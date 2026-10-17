@@ -39,6 +39,10 @@ test only uses `node:fs`/`node:path`/`node:test`.
   GitHub installs require pnpm build authorization on the user's machine.
 - Keep every user-visible string in `client.js` dictionaries (`zh` and `en`)
   and in `locale/*.json` for the plugin manager metadata.
+- `remote.js` and `client.js` both declare the `tempSession` wire codecs (the
+  browser bundle cannot import the Host file). `test/client.test.mjs` compares
+  their endpoint, service, parameter, and result identities; update both halves
+  together or that test fails.
 - Add a test when you change cleanup rules. Deleting stored sessions is the
   riskiest part of this plugin; `test/core.test.mjs` documents the intended
   safety boundaries.

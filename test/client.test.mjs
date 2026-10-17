@@ -8,6 +8,7 @@
 import { strict as assert } from 'node:assert'
 import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
+import { tempSessionDescriptors } from '../remote.js'
 
 /** Build an element tree with a minimal React. */
 function createElement(type, props, ...children) {
@@ -137,6 +138,22 @@ test('apply mounts the remote namespace, locale, and three slots', async () => {
     'sidebar.workspaces.session.menu.item',
     'shell.overlay',
   ])
+  // The browser repeats the Host codecs; their wire identities must not drift.
+  const shape = descriptors => descriptors.map(descriptor => ({
+    id: descriptor.id,
+    service: descriptor.service,
+    namespace: descriptor.namespace,
+    method: descriptor.method,
+    invocation: descriptor.invocation,
+    parameters: descriptor.parameters.map(parameter => ({
+      name: parameter.name,
+      wire: parameter.wire,
+      source: parameter.source,
+      typeSymbol: parameter.codec.typeSymbol,
+    })),
+    resultTypeSymbol: descriptor.result.typeSymbol,
+  }))
+  assert.deepEqual(shape(calls.mount.descriptors), shape(tempSessionDescriptors))
   assert.ok(calls.locale.dictionaries.zh.create.length > 0)
   assert.ok(calls.locale.dictionaries.en.create.length > 0)
   assert.equal(calls.lists, 1)
