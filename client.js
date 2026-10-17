@@ -237,7 +237,7 @@ window.__ModuleLoader__.load({
       return h('button', {
         type: 'button',
         className: wide ? 'dts-footer' : 'dts-footer dts-rail',
-        'aria-label': label,
+        'aria-label': !creating && ids.size > 0 ? `${label} — ${t('activeCount', { count: ids.size })}` : label,
         title: t('createHint'),
         disabled: creating,
         onClick: () => { actions.create() },
