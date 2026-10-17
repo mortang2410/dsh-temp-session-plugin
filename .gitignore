@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.pnpm-store/
+.npm-cache/
+.npm-logs/
+*.tgz
+.DS_Store
+*.log
+.devhome/
+.restore/

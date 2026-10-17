@@ -1,0 +1,77 @@
+{
+  "name": "dsh-temp-session-plugin",
+  "version": "0.1.0",
+  "description": "Temporary sessions for DeepSeek Harness: start a throwaway chat that is deleted when the app exits.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "core.js",
+    "remote.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-typert-protocol": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-typert-protocol": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "temporary-session",
+    "ephemeral-chat"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "author": "wj-spec",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wj-spec/dsh-temp-session-plugin.git"
+  },
+  "homepage": "https://github.com/wj-spec/dsh-temp-session-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/wj-spec/dsh-temp-session-plugin/issues"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check index.js && node --check client.js && node --check core.js && node --check remote.js && node --test test/*.test.mjs"
+  }
+}

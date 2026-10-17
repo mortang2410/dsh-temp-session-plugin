@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Temporary Sessions",
+    "description": "Start throwaway chats that are deleted when the app exits, with temporary markers in the sidebar and header."
+  }
+}

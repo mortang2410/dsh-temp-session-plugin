@@ -1,0 +1,4 @@
+# Temporary sessions: one Host row; the browser half comes from `dsh.client`.
+- insert:
+    - id: temp-session
+      name: dsh-temp-session-plugin
