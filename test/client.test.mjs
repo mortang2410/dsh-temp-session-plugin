@@ -92,7 +92,13 @@ function makeContext() {
       list: { getSnapshot: () => store },
       async create(options) { calls.created.push(options); return 'session-new' },
     },
-    workspaces: { list: { getSnapshot: () => ({ items: [{ path: '/tmp/workspace' }] }) } },
+    workspaces: {
+      list: {
+        getSnapshot: () => ({
+          items: [{ workspaceId: 'workspace-1', path: '/tmp/project', sessionIds: ['session-current'] }],
+        }),
+      },
+    },
     uiWorkspace: {
       openSession(id) { calls.opened.push(id) },
       async archiveSession(id) { calls.archived.push(id) },
@@ -133,6 +139,7 @@ test('apply mounts the remote namespace, locale, and three slots', async () => {
   assert.deepEqual(calls.slots, [
     'sidebar.footer.action',
     'conversation.session.header.actions',
+    'conversation.hero.options',
     'conversation.input.dock',
     'sidebar.session.row.leading',
     'sidebar.workspaces.session.menu.item',
@@ -169,11 +176,32 @@ test('the footer action creates a Session, registers it, and opens it', async ()
   const footer = captured.find(options => options.name === 'sidebar.footer.action')
   const injected = footer.inject()
   await injected.actions.create()
-  assert.deepEqual(calls.created, [{ cwd: '/tmp/project' }])
+  assert.deepEqual(calls.created, [{ workspaceId: 'workspace-1' }])
   assert.equal(calls.registered.length, 1)
   assert.equal(calls.registered[0].sessionId, 'session-new')
   assert.match(calls.registered[0].title, /^title/)
   assert.deepEqual(calls.opened, ['session-new'])
+})
+
+test('the New Session option marks the open workspace-bound blank Session temporary', async () => {
+  const { registration } = await loadBundle()
+  const plugin = registration.factory(() => React)
+  const captured = []
+  const { ctx, calls } = makeContext()
+  ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
+  await plugin.apply(ctx)
+  const hero = captured.find(options => options.name === 'conversation.hero.options')
+  assert.ok(hero !== undefined)
+  const t = ctx.locale.bind()
+  const injected = hero.inject()
+  // Not temporary yet: the pill renders and adopts the current Session.
+  const element = hero.component({ ...injected, sessionId: 'session-current', t })
+  assert.equal(element.type, 'button')
+  assert.equal(element.props['aria-pressed'], false)
+  await injected.actions.markCurrent('session-current')
+  assert.deepEqual(calls.registered.map(request => request.sessionId), ['session-current'])
+  assert.equal(calls.created.length, 0)
+  assert.equal(injected.store.getSnapshot().ids.has('session-current'), true)
 })
 
 test('the composer dock ends a temporary Session through archive and discard', async () => {

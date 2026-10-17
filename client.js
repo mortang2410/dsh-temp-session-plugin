@@ -99,6 +99,9 @@ window.__ModuleLoader__.load({
       end: '结束临时会话',
       endHint: '结束并隐藏这个临时会话，退出应用后彻底删除',
       activeCount: '当前有 {count} 个临时会话',
+      mark: '临时',
+      markHint: '把当前新会话标记为临时会话，退出应用后删除',
+      markFailed: '标记临时会话失败：{message}',
       title: '临时会话 · {time}',
       failed: '临时会话创建失败：{message}',
       endFailed: '结束临时会话失败：{message}',
@@ -113,6 +116,9 @@ window.__ModuleLoader__.load({
       end: 'End temporary chat',
       endHint: 'End and hide this temporary chat; its log is deleted when the app exits',
       activeCount: '{count} temporary chats are active',
+      mark: 'Temporary',
+      markHint: 'Mark this new chat as temporary; its log is deleted when the app exits',
+      markFailed: 'Could not mark the chat as temporary: {message}',
       title: 'Temporary chat · {time}',
       failed: 'Could not create a temporary chat: {message}',
       endFailed: 'Could not end the temporary chat: {message}',
@@ -131,6 +137,10 @@ window.__ModuleLoader__.load({
 .dts-chip{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:999px;font-size:11px;line-height:1;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap}
 .dts-iconButton{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
 .dts-iconButton:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.dts-heroPill{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 10px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l3);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:12px;line-height:1;white-space:nowrap;cursor:pointer}
+.dts-heroPill:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.dts-heroPill:disabled{cursor:default}
+.dts-heroPillActive{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);background:transparent}
 .dts-dock{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;padding:6px 10px;box-sizing:border-box;border:1px dashed var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .dts-dockLabel{display:inline-flex;align-items:center;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .dts-dockEnd{flex:none;display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:12px;line-height:18px;cursor:pointer}
@@ -247,6 +257,26 @@ window.__ModuleLoader__.load({
       !creating && ids.size > 0 ? h('span', { className: 'dts-count', 'aria-label': t('activeCount', { count: ids.size }) }, String(ids.size)) : null)
     }
 
+    /**
+     * Compact New Session option that adopts the already created, workspace-bound
+     * blank Session as temporary. The normal New Session flow chooses the
+     * workspace, so the temporary chat never asks for one afterwards.
+     */
+    function HeroOption({ sessionId, t, actions, store }) {
+      const ids = React.useSyncExternalStore(store.subscribe, () => store.getSnapshot().ids)
+      const active = ids.has(sessionId)
+      return h('button', {
+        type: 'button',
+        className: active ? 'dts-heroPill dts-heroPillActive' : 'dts-heroPill',
+        'aria-pressed': active,
+        title: t(active ? 'badgeHint' : 'markHint'),
+        disabled: active,
+        onClick: () => { void actions.markCurrent(sessionId) },
+      },
+      h(ClockChatIcon, { size: 13 }),
+      h('span', null, t('mark')))
+    }
+
     /** Temporary marker for the open temporary Session's title row. */
     function HeaderAction({ sessionId, t, store }) {
       const ids = React.useSyncExternalStore(store.subscribe, () => store.getSnapshot().ids)
@@ -355,27 +385,47 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** Cwd for the new Session: the open Session's project, then the first Workspace. */
-      const resolveCwd = () => {
+      /**
+       * Workspace for a new temporary Session: the open Session's workspace,
+       * then one matched by its cwd, then the workspace of the most recently
+       * active Session, then the first Workspace. Attaching to a Workspace is
+       * what keeps the composer usable instead of asking to choose one.
+       */
+      const resolveWorkspace = () => {
+        const sessions = ctx.sessions.list.getSnapshot()
+        const items = ctx.workspaces?.list?.getSnapshot?.().items ?? []
         const currentId = ctx.sessions.currentProvideInfo?.getSnapshot?.().sessionId
-        const fromSession = currentId === undefined
-          ? undefined
-          : ctx.sessions.list.getSnapshot().byId[currentId]?.cwd
-        if (typeof fromSession === 'string' && fromSession !== '') return fromSession
-        const fromWorkspace = ctx.workspaces?.list?.getSnapshot?.().items?.[0]?.path
-        return typeof fromWorkspace === 'string' && fromWorkspace !== '' ? fromWorkspace : undefined
+        if (currentId !== undefined) {
+          const member = items.find(item => item.sessionIds.includes(currentId))
+          if (member !== undefined) return member
+          const cwd = sessions.byId[currentId]?.cwd
+          if (typeof cwd === 'string' && cwd !== '') {
+            const byPath = items.find(item => item.path === cwd)
+            if (byPath !== undefined) return byPath
+          }
+        }
+        for (const id of sessions.ids) {
+          const owner = items.find(item => item.sessionIds.includes(id))
+          if (owner !== undefined) return owner
+        }
+        return items[0]
       }
+
+      /** Title shared by the footer entry and the New Session option. */
+      const tempTitle = () => t('title', { time: timeLabel() })
 
       const actions = {
         async create() {
           if (store.getSnapshot().creating) return
           store.setCreating(true)
           try {
-            const cwd = resolveCwd()
-            const sessionId = await ctx.sessions.create(cwd === undefined ? {} : { cwd })
+            const workspace = resolveWorkspace()
+            const sessionId = await ctx.sessions.create(
+              workspace === undefined ? {} : { workspaceId: workspace.workspaceId },
+            )
             const result = await ctx.remote.tempSession.register({
               sessionId,
-              title: t('title', { time: timeLabel() }),
+              title: tempTitle(),
             })
             if (!result.ok) {
               await hide(sessionId)
@@ -388,6 +438,26 @@ window.__ModuleLoader__.load({
             store.notify(t('failed', { message: messageOf(error) }))
           } finally {
             store.setCreating(false)
+          }
+        },
+
+        /**
+         * Adopt the already open, workspace-bound blank Session as temporary.
+         * This is the workspace-first flow: the user created a New Session in
+         * a Workspace and opted into the temporary lifetime before typing.
+         */
+        async markCurrent(sessionId) {
+          if (store.getSnapshot().ids.has(sessionId)) return
+          try {
+            const result = await ctx.remote.tempSession.register({
+              sessionId,
+              title: tempTitle(),
+            })
+            if (!result.ok) throw result.error
+            store.add(result.value.sessionId)
+          } catch (error) {
+            log?.warn?.(`could not mark a temporary session: ${String(error)}`)
+            store.notify(t('markFailed', { message: messageOf(error) }))
           }
         },
 
@@ -436,6 +506,14 @@ window.__ModuleLoader__.load({
         locale: NS,
         inject: () => ({ store }),
       }, HeaderAction))
+
+      ctx.slots.inject('conversation.hero.options', () => ctx.slots.register({
+        name: 'conversation.hero.options',
+        id: 'temp-session-mark',
+        order: 10,
+        locale: NS,
+        inject: () => ({ actions, store }),
+      }, HeroOption))
 
       ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
         name: 'conversation.input.dock',
