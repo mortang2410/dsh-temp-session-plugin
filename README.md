@@ -2,10 +2,15 @@
 
 [中文](README.zh.md)
 
-A small, dependency-free DSH plugin that adds **temporary sessions**: start a
-throwaway chat from the sidebar, use it like any other session, and have its
-stored log deleted when the application exits. Temporary sessions never show up
-in your history after a restart.
+A small, dependency-free DSH plugin that adds **temporary sessions** in two
+shapes:
+
+- a workspace-bound throwaway **chat** created from the normal New Session flow;
+- a **side chat** opened in the right sidebar from selected text, forked from
+  the current conversation, with the selection prefilled in the composer.
+
+Both run the real agent and both are deleted when the application exits — unless
+you choose to **promote** a side chat to a long-term session.
 
 The plugin is a standard DSH bundle (Host plugin + Web client module). It is
 plain JavaScript with no build step, so it installs directly from GitHub.
@@ -14,19 +19,30 @@ plain JavaScript with no build step, so it installs directly from GitHub.
 
 ## Features
 
-- **Sidebar entry** — a "Temporary chat" button at the foot of the sidebar.
-- **Full native session** — the temporary session runs the real agent with the
-  usual tools, model, permissions, streaming, and attachments.
+- **Workspace-first** — a `Temporary` pill in the New Session row. The normal
+  New Session flow already chose the workspace, so a temporary chat never asks
+  you to pick one afterwards. A sidebar-foot shortcut creates one in the
+  current or most recent workspace.
+- **Selection side chat** — select text in a conversation and click the floating
+  **Temporary chat** action. A forked copy of the conversation opens in the
+  right sidebar, with the selection prefilled as a quote in the composer.
+- **Promote to keep** — turn a side chat into a normal long-term session with
+  one click. The Host drops its temporary record and the row appears in the
+  sidebar; nothing is deleted on exit.
+- **Full native session** — temporary chats run the real agent with the usual
+  tools, model, permissions, streaming, and inherited context.
 - **Clear marking** — a dashed strip above the composer says the chat is
   temporary and offers the end action, even for a blank session; the sidebar
   foot counts active temporary chats. Once the first message is sent, the row
   is titled `Temporary chat · HH:mm`, gains a small badge while idle, and the
   conversation header shows a `Temporary` chip.
-- **End without opening** — end a temporary session from the strip above the
+- **Hidden side chats** — while temporary, forked side chats stay out of the
+  sidebar and search; they appear only when promoted.
+- **End without opening** — end a main temporary chat from the strip above the
   composer or from the session row's "…" menu. It is archived (hidden from the
-  list) immediately.
-- **Deleted on quit** — the Host removes every temporary session's log directory
-  on exit (normal exit, `SIGTERM`, or `SIGINT`).
+  list) immediately. Closing a side-chat tab discards it.
+- **Deleted on quit** — the Host removes every non-promoted temporary session's
+  log directory on exit (normal exit, `SIGTERM`, or `SIGINT`).
 - **Crash recovery** — if the process was killed hard, the next boot deletes the
   leftover logs before the browser can list them.
 - **Bilingual UI** — Chinese and English, following the DSH language setting.
@@ -76,7 +92,7 @@ Restart the Web process and refresh the page.
 After a release tag exists, pin the tag so later pushes cannot change what runs:
 
 ```sh
-dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.1.0'
+dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.0'
 ```
 
 ### Uninstall
@@ -91,29 +107,49 @@ If temporary logs remain, delete them manually: the registry at
 
 ## Usage
 
-1. Click **Temporary chat** at the foot of the sidebar. A fresh, blank session
-   opens in the current project directory (or the first workspace's directory
-   when no session is open).
-2. Chat normally. The header shows the `Temporary` chip.
-3. Click the trash button in the header (or use the session row's "…" menu →
-   **End temporary chat**) to archive and hide it.
-4. Quit the app. Every temporary session's log directory is deleted.
+### A temporary chat in a workspace
 
-You can keep multiple temporary sessions alive at once. They are ordinary
-sessions until they end; they are not inherited context for each other.
+1. Click **New Session**, choose a workspace, and look at the New Session row.
+2. Click the **Temporary** pill next to the workspace and preset. The chat is
+   now temporary; the dashed strip above the composer confirms it.
+3. Chat normally. The row is titled `Temporary chat · HH:mm` once the first
+   message is sent, and the header shows a `Temporary` chip.
+4. End it from the strip above the composer or from the session row's "…" menu,
+   or just quit the app. Its log directory is deleted on exit.
+
+The sidebar-foot **Temporary chat** button is a shortcut that creates a
+temporary chat in the current (or most recent) workspace.
+
+### A temporary side chat from selected text
+
+1. Open a conversation that has at least one completed turn.
+2. Select text in the transcript. A floating **Temporary chat** action appears.
+3. Click it. A fork of the conversation opens in the right sidebar, the
+   selection is prefilled as a quote, and the tab is marked temporary.
+4. Ask your side question in the right pane. The main conversation stays as it
+   was. While temporary, the fork is hidden from the sidebar.
+5. Choose **Keep as long-term chat** in the side bar to promote it, or close the
+   tab to discard it at exit.
+
+You can keep multiple temporary chats open at once. Each side chat inherits the
+parent conversation up to its last completed turn; the inherited history is
+reference context, not a continuation of the main task.
 
 ## How it works
 
 The bundle has two halves:
 
-- **Host** (`index.js`, `core.js`) — records a temporary session id plus the
-  exact per-session directory returned by the JSONL store, titles the session,
+- **Host** (`index.js`, `core.js`) — records a temporary session id, its kind
+  (`main` or `side`), and the exact per-session directory returned by the JSONL
+  store. It titles the session, detaches a side chat from the inherited goal,
   and owns deletion. The registry lives at
   `$DSH_HOME/temp-session/records.json` (mode `0600`).
-- **Web client** (`client.js`) — registers the sidebar entry with an active
-  count, the composer marker and end action, the header chip, the row menu item,
-  and the row badge. Creation is a normal `session.create` call followed by a
-  custom `tempSession/register` Remote call.
+- **Web client** (`client.js`) — registers the New Session pill, the sidebar
+  shortcut, the composer strip, the header chip, the row menu item and badge,
+  the selection action, the `tempchat` right-sidebar tab, and the hidden-side-chat
+  filter. A side chat is a normal `session.fork` plus a
+  `tempSession/register(kind: "side")` Remote call; promoting it is
+  `tempSession/promote`, which drops the record so cleanup never touches it.
 
 Deletion points:
 
@@ -125,8 +161,10 @@ Deletion points:
 
 Safety boundaries:
 
-- Only a **fresh, empty, top-level, unseeded** session may become temporary, so
-  a caller cannot convert existing history.
+- A main temporary chat must be **fresh, empty, top-level, and unseeded**. A side
+  chat must be a **fork whose child-owned tail is unused** (only the inherited
+  prefix carries turns). Neither can convert arbitrary existing history, and a
+  subagent Session is refused.
 - Deletion only targets a directory whose final path segment contains the
   session id, is absolute, and is nested at least three levels deep.
 - Records are stored under `$DSH_HOME`, and the registry is written atomically.
@@ -139,6 +177,9 @@ written:
 
 - For the duration of the session, DSH writes its normal checkpointed log. This
   is what makes streaming, tools, and crash handling work.
+- A side chat is a **fork**: its new log contains a copy of the parent history
+  up to the fork point. Deleting the side chat does not touch the parent; keep
+  that copy in mind if the parent conversation is sensitive.
 - **Attachments are not deleted.** DSH stores images and other attachment blobs
   content-addressed under `$DSH_HOME/attachments/v1`, without a session owner.
   Avoid attaching sensitive files to a temporary session if you need a clean
@@ -151,17 +192,37 @@ written:
 
 ## Known limitations
 
-- Ending a temporary session archives and hides it, but its log remains on disk
-  until the app exits. DSH `0.2.x` does not expose a per-session delete command
-  for a live agent.
+- A side chat needs a **completed turn** in the parent; a brand-new chat shows a
+  notice instead of forking.
+- Ending a main temporary chat archives and hides it, but its log remains on disk
+  until the app exits. Closing a side-chat tab marks it for deletion the same
+  way. DSH `0.2.x` does not expose a per-session delete command for a live agent.
+- Closing a side-chat tab is permanent for that temporary fork: there is no
+  reopen entry, and it is deleted on exit.
+- A hidden temporary side chat is kept out of the sidebar by a client-side
+  filter over the shipped workspace browser; a page reload rehydrates the hidden
+  set from the Host registry. It also stays in its workspace's membership list
+  after deletion, which the browser filters out (a harmless dangling id).
 - Remote/mobile peers are not granted access to the `tempSession` Remote
   namespace; creating a temporary session from a remote connection is refused.
 - Only the default JSONL backend is supported. The plugin refuses to register on
   a backend that cannot locate a session directory.
-- UI integration relies on stable `0.2.x` slots (`sidebar.footer.action`,
-  `conversation.session.header.actions`,
-  `sidebar.workspaces.session.menu.item`, `sidebar.session.row.leading`,
-  `shell.overlay`). A future DSH release may rename them.
+- UI integration relies on stable `0.2.x` slots (`conversation.hero.options`,
+  `sidebar.footer.action`, `conversation.session.header.actions`,
+  `conversation.input.dock`, `sidebar.workspaces.session.menu.item`,
+  `sidebar.session.row.leading`, `sidebar.right.pane.tab`, `shell.overlay`). A
+  future DSH release may rename them.
+
+## Verification
+
+- `npm run check`: 19 Host/client tests with no dependencies.
+- Playwright against a disposable `0.2.1-rc.1` Web profile: workspace New Session
+  option (composer stays usable), selection action, fork, native right-sidebar
+  conversation, quoted draft prefill, hidden sidebar row, promotion, tab-close
+  discard, `SIGTERM` log deletion, and boot cleanup.
+- Not verified: a real model answer inside a side chat (the test environment had
+  no credentials; the fork was cut from a completed-but-failed turn). The
+  Desktop app uses the same Host and client pieces but was not re-run separately.
 
 ## Development
 
@@ -188,7 +249,7 @@ Source map:
 | `index.js` | Host plugin: services, Remote contribution, boot/signal cleanup |
 | `core.js` | Registry, path safety, async/sync deletion (no Cordis dependency) |
 | `remote.js` | Host Typert Remote descriptors |
-| `client.js` | Browser module: entries, badge, end actions, notice |
+| `client.js` | Browser module: entries, side chat, badge, end/promote actions, notice |
 | `cordis.patch.yml` | Bundle layer inserting the Host row |
 | `locale/*.json` | Plugin-manager title and description |
 

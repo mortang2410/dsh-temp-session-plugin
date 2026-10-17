@@ -35,6 +35,7 @@ export async function apply(ctx) {
     sessionPersistence: ctx.sessionPersistence,
     sessionController: ctx.sessionController,
     get agents() { return ctx.get('agents') },
+    get goals() { return ctx.get('goals') },
     get workspaceRegistry() { return ctx.get('workspaceRegistry') },
     logger: log,
     paths,
@@ -75,6 +76,10 @@ export async function apply(ctx) {
 
     discard(request) {
       return temp.discard(request)
+    }
+
+    promote(request) {
+      return temp.promote(request)
     }
   }
   ctx.plugin(TempSessionsHost)

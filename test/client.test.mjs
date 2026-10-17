@@ -62,6 +62,11 @@ function makeContext() {
     opened: [],
     archived: [],
     discarded: [],
+    promoted: [],
+    forks: [],
+    drafts: [],
+    resources: [],
+    openedResources: [],
     lists: 0,
     slots: [],
     locale: undefined,
@@ -73,7 +78,7 @@ function makeContext() {
   }
   const store = {
     ids: [],
-    byId: { 'session-current': { cwd: '/tmp/project' } },
+    byId: { 'session-current': { cwd: '/tmp/project', blank: false } },
   }
   const ctx = {
     logger: () => ({ warn() {}, info() {} }),
@@ -86,13 +91,42 @@ function makeContext() {
     slots: {
       inject(name, factory) { calls.slots.push(name); factory() },
       register(options, component) { return () => {} },
+      entriesOfSlot() { return [] },
     },
     sessions: {
       currentProvideInfo,
       list: { getSnapshot: () => store },
       async create(options) { calls.created.push(options); return 'session-new' },
+      async fork(options) { calls.forks.push(options); return 'session-fork' },
+      retain(id) {
+        return {
+          binding: { sessionId: id },
+          ready: Promise.resolve(),
+          release() {},
+        }
+      },
     },
-    workspaces: { list: { getSnapshot: () => ({ items: [{ path: '/tmp/workspace' }] }) } },
+    conversation: {
+      input: {
+        requestDraftInitialization(binding, options) {
+          calls.drafts.push({ binding, options })
+          return 'applied'
+        },
+      },
+    },
+    resources: { register(provider) { calls.resources.push(provider); return () => {} } },
+    sidebarRightTabs: { register(definition) { return () => {} } },
+    sidebarRight: {
+      openResource(address, options) { calls.openedResources.push({ address, options }) },
+      registerCloseHandler() { return () => {} },
+    },
+    workspaces: {
+      list: {
+        getSnapshot: () => ({
+          items: [{ workspaceId: 'workspace-1', path: '/tmp/project', sessionIds: ['session-current'] }],
+        }),
+      },
+    },
     uiWorkspace: {
       openSession(id) { calls.opened.push(id) },
       async archiveSession(id) { calls.archived.push(id) },
@@ -104,11 +138,23 @@ function makeContext() {
           async list() { calls.lists += 1; return { ok: true, value: { sessions: [] } } },
           async register(request) {
             calls.registered.push(request)
-            return { ok: true, value: { sessionId: request.sessionId, createdAt: 1 } }
+            return {
+              ok: true,
+              value: {
+                sessionId: request.sessionId,
+                createdAt: 1,
+                kind: request.kind === 'side' ? 'side' : 'main',
+                pendingDelete: false,
+              },
+            }
           },
           async discard(request) {
             calls.discarded.push(request.sessionId)
             return { ok: true, value: { discarded: true } }
+          },
+          async promote(request) {
+            calls.promoted.push(request)
+            return { ok: true, value: { promoted: true } }
           },
         }
         return async () => {}
@@ -118,7 +164,7 @@ function makeContext() {
   return { ctx, calls }
 }
 
-test('apply mounts the remote namespace, locale, and three slots', async () => {
+test('apply mounts the remote namespace, locale, and temporary-session surfaces', async () => {
   const { registration } = await loadBundle()
   const plugin = registration.factory((specifier) => {
     assert.equal(specifier, 'react')
@@ -129,15 +175,21 @@ test('apply mounts the remote namespace, locale, and three slots', async () => {
   await plugin.apply(ctx)
   await new Promise(resolve => setTimeout(resolve, 0))
   assert.equal(calls.mount.package, 'dsh-temp-session-plugin')
-  assert.equal(calls.mount.descriptors.length, 3)
+  assert.equal(calls.mount.descriptors.length, 4)
   assert.deepEqual(calls.slots, [
+    'sidebar.right.pane.tab',
+    'dts.tempchat.conversation',
+    'shell.overlay',
     'sidebar.footer.action',
     'conversation.session.header.actions',
+    'conversation.hero.options',
     'conversation.input.dock',
     'sidebar.session.row.leading',
     'sidebar.workspaces.session.menu.item',
     'shell.overlay',
   ])
+  assert.equal(calls.resources.length, 1)
+  assert.equal(calls.resources[0].protocol, 'tempchat')
   // The browser repeats the Host codecs; their wire identities must not drift.
   const shape = descriptors => descriptors.map(descriptor => ({
     id: descriptor.id,
@@ -169,11 +221,87 @@ test('the footer action creates a Session, registers it, and opens it', async ()
   const footer = captured.find(options => options.name === 'sidebar.footer.action')
   const injected = footer.inject()
   await injected.actions.create()
-  assert.deepEqual(calls.created, [{ cwd: '/tmp/project' }])
+  assert.deepEqual(calls.created, [{ workspaceId: 'workspace-1' }])
   assert.equal(calls.registered.length, 1)
   assert.equal(calls.registered[0].sessionId, 'session-new')
   assert.match(calls.registered[0].title, /^title/)
   assert.deepEqual(calls.opened, ['session-new'])
+})
+
+test('the New Session option marks the open workspace-bound blank Session temporary', async () => {
+  const { registration } = await loadBundle()
+  const plugin = registration.factory(() => React)
+  const captured = []
+  const { ctx, calls } = makeContext()
+  ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
+  await plugin.apply(ctx)
+  const hero = captured.find(options => options.name === 'conversation.hero.options')
+  assert.ok(hero !== undefined)
+  const t = ctx.locale.bind()
+  const injected = hero.inject()
+  // Not temporary yet: the pill renders and adopts the current Session.
+  const element = hero.component({ ...injected, sessionId: 'session-current', t })
+  assert.equal(element.type, 'button')
+  assert.equal(element.props['aria-pressed'], false)
+  await injected.actions.markCurrent('session-current')
+  assert.deepEqual(calls.registered.map(request => request.sessionId), ['session-current'])
+  assert.equal(calls.created.length, 0)
+  assert.equal(injected.store.getSnapshot().ids.has('session-current'), true)
+})
+
+test('a selection starts a forked temporary side chat and can be promoted', async () => {
+  const { registration } = await loadBundle()
+  const plugin = registration.factory(() => React)
+  const captured = []
+  const { ctx, calls } = makeContext()
+  ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
+  await plugin.apply(ctx)
+  const selection = captured.find(options => options.id === 'temp-session-selection')
+  assert.ok(selection !== undefined)
+  const injected = selection.inject()
+  await injected.actions.startSideChat('selected text')
+  assert.deepEqual(calls.forks, [{ sessionId: 'session-current' }])
+  const sideRegister = calls.registered.find(request => request.kind === 'side')
+  assert.equal(sideRegister.sessionId, 'session-fork')
+  assert.equal(calls.drafts.length, 1)
+  assert.equal(calls.drafts[0].options.prompt, '> selected text\n\n')
+  assert.deepEqual(calls.openedResources, [{
+    address: 'dsh-resource://tempchat/session/session-fork',
+    options: { kind: 'tempchat', preferNewPane: true },
+  }])
+  assert.equal(injected.store.getSnapshot().side.has('session-fork'), true)
+  assert.equal(injected.store.getSnapshot().ids.has('session-fork'), true)
+
+  await injected.actions.promote('session-fork')
+  assert.deepEqual(calls.promoted, [{ sessionId: 'session-fork', title: 'selected text' }])
+  assert.equal(injected.store.getSnapshot().side.has('session-fork'), false)
+  assert.equal(injected.store.getSnapshot().ids.has('session-fork'), false)
+
+  // A second side chat that stays temporary is discarded when its tab closes,
+  // but remains hidden from the list until Host cleanup.
+  await injected.actions.startSideChat('another selection')
+  await injected.actions.closeSide('session-fork')
+  assert.equal(calls.discarded.includes('session-fork'), true)
+  assert.equal(injected.store.getSnapshot().ids.has('session-fork'), false)
+  assert.equal(injected.store.getSnapshot().side.has('session-fork'), true)
+})
+
+test('hydration keeps ended side chats hidden without counting them active', async () => {
+  const { registration } = await loadBundle()
+  const plugin = registration.factory(() => React)
+  const captured = []
+  const { ctx } = makeContext()
+  ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
+  await plugin.apply(ctx)
+  const footer = captured.find(options => options.name === 'sidebar.footer.action')
+  const injected = footer.inject()
+  injected.store.hydrate([
+    { sessionId: 'session-main', createdAt: 1, kind: 'main', pendingDelete: false },
+    { sessionId: 'session-side', createdAt: 2, kind: 'side', pendingDelete: false },
+    { sessionId: 'session-ended', createdAt: 3, kind: 'side', pendingDelete: true },
+  ])
+  assert.deepEqual([...injected.store.getSnapshot().ids], ['session-main', 'session-side'])
+  assert.deepEqual([...injected.store.getSnapshot().side], ['session-side', 'session-ended'])
 })
 
 test('the composer dock ends a temporary Session through archive and discard', async () => {

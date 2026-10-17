@@ -25,28 +25,53 @@ const sessionRequest = strict('SessionRequest', (value) => {
   return { sessionId: value.sessionId }
 })
 
-/** Validate a registration request and its optional display title. */
+/** Validate a registration request, its optional display title, and its kind. */
 const registerRequest = strict('RegisterRequest', (value) => {
+  const base = sessionRequest.create().parse(value)
+  if (value.kind !== undefined && value.kind !== 'main' && value.kind !== 'side') {
+    throw new Error('temporary session kind must be "main" or "side"')
+  }
+  return {
+    ...base,
+    title: typeof value.title === 'string' ? value.title : '',
+    kind: value.kind === 'side' ? 'side' : 'main',
+  }
+})
+
+/** Validate a promotion request and its optional lasting title. */
+const promoteRequest = strict('PromoteRequest', (value) => {
   const base = sessionRequest.create().parse(value)
   return { ...base, title: typeof value.title === 'string' ? value.title : '' }
 })
 
-/** Validate a registration result. */
+/** Validate a promotion receipt. */
+const promoteResult = strict('PromoteResult', (value) => {
+  if (value === null || typeof value !== 'object' || value.promoted !== true) {
+    throw new Error('temporary session promotion returned an invalid receipt')
+  }
+  return { promoted: true }
+})
+
+/** Validate one registration result. */
 const registerResult = strict('RegisterResult', (value) => {
   if (value === null
     || typeof value !== 'object'
     || typeof value.sessionId !== 'string'
-    || !Number.isSafeInteger(value.createdAt)) {
+    || !Number.isSafeInteger(value.createdAt)
+    || (value.kind !== 'main' && value.kind !== 'side')
+    || typeof value.pendingDelete !== 'boolean') {
     throw new Error('temporary session registration returned an invalid record')
   }
-  return { sessionId: value.sessionId, createdAt: value.createdAt }
+  return {
+    sessionId: value.sessionId,
+    createdAt: value.createdAt,
+    kind: value.kind,
+    pendingDelete: value.pendingDelete,
+  }
 })
 
 /** Validate one listed record. */
-const listedRecord = strict('ListedRecord', (value) => {
-  const parsed = registerResult.create().parse(value)
-  return { sessionId: parsed.sessionId, createdAt: parsed.createdAt }
-})
+const listedRecord = strict('ListedRecord', (value) => registerResult.create().parse(value))
 
 /** Validate a listing result. */
 const listResult = strict('ListResult', (value) => {
@@ -92,6 +117,15 @@ export const tempSessionDescriptors = [
     invocation: { kind: 'direct' },
     parameters: [{ name: 'request', wire: 'request', source: 'json', codec: sessionRequest }],
     result: discardResult,
+  },
+  {
+    id: 'dsh-temp-session-plugin#tempSession/promote',
+    service: 'tempSessionsHost',
+    namespace: 'tempSession',
+    method: 'promote',
+    invocation: { kind: 'direct' },
+    parameters: [{ name: 'request', wire: 'request', source: 'json', codec: promoteRequest }],
+    result: promoteResult,
   },
 ]
 
