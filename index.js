@@ -29,7 +29,7 @@ export const inject = ['sessions', 'sessionPersistence', 'sessionController', 't
  */
 export async function apply(ctx) {
   const log = typeof ctx.logger === 'function' ? ctx.logger('temp-session') : ctx.logger
-  const paths = statePaths()
+  const paths = statePaths(process.env, ctx.get('dshHomePath'))
   const temp = new TemporarySessions({
     sessions: ctx.sessions,
     sessionPersistence: ctx.sessionPersistence,

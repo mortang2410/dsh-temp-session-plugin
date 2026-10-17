@@ -21,13 +21,17 @@ export const STATE_VERSION = 1
 /**
  * Resolve this plugin's private registry location under the Harness home.
  * @param {NodeJS.ProcessEnv} [env] - process environment (DSH_HOME is set by dsh).
+ * @param {(path: string) => string} [dshHomePath] - the Host's home-path
+ *   service, when mounted; it knows the home the launcher actually used.
  * @returns {{ dir: string, file: string }} registry directory and file.
  */
-export function statePaths(env = process.env) {
-  const home = env.DSH_HOME !== undefined && env.DSH_HOME !== ''
-    ? env.DSH_HOME
-    : join(homedir(), '.dsh')
-  const dir = join(home, 'temp-session')
+export function statePaths(env = process.env, dshHomePath) {
+  const dir = typeof dshHomePath === 'function'
+    ? dshHomePath('temp-session')
+    : join(
+      env.DSH_HOME !== undefined && env.DSH_HOME !== '' ? env.DSH_HOME : join(homedir(), '.dsh'),
+      'temp-session',
+    )
   return { dir, file: join(dir, 'records.json') }
 }
 
@@ -219,7 +223,9 @@ export class TemporarySessions {
       await this.load()
       return {
         sessions: Object.values(this.state.sessions)
-          .filter(record => record?.sessionId !== undefined)
+          // Ended sessions are archived and already hidden; only running
+          // temporary sessions count toward the browser's badge and footer.
+          .filter(record => record?.sessionId !== undefined && record.pendingDelete !== true)
           .map(record => TemporarySessions.view(record)),
       }
     })

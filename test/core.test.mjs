@@ -83,6 +83,12 @@ after(async () => {
   await rm(root, { recursive: true, force: true })
 })
 
+test('state paths prefer the Host home-path service', () => {
+  const paths = statePaths({}, relative => join(root, relative))
+  assert.equal(paths.dir, join(root, 'temp-session'))
+  assert.equal(paths.file, join(root, 'temp-session', 'records.json'))
+})
+
 test('safe deletion requires the Session id in the leaf directory', () => {
   assert.equal(isSafeSessionDir('/home/u/.dsh/sessions/p/session-abc', 'session-abc'), true)
   assert.equal(isSafeSessionDir('/home/u/.dsh/sessions/p/other', 'session-abc'), false)
@@ -138,6 +144,8 @@ test('discard marks the record and cancels running work', async () => {
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.equal(saved.sessions[session.id].pendingDelete, true)
   await assert.rejects(h.temp.discard({ sessionId: 'other' }), /not a recorded/)
+  // Ended sessions no longer count as active for the browser.
+  assert.deepEqual((await h.temp.list()).sessions, [])
 })
 
 test('reap deletes non-live leftovers and keeps live Sessions', async () => {
