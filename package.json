@@ -1,7 +1,7 @@
 {
   "name": "dsh-temp-session-plugin",
-  "version": "0.1.0",
-  "description": "Temporary sessions for DeepSeek Harness: start a throwaway chat that is deleted when the app exits.",
+  "version": "0.2.0",
+  "description": "Temporary sessions and forked right-sidebar side chats for DeepSeek Harness: deleted when the app exits unless promoted.",
   "type": "module",
   "main": "index.js",
   "exports": {

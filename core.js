@@ -18,6 +18,10 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 /** Registry schema version. A different version starts an empty registry. */
 export const STATE_VERSION = 1
 
+/** Boundary note added to a forked, temporary side conversation. */
+const SIDE_INSTRUCTIONS = `This is a temporary side conversation forked from the main conversation.
+Treat the inherited history as reference only. Do not continue the main task, its goals, plans, approvals, or tool calls. Answer the new side question independently. Do not use subagents. Change files or workspace state only when the user explicitly asks for that change in this side conversation.`
+
 /**
  * Resolve this plugin's private registry location under the Harness home.
  * @param {NodeJS.ProcessEnv} [env] - process environment (DSH_HOME is set by dsh).
@@ -157,15 +161,23 @@ export class TemporarySessions {
 
   /** Public view of one record: no Host paths cross the wire. */
   static view(record) {
-    return { sessionId: record.sessionId, createdAt: record.createdAt }
+    return {
+      sessionId: record.sessionId,
+      createdAt: record.createdAt,
+      kind: record.kind === 'side' ? 'side' : 'main',
+      pendingDelete: record.pendingDelete === true,
+    }
   }
 
   /**
-   * Record a freshly created Session as temporary and pin its display title.
-   * Registration accepts only an unseeded, non-subagent Session with no
-   * committed events yet, so a caller cannot convert existing history.
-   * @param {{ sessionId: string, title?: string }} request - Session to adopt.
-   * @returns {Promise<{ sessionId: string, createdAt: number }>} the record view.
+   * Record a Session as temporary and pin its display title.
+   *
+   * A main-area temporary session is a fresh, unused Session. A side chat is a
+   * fork: it inherits history, so only the child-owned tail after the fork cut
+   * must stay unused. Neither an arbitrary existing history nor a subagent can
+   * be adopted.
+   * @param {{ sessionId: string, title?: string, kind?: 'main' | 'side' }} request - Session to adopt.
+   * @returns {Promise<{ sessionId: string, createdAt: number, kind: string, pendingDelete: boolean }>} the record view.
    */
   register(request) {
     return this.enqueue(async () => {
@@ -179,17 +191,24 @@ export class TemporarySessions {
       const session = this.deps.sessions.get(sessionId)
       if (session === undefined) throw new Error('the Session is not live; open it before registering')
       const header = session.header
-      // A fresh Session may already carry setup-only records (delegation
-      // policy, prompt wiring), so "empty" means the same thing the Session
-      // list means by blank: no turn and no human message yet.
-      const used = typeof session.snapshotEvents === 'function'
-        && session.snapshotEvents().some(event => event.type === 'turn/start'
-          || (event.type === 'user/message' && event.data?.source?.kind === 'user'))
-      if (header.isSeeded === true || header.origin === 'subagent' || used === true) {
-        throw new Error('only a fresh, unused, top-level Session can become temporary')
+      const kind = request.kind === 'side' ? 'side' : 'main'
+      if (header.origin === 'subagent') throw new Error('a subagent Session cannot become temporary')
+      if (header.isSeeded === true && header.parentSession === undefined) {
+        throw new Error('a seeded temporary Session must name its source Session')
       }
+      // For a fork, only events after the inherited cut belong to this chat.
+      // A fresh Session may already carry setup-only records (delegation
+      // policy, prompt wiring), so "empty" means no turn and no human message.
+      const events = typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : []
+      const inherited = header.isSeeded === true && Number.isSafeInteger(session.inheritedEventCount)
+        ? session.inheritedEventCount
+        : 0
+      const own = inherited > 0 ? events.slice(inherited) : events
+      const used = own.some(event => event.type === 'turn/start'
+        || (event.type === 'user/message' && event.data?.source?.kind === 'user'))
+      if (used) throw new Error('only an unused Session can become temporary')
       const title = typeof request.title === 'string' ? request.title : ''
-      // Materialize the (still empty) log so its directory can be located.
+      // Materialize the log so its directory can be located.
       await this.deps.sessions.flush(session)
       const dir = this.dirOf(header)
       if (dir === undefined) {
@@ -201,10 +220,12 @@ export class TemporarySessions {
         cwd: header.cwd ?? null,
         createdAt: Date.now(),
         title,
+        kind,
         pendingDelete: false,
       }
       this.state.sessions[sessionId] = record
       await this.save()
+      if (kind === 'side') this.prepareSideChat(sessionId)
       const controller = this.deps.sessionController
       if (controller !== undefined && title !== '') {
         try {
@@ -222,13 +243,43 @@ export class TemporarySessions {
     return this.enqueue(async () => {
       await this.load()
       return {
+        // Ended side chats stay listed (with pendingDelete) so a page reload
+        // can keep hiding them until the Host deletes their logs. The browser
+        // derives its active count from pendingDelete.
         sessions: Object.values(this.state.sessions)
-          // Ended sessions are archived and already hidden; only running
-          // temporary sessions count toward the browser's badge and footer.
-          .filter(record => record?.sessionId !== undefined && record.pendingDelete !== true)
+          .filter(record => record?.sessionId !== undefined)
           .map(record => TemporarySessions.view(record)),
       }
     })
+  }
+
+  /**
+   * Detach a forked side chat from the main goal and add its boundary note.
+   * Failures here never block registration: the side chat still works with the
+   * inherited context, just without the extra guidance.
+   * @param {string} sessionId - the registered side Session.
+   */
+  prepareSideChat(sessionId) {
+    const agent = this.deps.agents?.get?.(sessionId)
+    if (agent === undefined || agent === null) return
+    try {
+      const goal = this.deps.goals?.get?.(agent)
+      if (goal !== undefined && goal !== null && typeof this.deps.goals?.clear === 'function') {
+        this.deps.goals.clear(agent, { id: goal.id, revision: goal.revision })
+      }
+    } catch (error) {
+      this.deps.logger.warn(`could not clear the inherited goal for side chat "${sessionId}": ${String(error)}`)
+    }
+    try {
+      agent.ctx?.systemPrompt?.section?.({
+        name: 'dsh-temp-session-side',
+        order: 10000,
+        text: SIDE_INSTRUCTIONS,
+        interpolate: false,
+      })
+    } catch (error) {
+      this.deps.logger.warn(`could not add the side-chat instruction for "${sessionId}": ${String(error)}`)
+    }
   }
 
   /**
@@ -276,6 +327,33 @@ export class TemporarySessions {
       this.deps.logger.warn(`could not delete temporary session "${record.sessionId}": ${String(error)}`)
       return false
     }
+  }
+
+  /**
+   * Promote a temporary Session to a normal one: drop its record so exit and
+   * boot cleanup never delete its log. The caller also renames it to a lasting
+   * title when it supplies one.
+   * @param {{ sessionId: string, title?: string }} request - Session to keep.
+   * @returns {Promise<{ promoted: true }>} acknowledgement.
+   */
+  promote(request) {
+    return this.enqueue(async () => {
+      await this.load()
+      const sessionId = request?.sessionId
+      const record = typeof sessionId === 'string' ? this.state.sessions[sessionId] : undefined
+      if (record === undefined) throw new Error('this Session is not a recorded temporary session')
+      delete this.state.sessions[sessionId]
+      await this.save()
+      const title = typeof request.title === 'string' ? request.title : ''
+      if (title !== '' && this.deps.sessionController !== undefined) {
+        try {
+          await this.deps.sessionController.rename({ sessionId, title })
+        } catch (error) {
+          this.deps.logger.warn(`could not title promoted session "${sessionId}": ${String(error)}`)
+        }
+      }
+      return { promoted: true }
+    })
   }
 
   /**

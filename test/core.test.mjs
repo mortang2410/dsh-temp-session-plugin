@@ -19,12 +19,21 @@ let root
 let stateFile
 const warnings = []
 
-function fakeSession(id, { cwd = '/tmp/project', events = [], isSeeded = false, origin } = {}) {
+function fakeSession(id, {
+  cwd = '/tmp/project', events = [], isSeeded = false, origin, parentSession, inheritedEventCount,
+} = {}) {
   return {
     id,
     seq: events.length,
+    inheritedEventCount,
     snapshotEvents: () => events,
-    header: { id, cwd, isSeeded, ...(origin === undefined ? {} : { origin }) },
+    header: {
+      id,
+      cwd,
+      isSeeded,
+      ...(origin === undefined ? {} : { origin }),
+      ...(parentSession === undefined ? {} : { parentSession }),
+    },
   }
 }
 
@@ -122,14 +131,42 @@ test('register rejects existing history and seeded or subagent Sessions', async 
       ['session-setup', fakeSession('session-setup', { events: [{ type: 'developer/message', data: {} }] })],
     ]),
   })
-  await assert.rejects(h.temp.register({ sessionId: 'session-used' }), /fresh, unused, top-level/)
-  await assert.rejects(h.temp.register({ sessionId: 'session-turned' }), /fresh, unused, top-level/)
-  await assert.rejects(h.temp.register({ sessionId: 'session-seeded' }), /fresh, unused, top-level/)
-  await assert.rejects(h.temp.register({ sessionId: 'session-sub' }), /fresh, unused, top-level/)
+  await assert.rejects(h.temp.register({ sessionId: 'session-used' }), /unused/)
+  await assert.rejects(h.temp.register({ sessionId: 'session-turned' }), /unused/)
+  await assert.rejects(h.temp.register({ sessionId: 'session-seeded' }), /seeded temporary Session must name/)
+  await assert.rejects(h.temp.register({ sessionId: 'session-sub' }), /subagent/)
+  await assert.rejects(h.temp.register({ sessionId: 'session-turned' }), /unused/)
   await assert.rejects(h.temp.register({ sessionId: 'session-missing' }), /not live/)
   // Setup-only records (delegation policy, prompt wiring) are not history.
   const record = await h.temp.register({ sessionId: 'session-setup' })
   assert.equal(record.sessionId, 'session-setup')
+})
+
+test('register adopts a fork whose child-owned tail is unused', async () => {
+  const inherited = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'user/message', data: { source: { kind: 'user' } } },
+    { type: 'turn/end', data: { turn: 1, reason: 'completed' } },
+  ]
+  const fork = fakeSession('session-fork', {
+    isSeeded: true,
+    parentSession: 'session-parent',
+    inheritedEventCount: 3,
+    events: [...inherited, { type: 'fork/boundary', data: {} }],
+  })
+  const h = harness({ sessions: new Map([[fork.id, fork]]) })
+  const record = await h.temp.register({ sessionId: fork.id, kind: 'side' })
+  assert.equal(record.kind, 'side')
+  assert.equal(record.pendingDelete, false)
+  // A turn owned by the child itself is real use and is refused.
+  const busyFork = fakeSession('session-busy-fork', {
+    isSeeded: true,
+    parentSession: 'session-parent',
+    inheritedEventCount: 3,
+    events: [...inherited, { type: 'turn/start', data: { turn: 2 } }],
+  })
+  h.live.set(busyFork.id, busyFork)
+  await assert.rejects(h.temp.register({ sessionId: busyFork.id, kind: 'side' }), /unused/)
 })
 
 test('discard marks the record and cancels running work', async () => {
@@ -144,8 +181,23 @@ test('discard marks the record and cancels running work', async () => {
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.equal(saved.sessions[session.id].pendingDelete, true)
   await assert.rejects(h.temp.discard({ sessionId: 'other' }), /not a recorded/)
-  // Ended sessions no longer count as active for the browser.
+  // Ended sessions stay listed with their pending flag so the browser can
+  // keep hiding a side chat until the Host deletes it.
+  const listed = (await h.temp.list()).sessions
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0].pendingDelete, true)
+})
+
+test('promote drops the record and renames the lasting Session', async () => {
+  const session = fakeSession('session-promote')
+  const h = harness({ sessions: new Map([[session.id, session]]) })
+  await h.temp.register({ sessionId: session.id, title: '临时会话 · 10:02' })
+  assert.deepEqual(await h.temp.promote({ sessionId: session.id, title: '保留的会话' }), { promoted: true })
+  assert.deepEqual(h.renames, ['临时会话 · 10:02', '保留的会话'])
   assert.deepEqual((await h.temp.list()).sessions, [])
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[session.id], undefined)
+  await assert.rejects(h.temp.promote({ sessionId: 'other' }), /not a recorded/)
 })
 
 test('reap deletes non-live leftovers and keeps live Sessions', async () => {
