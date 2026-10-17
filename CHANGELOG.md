@@ -8,9 +8,10 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- Temporary sessions: create a throwaway chat from the sidebar foot, marked in
-  the session row and the conversation header.
-- End action in the header and in the session row menu; ended sessions are
+- Temporary sessions: create a throwaway chat from the sidebar foot, marked by a
+  strip above the composer, an active count in the sidebar foot, a title-row
+  chip, and a session-row badge.
+- End action above the composer and in the session row menu; ended sessions are
   archived and their logs are deleted when the application exits.
 - Crash recovery: the Host deletes leftover temporary sessions during the next
   boot, before the browser can list them.

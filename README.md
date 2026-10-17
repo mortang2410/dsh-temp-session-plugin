@@ -22,8 +22,9 @@ plain JavaScript with no build step, so it installs directly from GitHub.
   foot counts active temporary chats. Once the first message is sent, the row
   is titled `Temporary chat · HH:mm`, gains a small badge while idle, and the
   conversation header shows a `Temporary` chip.
-- **End without opening** — end a temporary session from the header or from the
-  session row's "…" menu. It is archived (hidden from the list) immediately.
+- **End without opening** — end a temporary session from the strip above the
+  composer or from the session row's "…" menu. It is archived (hidden from the
+  list) immediately.
 - **Deleted on quit** — the Host removes every temporary session's log directory
   on exit (normal exit, `SIGTERM`, or `SIGINT`).
 - **Crash recovery** — if the process was killed hard, the next boot deletes the
@@ -84,10 +85,9 @@ dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.1.0'
 dsh plugin --profile web remove dsh-temp-session-plugin
 ```
 
-Removing the bundle stops new temporary sessions. A previously recorded session
-is still cleaned up on the next boot **only if the plugin was loaded at least
-once** in that process; if you uninstall the plugin while temporary logs remain,
-delete them manually (see Privacy).
+Removing the bundle stops new temporary sessions and disables boot-time cleanup.
+If temporary logs remain, delete them manually: the registry at
+`$DSH_HOME/temp-session/records.json` lists each recorded session directory.
 
 ## Usage
 
