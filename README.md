@@ -15,14 +15,15 @@ you choose to **promote** a side chat to a long-term session.
 The plugin is a standard DSH bundle (Host plugin + Web client module). It is
 plain JavaScript with no build step, so it installs directly from GitHub.
 
-![Temporary session entry and composer marker](docs/screenshot.png)
+![Workspace + menu with New session and Temporary chat](docs/screenshot.png)
 
 ## Features
 
-- **Workspace-first** — a `Temporary` pill in the New Session row. The normal
-  New Session flow already chose the workspace, so a temporary chat never asks
-  you to pick one afterwards. A sidebar-foot shortcut creates one in the
-  current or most recent workspace.
+- **Workspace + menu** — a workspace row's `+` now opens a small menu with
+  **New session** and **Temporary chat**. The temporary chat is created in
+  that exact workspace, so it never asks you to pick one afterwards. A
+  `Temporary` pill in the New Session row still marks a freshly started blank
+  session as well.
 - **Selection side chat** — select text in a conversation and click the floating
   **Temporary chat** action. A forked copy of the conversation opens in the
   right sidebar, with the selection prefilled as a quote in the composer.
@@ -32,10 +33,9 @@ plain JavaScript with no build step, so it installs directly from GitHub.
 - **Full native session** — temporary chats run the real agent with the usual
   tools, model, permissions, streaming, and inherited context.
 - **Clear marking** — a dashed strip above the composer says the chat is
-  temporary and offers the end action, even for a blank session; the sidebar
-  foot counts active temporary chats. Once the first message is sent, the row
-  is titled `Temporary chat · HH:mm`, gains a small badge while idle, and the
-  conversation header shows a `Temporary` chip.
+  temporary and offers the end action, even for a blank session. Once the first
+  message is sent, the row is titled `Temporary chat · HH:mm`, gains a small
+  badge while idle, and the conversation header shows a `Temporary` chip.
 - **Hidden side chats** — while temporary, forked side chats stay out of the
   sidebar and search; they appear only when promoted.
 - **End without opening** — end a main temporary chat from the strip above the
@@ -91,7 +91,7 @@ Restart the Web process and refresh the page.
 After a release tag exists, pin the tag so later pushes cannot change what runs:
 
 ```sh
-dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.1'
+dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.2'
 ```
 
 ### Uninstall
@@ -108,16 +108,17 @@ If temporary logs remain, delete them manually: the registry at
 
 ### A temporary chat in a workspace
 
-1. Click **New Session**, choose a workspace, and look at the New Session row.
-2. Click the **Temporary** pill next to the workspace and preset. The chat is
-   now temporary; the dashed strip above the composer confirms it.
+1. Hover a workspace row and click its `+`. A menu offers **New session** and
+   **Temporary chat**.
+2. Choose **Temporary chat**. The new chat is attached to that workspace; the
+   dashed strip above the composer confirms it.
 3. Chat normally. The row is titled `Temporary chat · HH:mm` once the first
    message is sent, and the header shows a `Temporary` chip.
 4. End it from the strip above the composer, or just quit the app. Its log
    directory is deleted on exit.
 
-The sidebar-foot **Temporary chat** button is a shortcut that creates a
-temporary chat in the current (or most recent) workspace.
+You can also start a normal **New session** and click the **Temporary** pill in
+the New Session row to adopt it as temporary.
 
 ### A temporary side chat from selected text
 
@@ -207,18 +208,18 @@ written:
 - Only the default JSONL backend is supported. The plugin refuses to register on
   a backend that cannot locate a session directory.
 - UI integration relies on stable `0.2.x` slots (`conversation.hero.options`,
-  `sidebar.footer.action`, `conversation.session.header.actions`,
-  `conversation.input.dock`, `sidebar.session.row.leading`,
-  `sidebar.right.pane.tab`, `shell.overlay`). A future DSH release may rename
-  them.
+  `conversation.session.header.actions`, `conversation.input.dock`,
+  `sidebar.session.row.leading`, `sidebar.right.pane.tab`, `shell.overlay`,
+  and the workspace browser's trailing `+` button). A future DSH release may
+  rename or reorder them.
 
 ## Verification
 
 - `npm run check`: 19 Host/client tests with no dependencies.
-- Playwright against a disposable `0.2.1-rc.1` Web profile: workspace New Session
-  option (composer stays usable), selection action, fork, native right-sidebar
-  conversation, quoted draft prefill, hidden sidebar row, promotion, tab-close
-  discard, `SIGTERM` log deletion, and boot cleanup.
+- Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
+  (both choices), no sidebar-foot temporary entry, selection action, fork,
+  native right-sidebar conversation, quoted draft prefill, hidden sidebar row,
+  promotion, tab-close discard, `SIGTERM` log deletion, and boot cleanup.
 - Not verified: a real model answer inside a side chat (the test environment had
   no credentials; the fork was cut from a completed-but-failed turn). The
   Desktop app uses the same Host and client pieces but was not re-run separately.

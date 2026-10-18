@@ -121,19 +121,18 @@ window.__ModuleLoader__.load({
     }
 
     const zh = {
-      create: '临时会话',
-      createHint: '新建临时会话，退出应用后自动删除',
-      creating: '正在创建临时会话…',
       badge: '临时',
       badgeHint: '临时会话：退出应用后自动删除',
       end: '结束临时会话',
       endHint: '结束并隐藏这个临时会话，退出应用后彻底删除',
-      activeCount: '当前有 {count} 个临时会话',
       mark: '临时',
       markHint: '把当前新会话标记为临时会话，退出应用后删除',
       markFailed: '标记临时会话失败：{message}',
       title: '临时会话 · {time}',
       failed: '临时会话创建失败：{message}',
+      choiceNormal: '新会话',
+      choiceTemp: '临时会话',
+      choiceCreate: '在工作区“{name}”中创建',
       endFailed: '结束临时会话失败：{message}',
       dismiss: '关闭提示',
       selectionStart: '临时会话',
@@ -150,19 +149,18 @@ window.__ModuleLoader__.load({
       sideLoading: '正在打开临时会话…',
     }
     const en = {
-      create: 'Temporary chat',
-      createHint: 'Start a temporary chat that is deleted when the app exits',
-      creating: 'Creating a temporary chat…',
       badge: 'Temporary',
       badgeHint: 'Temporary chat: deleted when the app exits',
       end: 'End temporary chat',
       endHint: 'End and hide this temporary chat; its log is deleted when the app exits',
-      activeCount: '{count} temporary chats are active',
       mark: 'Temporary',
       markHint: 'Mark this new chat as temporary; its log is deleted when the app exits',
       markFailed: 'Could not mark the chat as temporary: {message}',
       title: 'Temporary chat · {time}',
       failed: 'Could not create a temporary chat: {message}',
+      choiceNormal: 'New session',
+      choiceTemp: 'Temporary chat',
+      choiceCreate: 'Create in workspace “{name}”',
       endFailed: 'Could not end the temporary chat: {message}',
       dismiss: 'Dismiss',
       selectionStart: 'Temporary chat',
@@ -180,17 +178,14 @@ window.__ModuleLoader__.load({
     }
 
     const css = `
-.dts-footer{flex:1;min-width:0;display:flex;align-items:center;justify-content:flex-start;gap:8px;height:42px;margin:4px -2px;padding:0 10px 0 8px;box-sizing:border-box;border:0;border-radius:var(--dsw-radius-md);background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:14px;line-height:22px;cursor:pointer;overflow:hidden}
-.dts-footer:hover{background:var(--dsw-alias-interactive-bg-hover)}
-.dts-footer:disabled{opacity:.6;cursor:default}
-.dts-footer.dts-rail{flex:none;width:36px;height:36px;margin:0;padding:0;justify-content:center}
-.dts-footerLabel{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.dts-count{flex:none;display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;box-sizing:border-box;border-radius:999px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1}
-.dts-icon{display:inline-flex;flex:none}
+.dts-choiceLayer{position:fixed;inset:0;z-index:1250}
+.dts-choice{position:fixed;width:210px;padding:6px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-2);box-shadow:0 8px 24px var(--dsw-alias-bg-mask-1)}
+.dts-choiceTitle{padding:6px 8px 8px;overflow:hidden;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;text-overflow:ellipsis;white-space:nowrap}
+.dts-choiceItem{display:flex;align-items:center;gap:8px;width:100%;padding:7px 8px;box-sizing:border-box;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;line-height:18px;text-align:left;white-space:nowrap;cursor:pointer}
+.dts-choiceItem:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dts-choiceGlyph{display:inline-flex;align-items:center;justify-content:center;width:14px;font-size:16px;line-height:1;color:var(--dsw-alias-label-secondary)}
 .dts-headerAction{display:inline-flex;align-items:center;gap:4px;min-width:0}
 .dts-chip{display:inline-flex;align-items:center;height:20px;padding:0 7px;border-radius:999px;font-size:11px;line-height:1;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-interactive-bg-hover);white-space:nowrap}
-.dts-iconButton{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}
-.dts-iconButton:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dts-heroPill{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 10px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l3);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:12px;line-height:1;white-space:nowrap;cursor:pointer}
 .dts-heroPill:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dts-heroPill:disabled{cursor:default}
@@ -208,7 +203,7 @@ window.__ModuleLoader__.load({
 .dts-sidechatBody{flex:1;min-height:0;display:flex;flex-direction:column;width:100%;overflow:hidden}
 .dts-sidechatLoading{padding:12px;font-size:13px;color:var(--dsw-alias-label-secondary)}
 .dts-selectionAction{position:fixed;z-index:1300;transform:translate(-50%,0);display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:12px;line-height:1;white-space:nowrap;cursor:pointer;box-shadow:0 4px 14px var(--dsw-alias-bg-mask-1)}
-.dts-selectionAction:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dts-selectionAction:hover{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-secondary)}
 .dts-notice{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:1200;display:flex;align-items:center;gap:10px;max-width:min(520px,calc(100vw - 48px));padding:10px 12px;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-md);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);box-shadow:0 8px 24px var(--dsw-alias-bg-mask-1);font-size:13px;line-height:18px}
 .dts-noticeText{min-width:0;word-break:break-word}
 .dts-noticeClose{flex:none;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font-size:16px;line-height:1;padding:2px 5px;cursor:pointer}
@@ -254,7 +249,7 @@ window.__ModuleLoader__.load({
      * hidden from the main sidebar, including ones already ended.
      */
     function createStore() {
-      let snapshot = { ids: new Set(), side: new Set(), selection: null, creating: false, notice: null }
+      let snapshot = { ids: new Set(), side: new Set(), selection: null, choice: null, notice: null }
       let noticeSeq = 0
       const listeners = new Set()
       const emit = () => { for (const listener of listeners) listener() }
@@ -300,9 +295,13 @@ window.__ModuleLoader__.load({
           snapshot = { ...snapshot, selection }
           emit()
         },
-        setCreating(creating) {
-          if (snapshot.creating === creating) return
-          snapshot = { ...snapshot, creating }
+        openChoice(choice) {
+          snapshot = { ...snapshot, choice }
+          emit()
+        },
+        closeChoice() {
+          if (snapshot.choice === null) return
+          snapshot = { ...snapshot, choice: null }
           emit()
         },
         notify(text) {
@@ -323,23 +322,6 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Render the sidebar-foot "start a temporary chat" entry. */
-    function CreateEntry({ wide, t, actions, store }) {
-      const { creating, ids } = React.useSyncExternalStore(store.subscribe, store.getSnapshot)
-      const label = creating ? t('creating') : t('create')
-      return h('button', {
-        type: 'button',
-        className: wide ? 'dts-footer' : 'dts-footer dts-rail',
-        'aria-label': !creating && ids.size > 0 ? `${label} — ${t('activeCount', { count: ids.size })}` : label,
-        title: t('createHint'),
-        disabled: creating,
-        onClick: () => { actions.create() },
-      },
-      h('span', { className: 'dts-icon' }, h(ClockChatIcon, { size: wide ? 16 : 18 })),
-      wide ? h('span', { className: 'dts-footerLabel' }, label) : null,
-      !creating && ids.size > 0 ? h('span', { className: 'dts-count', 'aria-label': t('activeCount', { count: ids.size }) }, String(ids.size)) : null)
-    }
-
     /**
      * Compact New Session option that adopts the already created, workspace-bound
      * blank Session as temporary. The normal New Session flow chooses the
@@ -358,6 +340,37 @@ window.__ModuleLoader__.load({
       },
       h(ClockChatIcon, { size: 13 }),
       h('span', null, t('mark')))
+    }
+
+    /**
+     * Menu opened by a workspace row's "+" button: create a normal Session or
+     * a temporary one in that exact workspace. This replaces the old
+     * sidebar-foot temporary entry.
+     */
+    function WorkspaceChoice({ t, store, actions }) {
+      const { choice } = React.useSyncExternalStore(store.subscribe, store.getSnapshot)
+      if (choice === null) return null
+      return h('div', { className: 'dts-choiceLayer', onMouseDown: () => { store.closeChoice() } },
+        h('div', {
+          className: 'dts-choice',
+          role: 'menu',
+          'aria-label': t('choiceCreate', { name: choice.title }),
+          style: { left: `${choice.x}px`, top: `${choice.y}px` },
+          onMouseDown: (event) => { event.stopPropagation() },
+        },
+        h('div', { className: 'dts-choiceTitle', title: choice.title }, choice.title),
+        h('button', {
+          type: 'button',
+          role: 'menuitem',
+          className: 'dts-choiceItem',
+          onClick: () => { store.closeChoice(); actions.startNormal(choice.workspaceId) },
+        }, h('span', { className: 'dts-choiceGlyph', 'aria-hidden': true }, '+'), h('span', null, t('choiceNormal'))),
+        h('button', {
+          type: 'button',
+          role: 'menuitem',
+          className: 'dts-choiceItem',
+          onClick: () => { store.closeChoice(); void actions.createTempInWorkspace(choice.workspaceId) },
+        }, h(ClockChatIcon, { size: 14 }), h('span', null, t('choiceTemp')))))
     }
 
     /** Temporary marker for the open temporary Session's title row. */
@@ -589,44 +602,27 @@ window.__ModuleLoader__.load({
           .find(session => (session.retainedBy?.mainView ?? 0) > 0)?.id
       }
 
-      /**
-       * Workspace for a new temporary Session: the open Session's workspace,
-       * then one matched by its cwd, then the workspace of the most recently
-       * active Session, then the first Workspace. Attaching to a Workspace is
-       * what keeps the composer usable instead of asking to choose one.
-       */
-      const resolveWorkspace = () => {
-        const sessions = ctx.sessions.list.getSnapshot()
-        const items = ctx.workspaces?.list?.getSnapshot?.().items ?? []
-        const currentId = currentSessionId()
-        if (currentId !== undefined) {
-          const member = items.find(item => item.sessionIds.includes(currentId))
-          if (member !== undefined) return member
-          const cwd = sessions.byId[currentId]?.cwd
-          if (typeof cwd === 'string' && cwd !== '') {
-            const byPath = items.find(item => item.path === cwd)
-            if (byPath !== undefined) return byPath
-          }
-        }
-        for (const id of sessions.ids) {
-          const owner = items.find(item => item.sessionIds.includes(id))
-          if (owner !== undefined) return owner
-        }
-        return items[0]
-      }
-
-      /** Title shared by the footer entry and the New Session option. */
+      /** Title shared by the workspace-create entry and the New Session option. */
       const tempTitle = () => t('title', { time: timeLabel() })
+      let creatingMain = false
 
       const actions = {
-        async create() {
-          if (store.getSnapshot().creating) return
-          store.setCreating(true)
+        /** Create an ordinary Session in one workspace (the menu's first row). */
+        startNormal(workspaceId) {
           try {
-            const workspace = resolveWorkspace()
-            const sessionId = await ctx.sessions.create(
-              workspace === undefined ? {} : { workspaceId: workspace.workspaceId },
-            )
+            ctx.uiWorkspace.startSession(workspaceId)
+          } catch (error) {
+            log?.warn?.(`could not start a session in the workspace: ${String(error)}`)
+            store.notify(t('failed', { message: messageOf(error) }))
+          }
+        },
+
+        /** Create a temporary Session in one workspace (the menu's second row). */
+        async createTempInWorkspace(workspaceId) {
+          if (creatingMain === true) return
+          creatingMain = true
+          try {
+            const sessionId = await ctx.sessions.create({ workspaceId })
             const result = await ctx.remote.tempSession.register({
               sessionId,
               title: tempTitle(),
@@ -641,7 +637,7 @@ window.__ModuleLoader__.load({
             log?.warn?.(`could not create a temporary session: ${String(error)}`)
             store.notify(t('failed', { message: messageOf(error) }))
           } finally {
-            store.setCreating(false)
+            creatingMain = false
           }
         },
 
@@ -850,6 +846,28 @@ window.__ModuleLoader__.load({
           return () => {}
         }
         const native = entry.component
+        const handleCreate = (event) => {
+          if (typeof Element === 'undefined' || !(event.target instanceof Element)) return
+          const button = event.target.closest('button')
+          if (button === null) return
+          const row = button.closest('[data-row-key^="workspace:"]')
+          if (row === null) return
+          // The trailing button in a workspace row is its New Session action;
+          // the leading one opens the workspace menu.
+          const buttons = row.querySelectorAll('button')
+          if (buttons.length === 0 || buttons[buttons.length - 1] !== button) return
+          const key = row.getAttribute('data-row-key')?.slice('workspace:'.length)
+          const workspace = ctx.workspaces.list.getSnapshot().items
+            .find(item => item.workspaceId === key)
+          if (workspace === undefined) return
+          event.preventDefault()
+          event.stopPropagation()
+          const rect = button.getBoundingClientRect()
+          const width = 210
+          const x = Math.min(window.innerWidth - width - 12, rect.right + 8)
+          const y = Math.min(window.innerHeight - 156, rect.bottom + 6)
+          store.openChoice({ workspaceId: workspace.workspaceId, title: workspace.title, x, y })
+        }
         function FilteredWorkspaceBrowser(props) {
           const hidden = React.useSyncExternalStore(store.subscribe, () => store.getSnapshot().side)
           const useSessions = props.useSessions === undefined
@@ -871,11 +889,21 @@ window.__ModuleLoader__.load({
                   },
                 }
               }
-          return h(native, { ...props, useSessions, searchSessions })
+          return h('div', { style: { display: 'contents' }, onClickCapture: handleCreate },
+            h(native, { ...props, useSessions, searchSessions }))
         }
         entry.component = FilteredWorkspaceBrowser
         return () => { if (entry.component === FilteredWorkspaceBrowser) entry.component = native }
       }, 'temp-session: hide side chats from the sidebar')
+
+      // ---- Workspace "+": ordinary or temporary Session ----
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay',
+        id: 'temp-session-workspace-choice',
+        order: 115,
+        locale: NS,
+        inject: () => ({ store, actions }),
+      }, WorkspaceChoice))
 
       // ---- Selection action ----
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
@@ -948,14 +976,6 @@ window.__ModuleLoader__.load({
         document.head.append(style)
         return () => { style.remove() }
       }, 'temp-session: styles')
-
-      ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-        name: 'sidebar.footer.action',
-        id: 'temp-session-create',
-        order: 10,
-        locale: NS,
-        inject: () => ({ actions, store }),
-      }, CreateEntry))
 
       ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
         name: 'conversation.session.header.actions',

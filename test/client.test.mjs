@@ -67,6 +67,7 @@ function makeContext() {
     drafts: [],
     resources: [],
     openedResources: [],
+    started: [],
     lists: 0,
     slots: [],
     locale: undefined,
@@ -129,6 +130,7 @@ function makeContext() {
     },
     uiWorkspace: {
       openSession(id) { calls.opened.push(id) },
+      startSession(workspaceId) { calls.started.push(workspaceId) },
       async archiveSession(id) { calls.archived.push(id) },
     },
     remote: {
@@ -180,7 +182,7 @@ test('apply mounts the remote namespace, locale, and temporary-session surfaces'
     'sidebar.right.pane.tab',
     'dts.tempchat.conversation',
     'shell.overlay',
-    'sidebar.footer.action',
+    'shell.overlay',
     'conversation.session.header.actions',
     'conversation.hero.options',
     'conversation.input.dock',
@@ -205,21 +207,24 @@ test('apply mounts the remote namespace, locale, and temporary-session surfaces'
     resultTypeSymbol: descriptor.result.typeSymbol,
   }))
   assert.deepEqual(shape(calls.mount.descriptors), shape(tempSessionDescriptors))
-  assert.ok(calls.locale.dictionaries.zh.create.length > 0)
-  assert.ok(calls.locale.dictionaries.en.create.length > 0)
+  assert.ok(calls.locale.dictionaries.zh.choiceTemp.length > 0)
+  assert.ok(calls.locale.dictionaries.en.choiceTemp.length > 0)
   assert.equal(calls.lists, 1)
 })
 
-test('the footer action creates a Session, registers it, and opens it', async () => {
+test('the workspace choice creates a normal or temporary Session in that workspace', async () => {
   const { registration } = await loadBundle()
   const plugin = registration.factory(() => React)
   const captured = []
   const { ctx, calls } = makeContext()
   ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
   await plugin.apply(ctx)
-  const footer = captured.find(options => options.name === 'sidebar.footer.action')
-  const injected = footer.inject()
-  await injected.actions.create()
+  const choice = captured.find(options => options.id === 'temp-session-workspace-choice')
+  assert.ok(choice !== undefined)
+  const injected = choice.inject()
+  injected.actions.startNormal('workspace-1')
+  assert.deepEqual(calls.started, ['workspace-1'])
+  await injected.actions.createTempInWorkspace('workspace-1')
   assert.deepEqual(calls.created, [{ workspaceId: 'workspace-1' }])
   assert.equal(calls.registered.length, 1)
   assert.equal(calls.registered[0].sessionId, 'session-new')
@@ -292,8 +297,7 @@ test('hydration keeps ended side chats hidden without counting them active', asy
   const { ctx } = makeContext()
   ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
   await plugin.apply(ctx)
-  const footer = captured.find(options => options.name === 'sidebar.footer.action')
-  const injected = footer.inject()
+  const injected = captured.find(options => options.id === 'temp-session-selection').inject()
   injected.store.hydrate([
     { sessionId: 'session-main', createdAt: 1, kind: 'main', pendingDelete: false },
     { sessionId: 'session-side', createdAt: 2, kind: 'side', pendingDelete: false },
@@ -327,11 +331,14 @@ test('components render the localized labels and only mark temporary Sessions', 
   ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
   await plugin.apply(ctx)
   const t = ctx.locale.bind()
-  const footer = captured.find(options => options.name === 'sidebar.footer.action')
-  const footerProps = { ...footer.inject(), wide: true, t }
-  const created = footer.component(footerProps)
-  assert.equal(created.type, 'button')
-  assert.ok(texts(created).includes('create'))
+  const choice = captured.find(options => options.id === 'temp-session-workspace-choice')
+  const choiceProps = { ...choice.inject(), t }
+  choiceProps.store.openChoice({ workspaceId: 'workspace-1', title: 'demo-project', x: 10, y: 20 })
+  const menu = choice.component(choiceProps)
+  assert.equal(menu.type, 'div')
+  assert.ok(texts(menu).includes('demo-project'))
+  assert.ok(texts(menu).includes('choiceNormal'))
+  assert.ok(texts(menu).includes('choiceTemp'))
 
   const badge = captured.find(options => options.name === 'sidebar.session.row.leading')
   const badgeProps = { ...badge.inject(), sessionId: 'session-other', t }

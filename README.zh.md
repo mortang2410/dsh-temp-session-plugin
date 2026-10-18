@@ -9,15 +9,15 @@
 
 插件是标准 DSH 组合包（Host 插件 + Web Client 模块），纯 JavaScript、无构建步骤，可以直接从 GitHub 安装。
 
-![临时会话入口与输入框上方标识](docs/screenshot.png)
+![工作区「+」菜单：新会话 / 临时会话](docs/screenshot.png)
 
 ## 功能
 
-- **工作区优先**：「新会话」行里有「临时」选项，工作区已经由正常新建流程选好，不会再让你选工作区。侧栏底部按钮是快捷入口，会在当前/最近工作区里新建。
+- **工作区「+」菜单**：点工作区行的「+」会弹出「新会话 / 临时会话」二选一；临时会话直接建在该工作区，不会再让你选工作区。「新会话」行里的「临时」选项仍可把刚创建的空白会话标记为临时。
 - **选中文字开侧聊**：在会话里选中文字，点浮出的「临时会话」，右侧栏打开一个 fork 会话，选中文字以引用形式预填到输入框。
 - **提升为长期会话**：侧聊顶部一键「提升为长期会话」；Host 删除临时记录、行重新出现在侧栏，退出时不再删除。
 - **完整原生会话**：使用真实的 Agent、工具、模型、权限、流式输出与继承的上下文。
-- **明确标识**：输入框上方虚线临时条 + 结束按钮；侧栏底部显示进行中数量。首条消息后标题变为「临时会话 · HH:mm」，空闲时行首出现图标，标题栏显示「临时」。
+- **明确标识**：输入框上方虚线临时条 + 结束按钮。首条消息后标题变为「临时会话 · HH:mm」，空闲时行首出现图标，标题栏显示「临时」。
 - **侧聊不打扰列表**：临时侧聊不出现在侧栏与搜索里，只有提升后才显示。
 - **结束与删除**：主区域临时会话可归档隐藏；侧聊关闭标签即丢弃。正常退出 / `SIGTERM` / `SIGINT` 同步删除所有未提升的临时会话目录。
 - **崩溃兜底**：进程被强制结束时，下次启动会在浏览器连上之前清掉残留。
@@ -61,7 +61,7 @@ dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin'
 发布 tag 后固定到 tag，避免后续推送改变实际运行的代码：
 
 ```sh
-dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.1'
+dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.2'
 ```
 
 ### 卸载
@@ -74,12 +74,12 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 
 ### 工作区里的临时聊天
 
-1. 点「新会话」，选择一个工作区，看向「新会话」那一行。
-2. 点工作区、预设旁边的「临时」选项；输入框上方出现虚线临时条。
+1. 悬停工作区行，点右侧的「+」；菜单提供「新会话」和「临时会话」。
+2. 选「临时会话」。新会话挂在该工作区，输入框上方出现虚线临时条。
 3. 正常聊天。发出第一条消息后，侧栏行标题变为「临时会话 · HH:mm」，标题栏出现「临时」标签。
 4. 在输入框上方结束，或直接退出应用；日志会在退出时删除。
 
-侧栏底部的「临时会话」按钮是快捷入口：在当前或最近工作区里新建临时聊天。
+也可以先点「新会话」，再在「新会话」行里点「临时」把空白会话标记为临时。
 
 ### 选中文字开临时侧聊
 
@@ -129,12 +129,12 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 - 临时侧聊由客户端过滤出侧栏；刷新页面会从 Host 注册表恢复隐藏集合。删除后它仍会留在工作区的成员 id 列表里（浏览器会按会话列表过滤掉，属无害残留）。
 - 远程/移动端没有 `tempSession` Remote 的授权，远程连接创建临时会话会被拒绝。
 - 仅支持默认 JSONL 后端。
-- UI 依赖 `0.2.x` 的稳定槽位（`conversation.hero.options`、`sidebar.footer.action`、`conversation.session.header.actions`、`conversation.input.dock`、`sidebar.session.row.leading`、`sidebar.right.pane.tab`、`shell.overlay`），未来 DSH 可能调整。
+- UI 依赖 `0.2.x` 的稳定槽位（`conversation.hero.options`、`conversation.session.header.actions`、`conversation.input.dock`、`sidebar.session.row.leading`、`sidebar.right.pane.tab`、`shell.overlay`），以及工作区行末尾的「+」按钮（通过 `data-row-key` 捕获）；未来 DSH 可能调整。
 
 ## 验证
 
 - `npm run check`：19 个 Host/Client 测试，无需安装依赖。
-- 在一次性 `0.2.1-rc.1` Web profile 上用 Playwright 验证：新会话「临时」选项（输入框可用）、选区浮层、fork、右侧栏原生会话、引用预填、侧栏隐藏、提升长期、关闭标签丢弃、`SIGTERM` 删除日志、重启清理。
+- 在一次性 `0.2.1-rc.1` Web profile 上用 Playwright 验证：工作区「+」菜单二选一、侧栏底部无临时入口、选区浮层（hover 不透底）、fork、右侧栏原生会话、引用预填、侧栏隐藏、提升长期、关闭标签丢弃、`SIGTERM` 删除日志、重启清理。
 - 未验证：侧聊里真实的模型回复（测试环境没有凭据；fork 来自一个已完成但失败的回合）。Desktop 使用相同的 Host/Client 部件，但没有单独复跑。
 
 ## 开发

@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-18
+
+### Changed
+
+- Removed the separate sidebar-foot Temporary chat entry and its active count.
+  Temporary chats are now created from the workspace row's `+`, which opens a
+  **New session / Temporary chat** menu in that exact workspace.
+- New Session's `Temporary` pill remains as the adopt-this-blank-session path.
+
+### Fixed
+
+- The floating selection action keeps its opaque background on hover; the
+  previous transparent hover token let the selected text show through, which
+  looked like the text floating up behind the button.
+
 ## [0.2.1] - 2026-10-18
 
 ### Fixed
