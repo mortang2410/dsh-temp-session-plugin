@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-18
+
+### Fixed
+
+- The floating selection action no longer sets a native `title` tooltip, whose
+  hover bubble overlapped the transcript. The hint remains its accessible name.
+- Removed the `End temporary chat` entry from the session row's "…" menu; the
+  composer strip remains the place to end a main temporary chat.
+
 ## [0.2.0] - 2026-10-17
 
 ### Added

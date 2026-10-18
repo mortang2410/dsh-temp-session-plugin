@@ -61,7 +61,7 @@ dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin'
 发布 tag 后固定到 tag，避免后续推送改变实际运行的代码：
 
 ```sh
-dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.0'
+dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.1'
 ```
 
 ### 卸载
@@ -77,7 +77,7 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 1. 点「新会话」，选择一个工作区，看向「新会话」那一行。
 2. 点工作区、预设旁边的「临时」选项；输入框上方出现虚线临时条。
 3. 正常聊天。发出第一条消息后，侧栏行标题变为「临时会话 · HH:mm」，标题栏出现「临时」标签。
-4. 在输入框上方或会话行「…」菜单里结束，或直接退出应用；日志会在退出时删除。
+4. 在输入框上方结束，或直接退出应用；日志会在退出时删除。
 
 侧栏底部的「临时会话」按钮是快捷入口：在当前或最近工作区里新建临时聊天。
 
@@ -129,7 +129,7 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 - 临时侧聊由客户端过滤出侧栏；刷新页面会从 Host 注册表恢复隐藏集合。删除后它仍会留在工作区的成员 id 列表里（浏览器会按会话列表过滤掉，属无害残留）。
 - 远程/移动端没有 `tempSession` Remote 的授权，远程连接创建临时会话会被拒绝。
 - 仅支持默认 JSONL 后端。
-- UI 依赖 `0.2.x` 的稳定槽位（`conversation.hero.options`、`sidebar.footer.action`、`conversation.session.header.actions`、`conversation.input.dock`、`sidebar.workspaces.session.menu.item`、`sidebar.session.row.leading`、`sidebar.right.pane.tab`、`shell.overlay`），未来 DSH 可能调整。
+- UI 依赖 `0.2.x` 的稳定槽位（`conversation.hero.options`、`sidebar.footer.action`、`conversation.session.header.actions`、`conversation.input.dock`、`sidebar.session.row.leading`、`sidebar.right.pane.tab`、`shell.overlay`），未来 DSH 可能调整。
 
 ## 验证
 

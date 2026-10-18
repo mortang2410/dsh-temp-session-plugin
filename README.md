@@ -39,8 +39,7 @@ plain JavaScript with no build step, so it installs directly from GitHub.
 - **Hidden side chats** — while temporary, forked side chats stay out of the
   sidebar and search; they appear only when promoted.
 - **End without opening** — end a main temporary chat from the strip above the
-  composer or from the session row's "…" menu. It is archived (hidden from the
-  list) immediately. Closing a side-chat tab discards it.
+  composer. It is archived (hidden from the list) immediately. Closing a side-chat tab discards it.
 - **Deleted on quit** — the Host removes every non-promoted temporary session's
   log directory on exit (normal exit, `SIGTERM`, or `SIGINT`).
 - **Crash recovery** — if the process was killed hard, the next boot deletes the
@@ -92,7 +91,7 @@ Restart the Web process and refresh the page.
 After a release tag exists, pin the tag so later pushes cannot change what runs:
 
 ```sh
-dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.0'
+dsh plugin --profile web add 'github:wj-spec/dsh-temp-session-plugin#v0.2.1'
 ```
 
 ### Uninstall
@@ -114,8 +113,8 @@ If temporary logs remain, delete them manually: the registry at
    now temporary; the dashed strip above the composer confirms it.
 3. Chat normally. The row is titled `Temporary chat · HH:mm` once the first
    message is sent, and the header shows a `Temporary` chip.
-4. End it from the strip above the composer or from the session row's "…" menu,
-   or just quit the app. Its log directory is deleted on exit.
+4. End it from the strip above the composer, or just quit the app. Its log
+   directory is deleted on exit.
 
 The sidebar-foot **Temporary chat** button is a shortcut that creates a
 temporary chat in the current (or most recent) workspace.
@@ -209,9 +208,9 @@ written:
   a backend that cannot locate a session directory.
 - UI integration relies on stable `0.2.x` slots (`conversation.hero.options`,
   `sidebar.footer.action`, `conversation.session.header.actions`,
-  `conversation.input.dock`, `sidebar.workspaces.session.menu.item`,
-  `sidebar.session.row.leading`, `sidebar.right.pane.tab`, `shell.overlay`). A
-  future DSH release may rename them.
+  `conversation.input.dock`, `sidebar.session.row.leading`,
+  `sidebar.right.pane.tab`, `shell.overlay`). A future DSH release may rename
+  them.
 
 ## Verification
 

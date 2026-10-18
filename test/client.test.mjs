@@ -185,7 +185,6 @@ test('apply mounts the remote namespace, locale, and temporary-session surfaces'
     'conversation.hero.options',
     'conversation.input.dock',
     'sidebar.session.row.leading',
-    'sidebar.workspaces.session.menu.item',
     'shell.overlay',
   ])
   assert.equal(calls.resources.length, 1)
@@ -356,4 +355,15 @@ test('components render the localized labels and only mark temporary Sessions', 
   assert.equal(dockElement.type, 'div')
   assert.ok(texts(dockElement).includes('badgeHint'))
   assert.ok(texts(dockElement).includes('end'))
+
+  // The selection action must not carry a native title tooltip (it overlaps
+  // the transcript); the hint stays as its accessible name.
+  const selection = captured.find(options => options.id === 'temp-session-selection')
+  const selectionProps = { ...selection.inject(), t }
+  selectionProps.store.setSelection({ text: 'x', x: 20, y: 30 })
+  const selectionElement = selection.component(selectionProps)
+  assert.equal(selectionElement.type, 'button')
+  assert.equal(selectionElement.props.title, undefined)
+  assert.equal(selectionElement.props['aria-label'], 'selectionHint')
+  assert.equal(captured.some(options => options.name === 'sidebar.workspaces.session.menu.item'), false)
 })

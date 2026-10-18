@@ -200,8 +200,6 @@ window.__ModuleLoader__.load({
 .dts-dockEnd{flex:none;display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:12px;line-height:18px;cursor:pointer}
 .dts-dockEnd:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dts-rowBadge{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;color:var(--dsw-alias-label-secondary)}
-.dts-menuItem{display:flex;align-items:center;gap:8px;width:100%;padding:6px 10px;box-sizing:border-box;border:0;border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:13px;line-height:18px;text-align:left;white-space:nowrap;cursor:pointer}
-.dts-menuItem:hover{background:var(--dsw-alias-interactive-bg-hover)}
 .dts-sidechat{display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0}
 .dts-sidebar{flex:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .dts-sidebarLabel{display:inline-flex;align-items:center;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
@@ -419,23 +417,6 @@ window.__ModuleLoader__.load({
         }, '\u00d7'))
     }
 
-    /** Sidebar row-menu entry that ends a temporary Session without opening it. */
-    function EndMenuItem({ sessionId, t, actions, store, useMenuOpenState }) {
-      const ids = React.useSyncExternalStore(store.subscribe, () => store.getSnapshot().ids)
-      const [, setMenuOpen] = useMenuOpenState()
-      if (!ids.has(sessionId)) return null
-      return h('button', {
-        type: 'button',
-        role: 'menuitem',
-        className: 'dts-menuItem',
-        onClick: (event) => {
-          event.stopPropagation()
-          setMenuOpen(false)
-          void actions.end(sessionId)
-        },
-      }, h(TrashIcon), h('span', null, t('end')))
-    }
-
     // ---- Forked side chats in the right sidebar ----
 
     const TEMPCHAT_PREFIX = 'dsh-resource://tempchat/session/'
@@ -543,7 +524,7 @@ window.__ModuleLoader__.load({
         type: 'button',
         className: 'dts-selectionAction',
         style: { left: `${selection.x}px`, top: `${selection.y}px` },
-        title: t('selectionHint'),
+        'aria-label': t('selectionHint'),
         onMouseDown: (event) => { event.preventDefault(); event.stopPropagation() },
         onClick: () => {
           const text = selection.text
@@ -1007,14 +988,6 @@ window.__ModuleLoader__.load({
         locale: NS,
         inject: () => ({ store }),
       }, RowBadge))
-
-      ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
-        name: 'sidebar.workspaces.session.menu.item',
-        id: 'temp-session-end',
-        order: 425,
-        locale: NS,
-        inject: () => ({ actions, store }),
-      }, EndMenuItem))
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',
