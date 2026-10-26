@@ -8,6 +8,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A failed `flush()` during registration rolls the provisional record back. Without that, a
+  reordered `register()` would strand a record that the sweep cannot clean up, because a record
+  without `dir` is skipped by `removeStorage`.
 - The registry record is now written before the session log is materialized, and refreshed once
   the locator resolves the directory. Previously a turn that landed during registration could be
   persisted by the flush while no record existed, which exposed it to readers that gate on this

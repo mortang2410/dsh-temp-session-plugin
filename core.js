@@ -223,9 +223,18 @@ export class TemporarySessions {
       }
       this.state.sessions[sessionId] = record
       await this.save()
-      // Materialize the log so its directory can be located.
-      await this.deps.sessions.flush(session)
-      const dir = this.dirOf(header)
+      // Materialize the log so its directory can be located. A failure here must not leave the
+      // record behind: the Session never became temporary, and a record without `dir` is skipped
+      // by removeStorage, so the sweep could never clean it up.
+      let dir
+      try {
+        await this.deps.sessions.flush(session)
+        dir = this.dirOf(header)
+      } catch (error) {
+        delete this.state.sessions[sessionId]
+        await this.save()
+        throw error
+      }
       if (dir === undefined) {
         delete this.state.sessions[sessionId]
         await this.save()
