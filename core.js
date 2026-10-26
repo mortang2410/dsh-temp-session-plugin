@@ -208,21 +208,30 @@ export class TemporarySessions {
         || (event.type === 'user/message' && event.data?.source?.kind === 'user'))
       if (used) throw new Error('only an unused Session can become temporary')
       const title = typeof request.title === 'string' ? request.title : ''
-      // Materialize the log so its directory can be located.
-      await this.deps.sessions.flush(session)
-      const dir = this.dirOf(header)
-      if (dir === undefined) {
-        throw new Error('temporary sessions need the JSONL session store (its locator is unavailable)')
-      }
+      // Publish the record before the log is materialized. This file is the only signal an
+      // outside reader has, and the flush below can persist a turn: with the record written
+      // afterwards, that turn is visible while the Session is still unregistered. `dir` is
+      // added once the locator can resolve it; a record without one is skipped by
+      // removeStorage and repaired by the sweep, so a crash between the two saves is safe.
       const record = {
         sessionId,
-        dir,
         cwd: header.cwd ?? null,
         createdAt: Date.now(),
         title,
         kind,
         pendingDelete: false,
       }
+      this.state.sessions[sessionId] = record
+      await this.save()
+      // Materialize the log so its directory can be located.
+      await this.deps.sessions.flush(session)
+      const dir = this.dirOf(header)
+      if (dir === undefined) {
+        delete this.state.sessions[sessionId]
+        await this.save()
+        throw new Error('temporary sessions need the JSONL session store (its locator is unavailable)')
+      }
+      record.dir = dir
       this.state.sessions[sessionId] = record
       await this.save()
       if (kind === 'side') this.prepareSideChat(sessionId)

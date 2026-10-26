@@ -119,6 +119,34 @@ test('register stores a fresh Session, titles it, and lists it', async () => {
   assert.equal(saved.sessions[session.id].dir, join(root, 'sessions', 'project', session.id))
 })
 
+test('the registry lists a fresh Session before its log is materialized', async () => {
+  // An outside reader learns nothing from the plugin except this file. If the record only
+  // appears after the flush, a turn written by that flush is visible while the Session is
+  // still unregistered.
+  const session = fakeSession('session-early')
+  const h = harness({ sessions: new Map([[session.id, session]]) })
+  let listedDuringFlush
+  h.temp.deps.sessions.flush = async () => {
+    const raw = await readFile(stateFile, 'utf8').catch(() => '')
+    listedDuringFlush = raw.includes(`"${session.id}":`)
+    return true
+  }
+  await h.temp.register({ sessionId: session.id })
+  assert.equal(listedDuringFlush, true)
+  // The locator's answer still lands in the registry after the flush.
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[session.id].dir, join(root, 'sessions', 'project', session.id))
+})
+
+test('a failed locator leaves no record behind', async () => {
+  const session = fakeSession('session-nolocator')
+  const h = harness({ sessions: new Map([[session.id, session]]) })
+  h.temp.deps.sessionPersistence = { locate: () => ({ kind: 'sqlite' }) }
+  await assert.rejects(h.temp.register({ sessionId: session.id }), /JSONL session store/)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(saved.sessions, {})
+})
+
 test('register rejects existing history and seeded or subagent Sessions', async () => {
   const h = harness({
     sessions: new Map([

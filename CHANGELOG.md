@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The registry record is now written before the session log is materialized, and refreshed once
+  the locator resolves the directory. Previously a turn that landed during registration could be
+  persisted by the flush while no record existed, which exposed it to readers that gate on this
+  file (mirrors, retention hooks). A failed locator rolls the provisional record back.
+
 ## [0.2.2] - 2026-10-18
 
 ### Changed
