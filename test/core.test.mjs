@@ -138,11 +138,16 @@ test('the registry lists a fresh Session before its log is materialized', async 
   assert.equal(saved.sessions[session.id].dir, join(root, 'sessions', 'project', session.id))
 })
 
-test('a failed flush leaves no record behind when nothing reached the disk', async () => {
+test('a directory without the log artifact does not keep a record', async () => {
+  // The Host creates the directory before it links the log, so a failure between the two leaves
+  // an empty directory and no transcript. That must not gate the Session.
   const session = fakeSession('session-badflush')
   const h = harness({ sessions: new Map([[session.id, session]]) })
-  h.temp.deps.sessions.flush = async () => { throw new Error('disk is full') }
-  await assert.rejects(h.temp.register({ sessionId: session.id }), /disk is full/)
+  h.temp.deps.sessions.flush = async () => {
+    await mkdir(join(root, 'sessions', 'project', session.id), { recursive: true })
+    throw new Error('link failed')
+  }
+  await assert.rejects(h.temp.register({ sessionId: session.id }), /link failed/)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.deepEqual(saved.sessions, {})
 })
@@ -155,6 +160,7 @@ test('a flush that publishes the log before failing keeps the record', async () 
   const dir = join(root, 'sessions', 'project', session.id)
   h.temp.deps.sessions.flush = async () => {
     await mkdir(dir, { recursive: true })
+    await writeFile(join(dir, 'session.v4.jsonl.zstd'), '')
     throw new Error('directory sync failed')
   }
   await assert.rejects(h.temp.register({ sessionId: session.id }), /directory sync failed/)

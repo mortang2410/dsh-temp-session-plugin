@@ -143,6 +143,17 @@ export class TemporarySessions {
    * @returns {string | undefined} absolute per-session directory.
    */
   dirOf(header) {
+    return this.resolveStorage(header)?.dir
+  }
+
+  /**
+   * The directory and the log artifact the Host would use for this Session.
+   * The artifact path matters on its own: a backend creates the directory before it links the
+   * log, so a directory says nothing about whether a transcript was published.
+   * @param {object} header - the live Session header.
+   * @returns {{dir: string, artifact: string} | undefined} absolute paths.
+   */
+  resolveStorage(header) {
     const locate = this.deps.sessionPersistence?.locate
     if (typeof locate !== 'function') return undefined
     try {
@@ -151,7 +162,7 @@ export class TemporarySessions {
         && typeof location === 'object'
         && location.kind === 'jsonl'
         && typeof location.path === 'string') {
-        return dirname(location.path)
+        return { dir: dirname(location.path), artifact: location.path }
       }
     } catch (error) {
       this.deps.logger.warn(`could not locate temporary-session storage: ${String(error)}`)
@@ -212,13 +223,13 @@ export class TemporarySessions {
       // from the header, so a backend that can answer now never needs a flush first, and a
       // backend that can only answer after the log exists would have to persist the very
       // transcript this record exists to gate.
-      const dir = this.dirOf(header)
-      if (dir === undefined) {
+      const storage = this.resolveStorage(header)
+      if (storage === undefined) {
         throw new Error('temporary sessions need the JSONL session store (its locator is unavailable)')
       }
       const record = {
         sessionId,
-        dir,
+        dir: storage.dir,
         cwd: header.cwd ?? null,
         createdAt: Date.now(),
         title,
@@ -236,7 +247,7 @@ export class TemporarySessions {
         // still leave the log on disk. Keep the record in that case: the Session was asked to be
         // temporary and its transcript is materialized, and a rollback would expose exactly that
         // transcript to every reader that gates on this file. Roll back only when nothing landed.
-        if (!existsSync(dir)) {
+        if (!existsSync(storage.artifact)) {
           delete this.state.sessions[sessionId]
           await this.save()
         }
