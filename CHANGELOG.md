@@ -8,13 +8,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- A failed `flush()` during registration rolls the provisional record back. Without that, a
-  reordered `register()` would strand a record that the sweep cannot clean up, because a record
-  without `dir` is skipped by `removeStorage`.
-- The registry record is now written before the session log is materialized, and refreshed once
-  the locator resolves the directory. Previously a turn that landed during registration could be
-  persisted by the flush while no record existed, which exposed it to readers that gate on this
-  file (mirrors, retention hooks). A failed locator rolls the provisional record back.
+- `register()` now resolves the storage directory and publishes the registry record before the
+  session log is materialized. Previously it flushed the log first and saved the record after, so
+  a turn persisted during registration was visible while the Session was still unregistered, to
+  every reader that gates on this file (mirrors, retention hooks). The locator computes the path
+  from the header, so no flush is needed to resolve it; a backend that cannot answer is refused
+  before anything is written.
+- A `flush()` failure after the record is published rolls it back, so a Session that never became
+  temporary is not left gated.
 
 ## [0.2.2] - 2026-10-18
 

@@ -147,13 +147,15 @@ test('a failed flush leaves no record behind', async () => {
   assert.deepEqual(saved.sessions, {})
 })
 
-test('a failed locator leaves no record behind', async () => {
+test('an unresolvable locator fails before anything is written', async () => {
   const session = fakeSession('session-nolocator')
   const h = harness({ sessions: new Map([[session.id, session]]) })
   h.temp.deps.sessionPersistence = { locate: () => ({ kind: 'sqlite' }) }
+  let flushed = false
+  h.temp.deps.sessions.flush = async () => { flushed = true; return true }
   await assert.rejects(h.temp.register({ sessionId: session.id }), /JSONL session store/)
-  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
-  assert.deepEqual(saved.sessions, {})
+  assert.equal(flushed, false)
+  await assert.rejects(readFile(stateFile, 'utf8'), /ENOENT/)
 })
 
 test('register rejects existing history and seeded or subagent Sessions', async () => {

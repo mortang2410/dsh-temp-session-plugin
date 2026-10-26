@@ -208,41 +208,35 @@ export class TemporarySessions {
         || (event.type === 'user/message' && event.data?.source?.kind === 'user'))
       if (used) throw new Error('only an unused Session can become temporary')
       const title = typeof request.title === 'string' ? request.title : ''
-      // Publish the record before the log is materialized. This file is the only signal an
-      // outside reader has, and the flush below can persist a turn: with the record written
-      // afterwards, that turn is visible while the Session is still unregistered. `dir` is
-      // added once the locator can resolve it; a record without one is skipped by
-      // removeStorage and repaired by the sweep, so a crash between the two saves is safe.
+      // Resolve the storage directory before anything is written. The locator computes the path
+      // from the header, so a backend that can answer now never needs a flush first, and a
+      // backend that can only answer after the log exists would have to persist the very
+      // transcript this record exists to gate.
+      const dir = this.dirOf(header)
+      if (dir === undefined) {
+        throw new Error('temporary sessions need the JSONL session store (its locator is unavailable)')
+      }
       const record = {
         sessionId,
+        dir,
         cwd: header.cwd ?? null,
         createdAt: Date.now(),
         title,
         kind,
         pendingDelete: false,
       }
+      // Publish the record before the log is materialized: this file is the only signal an
+      // outside reader has, and the flush below persists the Session's current content.
       this.state.sessions[sessionId] = record
       await this.save()
-      // Materialize the log so its directory can be located. A failure here must not leave the
-      // record behind: the Session never became temporary, and a record without `dir` is skipped
-      // by removeStorage, so the sweep could never clean it up.
-      let dir
       try {
         await this.deps.sessions.flush(session)
-        dir = this.dirOf(header)
       } catch (error) {
+        // The Session never became temporary, so it must not stay gated.
         delete this.state.sessions[sessionId]
         await this.save()
         throw error
       }
-      if (dir === undefined) {
-        delete this.state.sessions[sessionId]
-        await this.save()
-        throw new Error('temporary sessions need the JSONL session store (its locator is unavailable)')
-      }
-      record.dir = dir
-      this.state.sessions[sessionId] = record
-      await this.save()
       if (kind === 'side') this.prepareSideChat(sessionId)
       const controller = this.deps.sessionController
       if (controller !== undefined && title !== '') {
