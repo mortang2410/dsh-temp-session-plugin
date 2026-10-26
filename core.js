@@ -232,9 +232,14 @@ export class TemporarySessions {
       try {
         await this.deps.sessions.flush(session)
       } catch (error) {
-        // The Session never became temporary, so it must not stay gated.
-        delete this.state.sessions[sessionId]
-        await this.save()
+        // The backend links the artifact before it syncs the directory, so a failed flush can
+        // still leave the log on disk. Keep the record in that case: the Session was asked to be
+        // temporary and its transcript is materialized, and a rollback would expose exactly that
+        // transcript to every reader that gates on this file. Roll back only when nothing landed.
+        if (!existsSync(dir)) {
+          delete this.state.sessions[sessionId]
+          await this.save()
+        }
         throw error
       }
       if (kind === 'side') this.prepareSideChat(sessionId)

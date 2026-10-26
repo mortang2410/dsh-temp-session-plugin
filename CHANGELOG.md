@@ -14,8 +14,10 @@ All notable changes to this project are documented here. The format follows
   every reader that gates on this file (mirrors, retention hooks). The locator computes the path
   from the header, so no flush is needed to resolve it; a backend that cannot answer is refused
   before anything is written.
-- A `flush()` failure after the record is published rolls it back, so a Session that never became
-  temporary is not left gated.
+- A `flush()` failure rolls the record back only when nothing reached the disk. The Host backend
+  links the artifact before it syncs the directory, so a failed sync leaves the log on disk;
+  rolling back there would expose a temporary transcript to readers that gate on this file. A
+  publication that did land keeps the record, and a publication that did not is not gated.
 
 ## [0.2.2] - 2026-10-18
 
