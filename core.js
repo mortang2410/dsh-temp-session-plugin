@@ -18,6 +18,13 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 /** Registry schema version. A different version starts an empty registry. */
 export const STATE_VERSION = 1
 
+/**
+ * `kind` of a record the plugin created for a subagent child of a recorded
+ * temporary Session. Browser-adopted chats carry `main` or `side`, so readers
+ * and cleanup can tell the two apart.
+ */
+export const SUBAGENT_KIND = 'subagent'
+
 /** Boundary note added to a forked, temporary side conversation. */
 const SIDE_INSTRUCTIONS = `This is a temporary side conversation forked from the main conversation.
 Treat the inherited history as reference only. Do not continue the main task, its goals, plans, approvals, or tool calls. Answer the new side question independently. Do not use subagents. Change files or workspace state only when the user explicitly asks for that change in this side conversation.`
@@ -198,6 +205,7 @@ export class TemporarySessions {
         throw new Error('temporary session registration requires a Session id')
       }
       const existing = this.state.sessions[sessionId]
+      if (existing?.kind === SUBAGENT_KIND) throw new Error('a subagent Session cannot become temporary')
       if (existing !== undefined) return TemporarySessions.view(existing)
       const session = this.deps.sessions.get(sessionId)
       if (session === undefined) throw new Error('the Session is not live; open it before registering')
@@ -266,6 +274,103 @@ export class TemporarySessions {
     })
   }
 
+  /**
+   * Record a subagent child of a recorded temporary Session. The Host announces
+   * every new Session, so this runs for all of them and records only a subagent
+   * whose live ancestor chain reaches a recorded id. No unused-history rule
+   * applies: a child has turns by definition. A chain that breaks (an ancestor
+   * that is neither recorded nor live) records nothing, because a guessed link
+   * would let a later cleanup delete a transcript it does not own.
+   * @param {object} session - the Session the Host just announced.
+   * @returns {Promise<void>} settles after the registry write.
+   */
+  recordDescendant(session) {
+    return this.enqueue(async () => {
+      await this.load()
+      const header = session.header
+      if (header?.origin !== 'subagent' || typeof header.id !== 'string') return
+      if (this.state.sessions[header.id] !== undefined) return
+      const parentId = this.recordedAncestor(header)
+      if (parentId === undefined) return
+      const storage = this.resolveStorage(header)
+      if (storage === undefined) {
+        this.deps.logger.warn(`could not record subagent "${header.id}": the JSONL session store is unavailable`)
+        return
+      }
+      const record = {
+        sessionId: header.id,
+        dir: storage.dir,
+        cwd: header.cwd ?? null,
+        createdAt: Date.now(),
+        title: '',
+        kind: SUBAGENT_KIND,
+        parentSessionId: parentId,
+        pendingDelete: this.state.sessions[parentId].pendingDelete === true,
+      }
+      this.state.sessions[header.id] = record
+      try {
+        await this.save()
+      } catch (error) {
+        delete this.state.sessions[header.id]
+        throw error
+      }
+    })
+  }
+
+  /**
+   * The nearest recorded ancestor of a Session. Parent links are read from live
+   * Sessions; an ancestor that is neither recorded nor live ends the walk with
+   * no answer.
+   * @param {object} header - the Session header whose ancestors are walked.
+   * @returns {string | undefined} recorded ancestor id.
+   */
+  recordedAncestor(header) {
+    const seen = new Set()
+    let parentId = header.parentSession
+    while (typeof parentId === 'string' && !seen.has(parentId)) {
+      if (this.state.sessions[parentId]?.sessionId !== undefined) return parentId
+      seen.add(parentId)
+      const live = this.deps.sessions.get(parentId)
+      if (live === undefined) return undefined
+      parentId = live.header?.parentSession
+    }
+    return undefined
+  }
+
+  /**
+   * The subagent records that descend from a Session, through any depth of
+   * recorded parent links. Computed from the registry alone.
+   * @param {string} sessionId - the ancestor Session id.
+   * @returns {object[]} descendant records.
+   */
+  descendantRecords(sessionId) {
+    const ids = new Set([sessionId])
+    const found = []
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const record of Object.values(this.state.sessions)) {
+        if (record?.kind !== SUBAGENT_KIND || ids.has(record.sessionId)) continue
+        if (!ids.has(record.parentSessionId)) continue
+        ids.add(record.sessionId)
+        found.push(record)
+        grew = true
+      }
+    }
+    return found
+  }
+
+  /**
+   * The chat record for a browser-facing id. Subagent records are not chats, so
+   * the adopt, discard, and promote paths never see them.
+   * @param {unknown} sessionId - requested Session id.
+   * @returns {object | undefined} the chat record.
+   */
+  chatRecord(sessionId) {
+    const record = typeof sessionId === 'string' ? this.state.sessions[sessionId] : undefined
+    return record?.kind === SUBAGENT_KIND ? undefined : record
+  }
+
   /** List every recorded temporary Session, including ones already ended. */
   list() {
     return this.enqueue(async () => {
@@ -275,7 +380,7 @@ export class TemporarySessions {
         // can keep hiding them until the Host deletes their logs. The browser
         // derives its active count from pendingDelete.
         sessions: Object.values(this.state.sessions)
-          .filter(record => record?.sessionId !== undefined)
+          .filter(record => record?.sessionId !== undefined && record.kind !== SUBAGENT_KIND)
           .map(record => TemporarySessions.view(record)),
       }
     })
@@ -321,17 +426,22 @@ export class TemporarySessions {
     return this.enqueue(async () => {
       await this.load()
       const sessionId = request?.sessionId
-      const record = typeof sessionId === 'string' ? this.state.sessions[sessionId] : undefined
+      const record = this.chatRecord(sessionId)
       if (record === undefined) throw new Error('this Session is not a recorded temporary session')
+      // A discarded chat takes its subagent children with it: they are deleted by the same cleanup.
+      const children = this.descendantRecords(sessionId)
       record.pendingDelete = true
       record.discardedAt = Date.now()
+      for (const child of children) child.pendingDelete = true
       await this.save()
-      const agent = this.deps.agents?.get?.(sessionId)
-      if (agent?.status === 'running' && this.deps.sessionController !== undefined) {
-        try {
-          this.deps.sessionController.cancel({ sessionId })
-        } catch (error) {
-          this.deps.logger.warn(`could not cancel temporary session "${sessionId}": ${String(error)}`)
+      for (const id of [sessionId, ...children.map(child => child.sessionId)]) {
+        const agent = this.deps.agents?.get?.(id)
+        if (agent?.status === 'running' && this.deps.sessionController !== undefined) {
+          try {
+            this.deps.sessionController.cancel({ sessionId: id })
+          } catch (error) {
+            this.deps.logger.warn(`could not cancel temporary session "${id}": ${String(error)}`)
+          }
         }
       }
       return { discarded: true }
@@ -368,8 +478,10 @@ export class TemporarySessions {
     return this.enqueue(async () => {
       await this.load()
       const sessionId = request?.sessionId
-      const record = typeof sessionId === 'string' ? this.state.sessions[sessionId] : undefined
+      const record = this.chatRecord(sessionId)
       if (record === undefined) throw new Error('this Session is not a recorded temporary session')
+      // The kept chat's subagent logs must survive every later exit, so their records go too.
+      for (const child of this.descendantRecords(sessionId)) delete this.state.sessions[child.sessionId]
       delete this.state.sessions[sessionId]
       await this.save()
       const title = typeof request.title === 'string' ? request.title : ''

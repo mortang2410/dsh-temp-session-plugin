@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A subagent child of a recorded temporary chat is recorded when the Host announces it
+  (`session/created`), with `kind: "subagent"` and `parentSessionId` (the nearest recorded ancestor).
+  Exit, discard, and unload cleanup delete it with its chat, and `promote()` drops its records so the
+  kept chat's subagent logs survive. A chain that does not reach a recorded id through live Sessions is
+  never recorded. The record shape gains two fields; the file's top-level shape and version are unchanged.
+
 ### Fixed
 
 - `register()` now resolves the storage directory and publishes the registry record before the

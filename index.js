@@ -41,6 +41,15 @@ export async function apply(ctx) {
     paths,
   })
 
+  // Every announced Session passes here. A subagent under a recorded chat is recorded so exit,
+  // discard, and promote handle it with its chat. The listener never throws synchronously: a
+  // throw would roll back the Host attach, and a rejected promise is only logged.
+  ctx.on('session/created', (session) => {
+    temp.recordDescendant(session).catch((error) => {
+      log.warn(`temporary-session child tracking failed: ${String(error)}`)
+    })
+  })
+
   // Reap before the browser can list Sessions: every recorded Session that
   // does not belong to a live Agent is a leftover from a previous run.
   try {

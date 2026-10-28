@@ -334,3 +334,132 @@ test('a corrupt registry never throws and never deletes blindly', async () => {
   await h.temp.reap()
   assert.equal(cleanupAllSync(stateFile), 0)
 })
+
+/** Register a chat and record one subagent child under it. */
+async function chatWithChild() {
+  const chat = fakeSession('session-chat')
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  return { h, chat, child }
+}
+
+test('a subagent under a recorded chat is recorded at creation; other Sessions are not', async () => {
+  const chat = fakeSession('session-chat')
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
+  // A plain fork of a chat is not a subagent, so it is left to the browser path.
+  const fork = fakeSession('session-plain-fork', { parentSession: chat.id, isSeeded: true })
+  // A subagent whose parent is neither recorded nor live is a guess, so it is refused.
+  const stranger = fakeSession('session-stranger', { origin: 'subagent', parentSession: 'session-nowhere' })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [child.id, child], [fork.id, fork], [stranger.id, stranger]]),
+  })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  await h.temp.recordDescendant(fork)
+  await h.temp.recordDescendant(stranger)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(Object.keys(saved.sessions).sort(), ['session-chat', 'session-child'])
+  const { createdAt, ...record } = saved.sessions[child.id]
+  assert.ok(Number.isSafeInteger(createdAt))
+  assert.deepEqual(record, {
+    sessionId: child.id,
+    dir: join(root, 'sessions', 'project', child.id),
+    cwd: '/tmp/project',
+    title: '',
+    kind: 'subagent',
+    parentSessionId: chat.id,
+    pendingDelete: false,
+  })
+  // A Session without a header must not make the listener throw.
+  await assert.doesNotReject(h.temp.recordDescendant({}))
+})
+
+test('a subagent record is not a chat: it is not listed, adopted, discarded, or promoted', async () => {
+  const { h, chat, child } = await chatWithChild()
+  assert.deepEqual((await h.temp.list()).sessions.map(item => item.sessionId), [chat.id])
+  await assert.rejects(h.temp.register({ sessionId: child.id }), /subagent/)
+  await assert.rejects(h.temp.discard({ sessionId: child.id }), /not a recorded/)
+  await assert.rejects(h.temp.promote({ sessionId: child.id }), /not a recorded/)
+})
+
+test('a subagent under an unrecorded live ancestor is recorded under the nearest recorded id', async () => {
+  const chat = fakeSession('session-chat')
+  // The middle subagent was never announced to the plugin, so it is not recorded.
+  const middle = fakeSession('session-middle', { origin: 'subagent', parentSession: chat.id })
+  const leaf = fakeSession('session-leaf', { origin: 'subagent', parentSession: middle.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [middle.id, middle], [leaf.id, leaf]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(leaf)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[leaf.id].parentSessionId, chat.id)
+  assert.equal(saved.sessions[middle.id], undefined)
+})
+
+test('exit cleanup deletes a recorded child together with its chat', async () => {
+  const { chat, child } = await chatWithChild()
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  assert.equal(cleanupAllSync(stateFile), 2)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('discard marks the chat and its children, and unload cleanup deletes both', async () => {
+  const { h, chat, child } = await chatWithChild()
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  await h.temp.discard({ sessionId: chat.id })
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[child.id].pendingDelete, true)
+  await h.temp.cleanupPending()
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a child recorded after its chat was discarded inherits the pending deletion', async () => {
+  const chat = fakeSession('session-chat')
+  const late = fakeSession('session-late', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [late.id, late]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.discard({ sessionId: chat.id })
+  await h.temp.recordDescendant(late)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[late.id].pendingDelete, true)
+})
+
+test('promote drops the chat and its child records, so a later exit keeps the child log', async () => {
+  const { h, chat, child } = await chatWithChild()
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  await h.temp.promote({ sessionId: chat.id })
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(saved.sessions, {})
+  assert.equal(cleanupAllSync(stateFile), 0)
+  assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.equal(await readFile(join(chatDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+})
+
+test('boot reap deletes a child whose parent record is gone, and drops a child whose directory is gone', async () => {
+  const { h, child } = await chatWithChild()
+  const orphanDir = await materializeSession(child.id)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  // The parent record is removed without its cascade: the child must still be deleted.
+  delete saved.sessions['session-chat']
+  await writeFile(stateFile, JSON.stringify(saved))
+  h.live.clear()
+  await h.temp.reap()
+  await assert.rejects(readFile(join(orphanDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.deepEqual(JSON.parse(await readFile(stateFile, 'utf8')).sessions, {})
+
+  // A child whose directory was never materialized is dropped without error.
+  const chat2 = fakeSession('session-chat2')
+  const gone = fakeSession('session-gone', { origin: 'subagent', parentSession: chat2.id })
+  const again = harness({ sessions: new Map([[chat2.id, chat2], [gone.id, gone]]) })
+  await again.temp.register({ sessionId: chat2.id })
+  await again.temp.recordDescendant(gone)
+  again.live.clear()
+  await again.temp.reap()
+  assert.deepEqual(JSON.parse(await readFile(stateFile, 'utf8')).sessions, {})
+})

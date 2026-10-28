@@ -165,6 +165,10 @@ Safety boundaries:
   chat must be a **fork whose child-owned tail is unused** (only the inherited
   prefix carries turns). Neither can convert arbitrary existing history, and a
   subagent Session is refused.
+- A subagent the Host creates under a recorded chat is recorded automatically
+  (`kind: "subagent"`) and follows that chat through exit, discard, and unload
+  cleanup. Promoting the chat drops those records. A subagent whose parent chain
+  does not reach a recorded id is never recorded.
 - Deletion only targets a directory whose final path segment contains the
   session id, is absolute, and is nested at least three levels deep.
 - Records are stored under `$DSH_HOME`, and the registry is written atomically.
