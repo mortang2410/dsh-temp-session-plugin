@@ -167,8 +167,9 @@ Safety boundaries:
   subagent Session is refused.
 - A subagent the Host creates under a recorded chat is recorded automatically
   (`kind: "subagent"`) and follows that chat through exit, discard, and unload
-  cleanup. Promoting the chat drops those records. A subagent whose parent chain
-  does not reach a recorded id is never recorded.
+  cleanup. Promoting the chat drops those records. A subagent is recorded only when
+  its parent chain reaches a recorded id through live subagent Sessions. A chain that
+  passes through an ordinary fork, or never reaches a recorded id, is never recorded.
 - Deletion only targets a directory whose final path segment contains the
   session id, is absolute, and is nested at least three levels deep.
 - Records are stored under `$DSH_HOME`, and the registry is written atomically.
@@ -219,7 +220,7 @@ written:
 
 ## Verification
 
-- `npm run check`: 19 Host/client tests with no dependencies.
+- `npm run check`: 43 Host/client tests with no dependencies.
 - Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
   (both choices), no sidebar-foot temporary entry, selection action, fork,
   native right-sidebar conversation, quoted draft prefill, hidden sidebar row,

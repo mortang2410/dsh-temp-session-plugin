@@ -10,7 +10,7 @@
  * @module dsh-temp-session-plugin/core
  */
 
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
@@ -79,6 +79,25 @@ function emptyState() {
 }
 
 /**
+ * Parse registry text with the rules load() and registryForExit() share.
+ * @param {string} text - registry file contents.
+ * @returns {{ version: number, sessions: object } | undefined} the registry, or
+ *   undefined when the version or the sessions object does not match.
+ * @throws {SyntaxError} when the text is not JSON.
+ */
+function parseState(text) {
+  const parsed = JSON.parse(text)
+  if (parsed !== null
+    && typeof parsed === 'object'
+    && parsed.version === STATE_VERSION
+    && parsed.sessions !== null
+    && typeof parsed.sessions === 'object') {
+    return { version: STATE_VERSION, sessions: { ...parsed.sessions } }
+  }
+  return undefined
+}
+
+/**
  * Owns the temporary-session registry and its cleanup rules.
  *
  * Mutations are serialized through one promise chain, so two browser calls
@@ -100,7 +119,11 @@ export class TemporarySessions {
     this.paths = deps.paths
     this.state = emptyState()
     this.loaded = false
+    // The file exists but could not be read or parsed; the unload flush must not overwrite it.
+    this.unreadable = false
     this.queue = Promise.resolve()
+    // Announced subagents whose queued registry write has not associated them yet.
+    this.pending = []
   }
 
   /** Run one mutation after every mutation already queued. */
@@ -115,22 +138,47 @@ export class TemporarySessions {
     if (this.loaded) return this.state
     this.loaded = true
     try {
-      const text = await readFile(this.paths.file, 'utf8')
-      const parsed = JSON.parse(text)
-      if (parsed !== null
-        && typeof parsed === 'object'
-        && parsed.version === STATE_VERSION
-        && parsed.sessions !== null
-        && typeof parsed.sessions === 'object') {
-        this.state = { version: STATE_VERSION, sessions: { ...parsed.sessions } }
+      const state = parseState(await readFile(this.paths.file, 'utf8'))
+      if (state !== undefined) {
+        this.state = state
       } else {
+        this.unreadable = true
         this.deps.logger.warn(`ignoring unsupported temporary-session registry at ${this.paths.file}`)
       }
     } catch (error) {
       if (error?.code !== 'ENOENT') {
+        this.unreadable = true
         this.deps.logger.warn(`could not read temporary-session registry: ${String(error)}`)
       }
     }
+    return this.state
+  }
+
+  /**
+   * The registry as exit cleanup must see it. Exit handlers cannot await, so this is
+   * synchronous: it loads the file when no load has run, then associates every announced
+   * child still waiting in the queue. It never saves; exit cleanup only deletes.
+   * @returns {{ version: number, sessions: object }} the in-memory registry.
+   */
+  registryForExit() {
+    if (!this.loaded) {
+      this.loaded = true
+      try {
+        const state = parseState(readFileSync(this.paths.file, 'utf8'))
+        if (state !== undefined) {
+          this.state = state
+        } else {
+          this.unreadable = true
+          this.deps.logger.warn(`ignoring unsupported temporary-session registry at ${this.paths.file}`)
+        }
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          this.unreadable = true
+          this.deps.logger.warn(`could not read temporary-session registry: ${String(error)}`)
+        }
+      }
+    }
+    for (const session of this.pending) this.associateDescendant(session)
     return this.state
   }
 
@@ -140,6 +188,29 @@ export class TemporarySessions {
     const temporary = `${this.paths.file}.${process.pid}.${Date.now()}.tmp`
     await writeFile(temporary, encodeState(this.state), { mode: 0o600 })
     await rename(temporary, this.paths.file)
+    // The file now holds this state, so it is no longer unreadable.
+    this.unreadable = false
+  }
+
+  /**
+   * Publish the in-memory registry without awaiting. The unload path calls this before its queued
+   * work: a queued write can be blocked behind a save that never finishes, and a record that exists
+   * only in memory would otherwise be lost with this instance. Associates every announced child still
+   * waiting in the queue, then writes the state the way save() does: a temporary file renamed over the
+   * registry. A failed write is logged; a successful one is not. It returns early while the
+   * file is unreadable, so it never overwrites that file.
+   */
+  flushRegistrySync() {
+    if (!this.loaded || this.unreadable) return
+    for (const session of this.pending) this.associateDescendant(session)
+    try {
+      mkdirSync(this.paths.dir, { recursive: true, mode: 0o700 })
+      const temporary = `${this.paths.file}.${process.pid}.${Date.now()}.tmp`
+      writeFileSync(temporary, encodeState(this.state), { mode: 0o600 })
+      renameSync(temporary, this.paths.file)
+    } catch (error) {
+      this.deps.logger.warn(`could not publish temporary-session registry: ${String(error)}`)
+    }
   }
 
   /**
@@ -279,48 +350,60 @@ export class TemporarySessions {
    * every new Session, so this runs for all of them and records only a subagent
    * whose live ancestor chain reaches a recorded id. No unused-history rule
    * applies: a child has turns by definition. A chain that breaks (an ancestor
-   * that is neither recorded nor live) records nothing, because a guessed link
-   * would let a later cleanup delete a transcript it does not own.
+   * that is neither recorded nor a live subagent, such as an ordinary fork)
+   * records nothing, because a guessed link would let a later cleanup delete a
+   * transcript it does not own.
    * @param {object} session - the Session the Host just announced.
    * @returns {Promise<void>} settles after the registry write.
    */
   recordDescendant(session) {
+    // Pending before the queue wait, so exit cleanup sees the child while its write is queued.
+    this.pending.push(session)
     return this.enqueue(async () => {
       await this.load()
-      const header = session.header
-      if (header?.origin !== 'subagent' || typeof header.id !== 'string') return
-      if (this.state.sessions[header.id] !== undefined) return
-      const parentId = this.recordedAncestor(header)
-      if (parentId === undefined) return
-      const storage = this.resolveStorage(header)
-      if (storage === undefined) {
-        this.deps.logger.warn(`could not record subagent "${header.id}": the JSONL session store is unavailable`)
-        return
-      }
-      const record = {
-        sessionId: header.id,
-        dir: storage.dir,
-        cwd: header.cwd ?? null,
-        createdAt: Date.now(),
-        title: '',
-        kind: SUBAGENT_KIND,
-        parentSessionId: parentId,
-        pendingDelete: this.state.sessions[parentId].pendingDelete === true,
-      }
-      this.state.sessions[header.id] = record
-      try {
-        await this.save()
-      } catch (error) {
-        delete this.state.sessions[header.id]
-        throw error
-      }
+      const recorded = this.associateDescendant(session)
+      this.pending.splice(this.pending.indexOf(session), 1)
+      // A failed save keeps the record in memory: exit cleanup deletes it, unload publishes it, and the next save persists it.
+      if (recorded) await this.save()
     })
+  }
+
+  /**
+   * Add the in-memory record for one announced subagent when its live ancestor chain
+   * reaches a recorded id. Synchronous; the caller decides whether to save.
+   * @param {object} session - the Session the Host announced.
+   * @returns {boolean} whether a record was added.
+   */
+  associateDescendant(session) {
+    const header = session?.header
+    if (header?.origin !== 'subagent' || typeof header.id !== 'string') return false
+    if (this.state.sessions[header.id] !== undefined) return false
+    const parentId = this.recordedAncestor(header)
+    if (parentId === undefined) return false
+    const storage = this.resolveStorage(header)
+    if (storage === undefined) {
+      this.deps.logger.warn(`could not record subagent "${header.id}": the JSONL session store is unavailable`)
+      return false
+    }
+    const record = {
+      sessionId: header.id,
+      dir: storage.dir,
+      cwd: header.cwd ?? null,
+      createdAt: Date.now(),
+      title: '',
+      kind: SUBAGENT_KIND,
+      parentSessionId: parentId,
+      pendingDelete: this.state.sessions[parentId].pendingDelete === true,
+    }
+    this.state.sessions[header.id] = record
+    return true
   }
 
   /**
    * The nearest recorded ancestor of a Session. Parent links are read from live
    * Sessions; an ancestor that is neither recorded nor live ends the walk with
-   * no answer.
+   * no answer. So does a live ancestor that is not a subagent: an ordinary fork
+   * is a boundary, and its subagents belong to the fork, not to the chat above it.
    * @param {object} header - the Session header whose ancestors are walked.
    * @returns {string | undefined} recorded ancestor id.
    */
@@ -331,7 +414,7 @@ export class TemporarySessions {
       if (this.state.sessions[parentId]?.sessionId !== undefined) return parentId
       seen.add(parentId)
       const live = this.deps.sessions.get(parentId)
-      if (live === undefined) return undefined
+      if (live === undefined || live.header?.origin !== 'subagent') return undefined
       parentId = live.header?.parentSession
     }
     return undefined
@@ -434,14 +517,12 @@ export class TemporarySessions {
       record.discardedAt = Date.now()
       for (const child of children) child.pendingDelete = true
       await this.save()
-      for (const id of [sessionId, ...children.map(child => child.sessionId)]) {
-        const agent = this.deps.agents?.get?.(id)
-        if (agent?.status === 'running' && this.deps.sessionController !== undefined) {
-          try {
-            this.deps.sessionController.cancel({ sessionId: id })
-          } catch (error) {
-            this.deps.logger.warn(`could not cancel temporary session "${id}": ${String(error)}`)
-          }
+      const agent = this.deps.agents?.get?.(sessionId)
+      if (agent?.status === 'running' && this.deps.sessionController !== undefined) {
+        try {
+          this.deps.sessionController.cancel({ sessionId })
+        } catch (error) {
+          this.deps.logger.warn(`could not cancel temporary session "${sessionId}": ${String(error)}`)
         }
       }
       return { discarded: true }
@@ -499,7 +580,8 @@ export class TemporarySessions {
   /**
    * Boot-time cleanup: restore the archive set and delete every recorded
    * Session that no longer has a live Agent. Live Sessions (for example during
-   * a live profile reload) are kept for the next boot or process exit.
+   * a live profile reload) are kept for the next boot or process exit, and so
+   * is a subagent record under a live chat.
    */
   reap() {
     return this.enqueue(async () => {
@@ -511,6 +593,12 @@ export class TemporarySessions {
       } catch (error) {
         this.deps.logger.warn(`could not list stored sessions during temporary-session cleanup: ${String(error)}`)
       }
+      // Collected before anything is deleted, so a removed parent cannot break the chain for its children.
+      const kept = new Set()
+      for (const [sessionId, record] of Object.entries(this.state.sessions)) {
+        if (record?.kind === SUBAGENT_KIND || this.deps.sessions.get(sessionId) === undefined) continue
+        for (const child of this.descendantRecords(sessionId)) kept.add(child.sessionId)
+      }
       let changed = false
       for (const [sessionId, record] of Object.entries(this.state.sessions)) {
         if (record === null || typeof record !== 'object') {
@@ -518,7 +606,7 @@ export class TemporarySessions {
           changed = true
           continue
         }
-        if (this.deps.sessions.get(sessionId) !== undefined) continue
+        if (this.deps.sessions.get(sessionId) !== undefined || kept.has(sessionId)) continue
         try {
           await this.deps.workspaceRegistry?.unarchiveSession?.(sessionId)
         } catch (error) {
@@ -535,8 +623,12 @@ export class TemporarySessions {
     })
   }
 
-  /** On plugin unload, delete the storage of Sessions already ended by the user. */
+  /**
+   * On plugin unload, publish the registry synchronously, then delete the storage of Sessions
+   * already ended by the user. The publish runs before the queue, which can be blocked.
+   */
   cleanupPending() {
+    this.flushRegistrySync()
     return this.enqueue(async () => {
       await this.load()
       for (const record of Object.values(this.state.sessions)) {
@@ -551,23 +643,30 @@ export class TemporarySessions {
  * Synchronously delete every recorded temporary Session. Runs from process
  * `exit`/signal handlers, where asynchronous work can no longer finish.
  * Records stay behind as tombstones, so the next boot still clears the archive
- * set; the next boot's reap drops them.
+ * set; the next boot's reap drops them. A record that is only in memory, because
+ * its registry save has not finished, is deleted too; each Session is deleted once.
  * @param {string} stateFile - registry file path.
  * @param {{ warn?: (message: string) => void }} [logger] - optional logger.
+ * @param {() => { sessions?: object }} [stateProvider] - live registry, read at exit.
  * @returns {number} directories removed.
  */
-export function cleanupAllSync(stateFile, logger) {
+export function cleanupAllSync(stateFile, logger, stateProvider) {
   let parsed
   try {
     parsed = JSON.parse(readFileSync(stateFile, 'utf8'))
   } catch {
-    return 0
+    parsed = undefined
   }
-  if (parsed === null || typeof parsed !== 'object' || parsed.sessions === null || typeof parsed.sessions !== 'object') return 0
+  const onDisk = parsed === null || typeof parsed !== 'object' || parsed.sessions === null || typeof parsed.sessions !== 'object'
+    ? {}
+    : parsed.sessions
+  const inMemory = stateProvider?.()?.sessions ?? {}
+  const seen = new Set()
   let removed = 0
-  for (const record of Object.values(parsed.sessions)) {
+  for (const record of [...Object.values(onDisk), ...Object.values(inMemory)]) {
     if (record === null || typeof record !== 'object') continue
-    if (!isSafeSessionDir(record.dir, record.sessionId)) continue
+    if (!isSafeSessionDir(record.dir, record.sessionId) || seen.has(record.sessionId)) continue
+    seen.add(record.sessionId)
     if (!existsSync(record.dir)) continue
     try {
       rmSync(record.dir, { recursive: true, force: true })
@@ -583,20 +682,37 @@ export function cleanupAllSync(stateFile, logger) {
 const PROCESS_CLEANUP = Symbol.for('dsh.temp-session.process-cleanup')
 
 /**
+ * The state provider of the latest install, kept on `globalThis` so that every
+ * copy of this module (a reload can import a new one while the old handlers are
+ * still installed) reads the same binding. The exit handlers are installed once
+ * per process, so they read this binding at exit, not a closure from the first
+ * install, whose registry can be stale after a live reload.
+ */
+const EXIT_STATE_PROVIDER = Symbol.for('dsh.temp-session.exit-state-provider')
+
+/**
  * Install synchronous cleanup for normal exit, SIGTERM, and SIGINT. Signal
  * handling re-raises the original signal after deleting, so the Host keeps
  * whatever termination behavior it had without this plugin. Installation is
  * idempotent and intentionally never uninstalled: even an uninstalled plugin
- * must not leave temporary logs behind on the next quit.
+ * must not leave temporary logs behind on the next quit. Each call makes its
+ * `stateProvider` the one the handlers read; the returned disposer clears that
+ * binding if it still points at this call, so after an unload the handlers
+ * fall back to the disk registry alone.
  * @param {string} stateFile - registry file path.
  * @param {{ warn?: (message: string) => void }} [logger] - optional logger.
- * @returns {() => void} a no-op disposer.
+ * @param {() => { sessions?: object }} [stateProvider] - live registry, read at exit.
+ * @returns {() => void} disposer for this install's binding.
  */
-export function installProcessCleanup(stateFile, logger) {
-  if (globalThis[PROCESS_CLEANUP] === true) return () => undefined
+export function installProcessCleanup(stateFile, logger, stateProvider) {
+  globalThis[EXIT_STATE_PROVIDER] = stateProvider
+  const release = () => {
+    if (globalThis[EXIT_STATE_PROVIDER] === stateProvider) globalThis[EXIT_STATE_PROVIDER] = undefined
+  }
+  if (globalThis[PROCESS_CLEANUP] === true) return release
   const cleanup = () => {
     try {
-      cleanupAllSync(stateFile, logger)
+      cleanupAllSync(stateFile, logger, globalThis[EXIT_STATE_PROVIDER])
     } catch (error) {
       logger?.warn?.(`temporary-session exit cleanup failed: ${String(error)}`)
     }
@@ -616,5 +732,5 @@ export function installProcessCleanup(stateFile, logger) {
   process.on('SIGTERM', onSignal)
   process.on('SIGINT', onSignal)
   globalThis[PROCESS_CLEANUP] = true
-  return () => undefined
+  return release
 }

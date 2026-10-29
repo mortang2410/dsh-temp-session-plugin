@@ -64,7 +64,7 @@ export async function apply(ctx) {
 
   // A hard KillAgent shutdown sends SIGTERM without Cordis disposal: delete
   // synchronously there and at normal process exit.
-  ctx.effect(() => installProcessCleanup(paths.file, log), 'temp-session: process cleanup')
+  ctx.effect(() => installProcessCleanup(paths.file, log, () => temp.registryForExit()), 'temp-session: process cleanup')
 
   /**
    * Host service behind the `tempSession` Remote namespace. Methods are

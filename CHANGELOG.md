@@ -27,6 +27,14 @@ All notable changes to this project are documented here. The format follows
   failure after the directory exists says nothing about the transcript: the check is the final
   artifact path the locator returns. A publication that did land keeps the record, and a
   publication that did not is not gated.
+- Subagent records of a temporary chat are narrowed and kept longer. A subagent whose parent chain
+  passes through a live, unrecorded ordinary (non-subagent) Session is no longer recorded, so discard
+  and unload cleanup cannot delete a transcript the chat does not own. A live profile reload keeps a
+  settled child record and its log while the chat stays live, so a later promotion still keeps them.
+  Process exit also deletes a child whose registry save has not finished, because its record is read
+  from memory as well as from disk. Discard no longer sends `cancel` to subagent children, which the
+  Host refuses: a running child keeps running until it settles, and its record is marked for deletion
+  with its chat.
 
 ## [0.2.2] - 2026-10-18
 

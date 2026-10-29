@@ -108,7 +108,7 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 
 - 主区域临时会话必须是**全新的、空的、顶层、非 fork** 会话；侧聊必须是**子会话自有尾部未使用**的 fork（历史只在继承前缀里）。两者都不能把任意已有历史转成临时，subagent 会话一律拒绝。
 - 删除目标必须是绝对路径、至少三层深，且最后一段包含会话 id。
-- Host 在已记录的临时会话下创建的 subagent 会自动记录（`kind: "subagent"`），并随该会话一起在退出、丢弃和卸载清理时删除；保留该会话会同时删除这些记录。祖先链无法通过已记录 id 追溯到的 subagent 一律不记录。
+- Host 在已记录的临时会话下创建的 subagent 会自动记录（`kind: "subagent"`），并随该会话一起在退出、丢弃和卸载清理时删除；保留该会话会同时删除这些记录。只有祖先链经由存活的 subagent 会话追溯到已记录 id 时才记录；经过普通 fork 的链，或追溯不到已记录 id 的链，一律不记录。
 - 注册表位于 `$DSH_HOME` 下，原子写入。
 - 插件不会碰附件，也不会碰其他会话的数据。
 
@@ -134,7 +134,7 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 
 ## 验证
 
-- `npm run check`：19 个 Host/Client 测试，无需安装依赖。
+- `npm run check`：43 个 Host/Client 测试，无需安装依赖。
 - 在一次性 `0.2.1-rc.1` Web profile 上用 Playwright 验证：工作区「+」菜单二选一、侧栏底部无临时入口、选区浮层（hover 不透底）、fork、右侧栏原生会话、引用预填、侧栏隐藏、提升长期、关闭标签丢弃、`SIGTERM` 删除日志、重启清理。
 - 未验证：侧聊里真实的模型回复（测试环境没有凭据；fork 来自一个已完成但失败的回合）。Desktop 使用相同的 Host/Client 部件，但没有单独复跑。
 

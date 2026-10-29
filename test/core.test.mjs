@@ -4,13 +4,14 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, beforeEach, test } from 'node:test'
 import {
   TemporarySessions,
   cleanupAllSync,
+  installProcessCleanup,
   isSafeSessionDir,
   statePaths,
 } from '../core.js'
@@ -335,6 +336,18 @@ test('a corrupt registry never throws and never deletes blindly', async () => {
   assert.equal(cleanupAllSync(stateFile), 0)
 })
 
+test('unload leaves an unreadable registry file untouched and leaves no temporary file', async () => {
+  const dir = join(root, 'temp-session')
+  const truncated = '{"version":1,"sessions":{'
+  await mkdir(dir, { recursive: true })
+  await writeFile(stateFile, truncated)
+  const h = harness()
+  await h.temp.load()
+  await h.temp.cleanupPending()
+  assert.equal(await readFile(stateFile, 'utf8'), truncated)
+  assert.deepEqual((await readdir(dir)).filter(name => name.endsWith('.tmp')), [])
+})
+
 /** Register a chat and record one subagent child under it. */
 async function chatWithChild() {
   const chat = fakeSession('session-chat')
@@ -463,3 +476,327 @@ test('boot reap deletes a child whose parent record is gone, and drops a child w
   await again.temp.reap()
   assert.deepEqual(JSON.parse(await readFile(stateFile, 'utf8')).sessions, {})
 })
+
+test('a subagent of an ordinary fork is not recorded under the chat the fork came from', async () => {
+  const chat = fakeSession('session-chat')
+  // An ordinary fork of the chat is live and unrecorded. Its subagent belongs to the fork.
+  const fork = fakeSession('session-plain-fork', { parentSession: chat.id, isSeeded: true })
+  const child = fakeSession('session-plain-child', { origin: 'subagent', parentSession: fork.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(Object.keys(saved.sessions), [chat.id])
+  // Ending the chat must leave the fork's subagent log alone.
+  const childDir = await materializeSession(child.id)
+  await h.temp.discard({ sessionId: chat.id })
+  await h.temp.cleanupPending()
+  assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+})
+
+test('reap keeps a settled child while its live chat stays, through every depth, and promotion keeps its log', async () => {
+  const chat = fakeSession('session-chat')
+  const middle = fakeSession('session-middle', { origin: 'subagent', parentSession: chat.id })
+  const leaf = fakeSession('session-leaf', { origin: 'subagent', parentSession: middle.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [middle.id, middle], [leaf.id, leaf]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(middle)
+  await h.temp.recordDescendant(leaf)
+  const leafDir = await materializeSession(leaf.id)
+  // Both children settle while the chat stays live, as they do across a live profile reload.
+  h.live.delete(middle.id)
+  h.live.delete(leaf.id)
+  await h.temp.reap()
+  const kept = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(Object.keys(kept.sessions).sort(), ['session-chat', 'session-leaf', 'session-middle'])
+  assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  await h.temp.promote({ sessionId: chat.id })
+  assert.equal(cleanupAllSync(stateFile), 0)
+  assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+})
+
+test('exit cleanup also deletes a child whose registry save has not finished', async () => {
+  const chat = fakeSession('session-chat')
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  // The child is associated in memory, and its registry save is still pending when the process exits.
+  let saveStarted
+  const started = new Promise(resolve => { saveStarted = resolve })
+  h.temp.save = () => { saveStarted(); return new Promise(() => {}) }
+  void h.temp.recordDescendant(child)
+  await started
+  const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(onDisk.sessions[child.id], undefined)
+  const removed = cleanupAllSync(stateFile, undefined, () => h.temp.state)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(removed, 2)
+  // A boot reap after the exit: the child was never saved, so it has no record and its directory stays gone.
+  await new TemporarySessions(h.temp.deps).reap()
+  const afterReap = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(afterReap.sessions[child.id], undefined)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('discard sends cancel only to the chat, never to a subagent child the Host refuses', async () => {
+  const chat = fakeSession('session-chat')
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [child.id, child]]),
+    registry: { running: [chat.id, child.id] },
+  })
+  const attempts = []
+  // The Host refuses cancel for every subagent-owned Session.
+  h.temp.deps.sessionController.cancel = ({ sessionId }) => {
+    attempts.push(sessionId)
+    if (sessionId === child.id) throw new Error('session is owned by subagent routing')
+  }
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  await h.temp.discard({ sessionId: chat.id })
+  assert.deepEqual(attempts, [chat.id])
+  // The child is still marked for deletion with its chat.
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[child.id].pendingDelete, true)
+})
+
+const PROCESS_CLEANUP_FLAG = Symbol.for('dsh.temp-session.process-cleanup')
+const EXIT_STATE_PROVIDER_KEY = Symbol.for('dsh.temp-session.exit-state-provider')
+
+/**
+ * Runs a body with the once-per-process guard and the exit state provider
+ * cleared, so this test's install adds its own exit handler whether or not
+ * another test installed one first. The body receives a reader for the exit
+ * listeners this run added. Afterwards the added listeners are removed and both
+ * globals are restored.
+ */
+async function withFreshProcessCleanup(body) {
+  const savedGuard = globalThis[PROCESS_CLEANUP_FLAG]
+  const savedProvider = globalThis[EXIT_STATE_PROVIDER_KEY]
+  delete globalThis[PROCESS_CLEANUP_FLAG]
+  delete globalThis[EXIT_STATE_PROVIDER_KEY]
+  const exitBefore = new Set(process.listeners('exit'))
+  const signalsBefore = ['SIGTERM', 'SIGINT'].map(name => [name, new Set(process.listeners(name))])
+  try {
+    return await body(() => process.listeners('exit').filter(listener => !exitBefore.has(listener)))
+  } finally {
+    for (const listener of process.listeners('exit')) {
+      if (!exitBefore.has(listener)) process.off('exit', listener)
+    }
+    for (const [name, before] of signalsBefore) {
+      for (const listener of process.listeners(name)) {
+        if (!before.has(listener)) process.off(name, listener)
+      }
+    }
+    if (savedGuard === undefined) delete globalThis[PROCESS_CLEANUP_FLAG]
+    else globalThis[PROCESS_CLEANUP_FLAG] = savedGuard
+    if (savedProvider === undefined) delete globalThis[EXIT_STATE_PROVIDER_KEY]
+    else globalThis[EXIT_STATE_PROVIDER_KEY] = savedProvider
+  }
+}
+
+test('exit cleanup reads the latest install registry, not the first install', () => withFreshProcessCleanup(async addedExitListeners => {
+  const dirA = await materializeSession('session-a-first')
+  const dirB = await materializeSession('session-b-latest')
+  const disposeFirst = installProcessCleanup(stateFile, undefined, () => ({
+    sessions: { 'session-a-first': { sessionId: 'session-a-first', dir: dirA } },
+  }))
+  installProcessCleanup(stateFile, undefined, () => ({
+    sessions: { 'session-b-latest': { sessionId: 'session-b-latest', dir: dirB } },
+  }))
+  // The first instance unloads after the second installed, as in a live profile reload.
+  disposeFirst()
+  assert.equal(addedExitListeners().length, 1)
+  addedExitListeners()[0]()
+  await assert.rejects(readFile(join(dirB, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(dirA, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+}))
+
+test('a disposer clears the exit registry, so exit falls back to the disk registry alone', () => withFreshProcessCleanup(async addedExitListeners => {
+  const dirLive = await materializeSession('session-live-memory')
+  const dirDisk = await materializeSession('session-disk-record')
+  await mkdir(join(stateFile, '..'), { recursive: true })
+  await writeFile(stateFile, JSON.stringify({
+    version: 1,
+    sessions: { 'session-disk-record': { sessionId: 'session-disk-record', dir: dirDisk } },
+  }))
+  const dispose = installProcessCleanup(stateFile, undefined, () => ({
+    sessions: { 'session-live-memory': { sessionId: 'session-live-memory', dir: dirLive } },
+  }))
+  dispose()
+  addedExitListeners()[0]()
+  await assert.rejects(readFile(join(dirDisk, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(dirLive, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+}))
+
+test('exit cleanup deletes a child queued behind a held registry save, with its chat', async () => {
+  const chat = fakeSession('session-chat')
+  const first = fakeSession('session-first', { origin: 'subagent', parentSession: chat.id })
+  const second = fakeSession('session-second', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [first.id, first], [second.id, second]]),
+  })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const firstDir = await materializeSession(first.id)
+  const secondDir = await materializeSession(second.id)
+  // The first child's registry save never finishes, so the second child waits behind it in the queue.
+  let saveStarted
+  const started = new Promise(resolve => { saveStarted = resolve })
+  h.temp.save = () => { saveStarted(); return new Promise(() => {}) }
+  void h.temp.recordDescendant(first)
+  await started
+  void h.temp.recordDescendant(second)
+  assert.equal(h.temp.state.sessions[second.id], undefined)
+  const removed = cleanupAllSync(stateFile, undefined, () => h.temp.registryForExit())
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(firstDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(secondDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(removed, 3)
+  // A boot after the exit finds no record and no directory for the queued child.
+  h.live.clear()
+  await new TemporarySessions(h.temp.deps).reap()
+  const afterReap = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(afterReap.sessions, {})
+  await assert.rejects(readFile(join(secondDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a failed child save keeps the record for exit cleanup and for the next successful save', async () => {
+  const chat = fakeSession('session-chat')
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
+  const second = fakeSession('session-second', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [child.id, child], [second.id, second]]),
+  })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  // Exactly one registry write fails, as a full disk would.
+  const save = h.temp.save
+  let failures = 1
+  h.temp.save = async function failOnce() {
+    if (failures > 0) {
+      failures -= 1
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    }
+    return save.call(this)
+  }
+  await assert.rejects(h.temp.recordDescendant(child), /ENOSPC/)
+  assert.notEqual(h.temp.state.sessions[child.id], undefined)
+  const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(onDisk.sessions[child.id], undefined)
+  // Exit cleanup still sees the child's record in memory.
+  const removed = cleanupAllSync(stateFile, undefined, () => h.temp.registryForExit())
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(removed, 2)
+  // The next successful save persists the record that the failed save left in memory.
+  await h.temp.recordDescendant(second)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.notEqual(saved.sessions[child.id], undefined)
+  assert.notEqual(saved.sessions[second.id], undefined)
+})
+
+/**
+ * After an unload that left records only in memory: each child's record is on disk, a fresh
+ * instance's boot reap keeps the children while the chat is live, and that instance's exit
+ * cleanup deletes the children with the chat. The children are not live in the fresh boot,
+ * so only the chat-owned rule can keep them.
+ */
+async function assertUnloadPublishes(h, addedExitListeners, { chatDir, children }) {
+  const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
+  for (const child of children) assert.notEqual(onDisk.sessions[child.id], undefined)
+  for (const child of children) h.live.delete(child.id)
+  const successor = new TemporarySessions(h.temp.deps)
+  await successor.reap()
+  const afterReap = JSON.parse(await readFile(stateFile, 'utf8'))
+  for (const child of children) {
+    assert.notEqual(afterReap.sessions[child.id], undefined)
+    assert.equal(await readFile(join(child.dir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  }
+  installProcessCleanup(stateFile, undefined, () => successor.registryForExit())
+  assert.equal(addedExitListeners().length, 1)
+  addedExitListeners()[0]()
+  for (const child of children) {
+    await assert.rejects(readFile(join(child.dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  }
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+}
+
+test('unload publishes a child queued behind a held save, so a fresh boot and exit still see it', () => withFreshProcessCleanup(async addedExitListeners => {
+  const chat = fakeSession('session-chat')
+  const first = fakeSession('session-first', { origin: 'subagent', parentSession: chat.id })
+  const second = fakeSession('session-second', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [first.id, first], [second.id, second]]),
+  })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const firstDir = await materializeSession(first.id)
+  const secondDir = await materializeSession(second.id)
+  // The first child's registry save never finishes, so the second child waits behind it in the queue.
+  let saveStarted
+  const started = new Promise(resolve => { saveStarted = resolve })
+  h.temp.save = () => { saveStarted(); return new Promise(() => {}) }
+  void h.temp.recordDescendant(first)
+  await started
+  void h.temp.recordDescendant(second)
+  assert.notEqual(h.temp.state.sessions[first.id], undefined)
+  assert.equal(h.temp.state.sessions[second.id], undefined)
+  // Unload runs while the queue is blocked. It must publish both memory-only records without waiting.
+  void h.temp.cleanupPending()
+  await assertUnloadPublishes(h, addedExitListeners, {
+    chatDir,
+    children: [{ id: first.id, dir: firstDir }, { id: second.id, dir: secondDir }],
+  })
+}))
+
+test('unload publishes a child whose save failed, so a fresh boot and exit still see it', () => withFreshProcessCleanup(async addedExitListeners => {
+  const chat = fakeSession('session-chat')
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  // Exactly one registry write fails, as a full disk would.
+  const save = h.temp.save
+  let failures = 1
+  h.temp.save = async function failOnce() {
+    if (failures > 0) {
+      failures -= 1
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    }
+    return save.call(this)
+  }
+  await assert.rejects(h.temp.recordDescendant(child), /ENOSPC/)
+  assert.notEqual(h.temp.state.sessions[child.id], undefined)
+  await h.temp.cleanupPending()
+  await assertUnloadPublishes(h, addedExitListeners, {
+    chatDir,
+    children: [{ id: child.id, dir: childDir }],
+  })
+}))
+
+test('an exit listener from an earlier module generation reads the latest install registry', () => withFreshProcessCleanup(async addedExitListeners => {
+  // Two module instances of core.js stand for two generations of one plugin after a watched-file reload.
+  const generationOne = await import(new URL('../core.js?generation=1', import.meta.url).href)
+  const generationTwo = await import(new URL('../core.js?generation=2', import.meta.url).href)
+  assert.notEqual(generationOne, generationTwo)
+  const dirA = await materializeSession('session-generation-one')
+  const dirB = await materializeSession('session-generation-two')
+  const disposeFirst = generationOne.installProcessCleanup(stateFile, undefined, () => ({
+    sessions: { 'session-generation-one': { sessionId: 'session-generation-one', dir: dirA } },
+  }))
+  disposeFirst()
+  generationTwo.installProcessCleanup(stateFile, undefined, () => ({
+    sessions: { 'session-generation-two': { sessionId: 'session-generation-two', dir: dirB } },
+  }))
+  // Only the first generation installed a handler; it must read the second generation's registry at exit.
+  assert.equal(addedExitListeners().length, 1)
+  addedExitListeners()[0]()
+  await assert.rejects(readFile(join(dirB, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(dirA, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+}))
