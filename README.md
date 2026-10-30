@@ -156,8 +156,8 @@ Deletion points:
 | Moment | What happens |
 |---|---|
 | App exit / `SIGTERM` / `SIGINT` | Every directory in the validated exit snapshot is deleted synchronously; exit never parses the registry file. |
-| Plugin unload / live profile reload | Only sessions the user already ended are deleted; live ones stay. |
-| Next boot | Recorded sessions with no live agent are deleted before the browser connects, and their archive entries are cleared. |
+| Plugin unload / live profile reload | Pending sessions are stopped again, and only members whose stop is confirmed idle with no owned job are deleted; live or unconfirmed work stays. |
+| Next boot | Journal-pending sessions resume their stop before the browser connects; confirmed members are deleted and their archive entries are cleared. |
 
 Safety boundaries:
 
@@ -167,9 +167,14 @@ Safety boundaries:
   subagent Session is refused.
 - A subagent the Host creates under a recorded chat is recorded automatically
   (`kind: "subagent"`) and follows that chat through exit, discard, and unload
-  cleanup. A discard drops its records. A descendant is recorded only when its
-  parent chain reaches a recorded temporary id through live ordinary forks or
-  subagent Sessions. A chain with no recorded ancestor is never recorded.
+  cleanup. Discard archives each chat with its activity stop, cancels live
+  Agents, and kills owned jobs; records stay visibly stopping until settlement
+  is confirmed. Plugin unload deletes only members it confirms idle with no
+  owned job; process exit deletes every directory in its validated exit
+  snapshot, and the next boot resumes a pending stop and deletes confirmed
+  members. A descendant is recorded only when
+  its parent chain reaches a recorded temporary id through live ordinary forks
+  or subagent Sessions. A chain with no recorded ancestor is never recorded.
 - Deletion only targets a directory whose final path segment contains the
   session id, is absolute, and is nested at least three levels deep.
 - Records are stored under `$DSH_HOME`, and the registry is written atomically.
@@ -199,9 +204,10 @@ written:
 
 - A side chat needs a **completed turn** in the parent; a brand-new chat shows a
   notice instead of forking.
-- Ending a main temporary chat archives and hides it, but its log remains on disk
-  until the app exits. Closing a side-chat tab marks it for deletion the same
-  way. DSH `0.2.x` does not expose a per-session delete command for a live agent.
+- Ending a main temporary chat archives and hides it, and asks the Host to stop
+  its Agents and jobs, but its log remains on disk until unload confirms it
+  idle, the app exits, or the next boot resumes the stop. Closing a side-chat
+  tab marks it the same way.
 - Closing a side-chat tab is permanent for that temporary fork: there is no
   reopen entry, and it is deleted on exit.
 - A hidden temporary side chat is kept out of the sidebar by a client-side
@@ -220,7 +226,7 @@ written:
 
 ## Verification
 
-- `npm run check`: 183 Host/client tests with no dependencies.
+- `npm run check`: 207 Host/client tests with no dependencies.
 - Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
   (both choices), no sidebar-foot temporary entry, selection action, fork,
   native right-sidebar conversation, quoted draft prefill, hidden sidebar row,

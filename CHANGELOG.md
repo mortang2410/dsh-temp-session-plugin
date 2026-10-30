@@ -17,9 +17,27 @@ All notable changes to this project are documented here. The format follows
   dropped, and shows a per-chat stopping entry independent of closed chat views.
 - A subagent child of a recorded temporary chat is recorded when the Host announces it
   (`session/created`), with `kind: "subagent"` and `parentSessionId` (the nearest recorded ancestor).
-  Exit, discard, and unload cleanup delete it with its chat. A chain that does not reach a
+  Exit, discard, and unload cleanup handle it with its chat. A chain that does not reach a
   recorded id through live Sessions is never recorded. The record shape gains two fields; the
   file's top-level shape and version are unchanged.
+- Discard, unload and later expiry share one stop path: one journal `pending` event for
+  the whole tree, archive each chat with `stopActivity`, cancel live chat and subagent
+  Agents, kill and await owned jobs, and keep a member visibly stopping until settlement
+  is confirmed. A later descendant of a pending tree inherits stopping and is stopped by
+  reconciliation. After a tree settles, its record stays pending and hidden while its public
+  stopping entries and count clear. A public list revalidates live work first, so a wake or owned
+  job that starts before the next retry is still reported as stopping. A temporary side chat
+  follows only pending ancestors for owned jobs, so unrelated work in its ordinary source chat is
+  outside its stop chain. The stop path emits an ordered trace used by
+  `test/probes/stop-tree.mjs`.
+- A pending tree keeps reconciling after its first confirmation, so an Agent or owned job
+  that starts later is stopped again. A background subagent job is recognized through its
+  parent owner, and a job that appears during the idle wait or before removal blocks both
+  confirmation and deletion. Unload deletes a member only after the same stop pass
+  succeeded.
+- The main chat's End action sends the discard before any archive, so the Host can journal
+  the tree first; the browser no longer archives or stops the chat ahead of that event.
+  List results carry `stoppingCount` alongside their stopping entries.
 
 ### Changed
 
@@ -52,9 +70,9 @@ All notable changes to this project are documented here. The format follows
   and unload cleanup cannot delete a transcript the chat does not own. A live profile reload keeps a
   settled child record and its log while the chat stays live, and a later discard deletes them.
   Process exit also deletes a child whose registry save has not finished, because its record is read
-  from memory as well as from disk. Discard no longer sends `cancel` to subagent children, which the
-  Host refuses: a running child keeps running until it settles, and its record is marked for deletion
-  with its chat.
+  from memory as well as from disk. Discard now cancels a live subagent with the parent cause and
+  keeps its record pending until settlement is confirmed; a held or unlisted stop stays visibly
+  stopping and is retried instead of being reported as deleted.
 
 ## [0.2.2] - 2026-10-18
 

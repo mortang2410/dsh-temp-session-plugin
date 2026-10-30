@@ -119,6 +119,8 @@ function harness({ sessions = new Map(), stored = [], registry, persistence = {}
   const renames = []
   const cancelled = []
   const unarchived = []
+  const archived = []
+  const traces = []
   const deps = {
     sessions: { get: id => live.get(id), flush: async () => true },
     sessionPersistence: {
@@ -138,7 +140,16 @@ function harness({ sessions = new Map(), stored = [], registry, persistence = {}
       cancel: request => { cancelled.push(request.sessionId); return { accepted: true } },
     },
     agents: { get: id => (registry?.running?.includes(id) ? { status: 'running' } : undefined) },
-    workspaceRegistry: { unarchiveSession: async id => { unarchived.push(id) } },
+    jobs: {
+      list: () => [],
+      kill: () => 'requested',
+      wait: async () => ({ status: 'killed' }),
+    },
+    workspaceRegistry: {
+      archiveSession: async (sessionId, options) => { archived.push({ sessionId, options }) },
+      unarchiveSession: async id => { unarchived.push(id) },
+    },
+    trace: message => { traces.push(message) },
     logger: { warn: message => warnings.push(message), info: () => {} },
     paths: statePaths({ DSH_HOME: root }),
   }
@@ -150,6 +161,8 @@ function harness({ sessions = new Map(), stored = [], registry, persistence = {}
     renames,
     cancelled,
     unarchived,
+    archived,
+    traces,
   }
 }
 
@@ -168,6 +181,35 @@ async function waitFor(predicate, message, timeout = 2000) {
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   assert.fail(message)
+}
+
+/**
+ * A fake Agent that records its cancel cause and drops queued input by default,
+ * so a test can observe both the stop signal and the settlement it produces.
+ */
+function workingAgent({ status = 'running', onCancel, whenIdle } = {}) {
+  const agent = {
+    status,
+    inbox: { nextTurn: [], nextStep: [] },
+    cancels: [],
+    whenIdle: whenIdle ?? (async () => {}),
+  }
+  agent.cancel = (cause) => {
+    agent.cancels.push(cause)
+    if (onCancel !== undefined) {
+      onCancel(agent, cause)
+      return
+    }
+    agent.status = 'idle'
+    agent.inbox.nextTurn.length = 0
+    agent.inbox.nextStep.length = 0
+  }
+  return agent
+}
+
+/** A fake job view owned by one Session. */
+function jobView(id, owner, status = 'running') {
+  return { id, owner, status, label: id, startedAt: 1, output: { total: 0, earliest: 0 } }
 }
 
 before(async () => {
@@ -355,7 +397,12 @@ test('discard marks the record and cancels running work', async () => {
     registry: { running: [session.id] },
   })
   await h.temp.register({ sessionId: session.id, title: '临时会话 · 10:01' })
-  assert.deepEqual(await h.temp.discard({ sessionId: session.id }), { discarded: true })
+  const result = await h.temp.discard({ sessionId: session.id })
+  assert.deepEqual(result, {
+    discarded: true,
+    stopping: [{ sessionId: session.id, kind: 'main' }],
+    stoppingCount: 1,
+  })
   assert.deepEqual(h.cancelled, [session.id])
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.equal(saved.sessions[session.id].pendingDelete, true)
@@ -365,6 +412,611 @@ test('discard marks the record and cancels running work', async () => {
   const listed = (await h.temp.list()).sessions
   assert.equal(listed.length, 1)
   assert.equal(listed[0].pendingDelete, true)
+})
+
+test('the tree pending event is atomic', async () => {
+  const chat = fakeSession('session-atomic-chat', { createdAt: 1 })
+  const child = fakeSession('session-atomic-child', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 2,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const append = h.temp.appendEvent
+  h.temp.appendEvent = async function failPending() {
+    throw new Error('injected tree pending failure')
+  }
+  await assert.rejects(h.temp.discard({ sessionId: chat.id }), /injected tree pending failure/)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+  assert.equal(h.temp.state.sessions[child.id].pendingDelete, false)
+  assert.deepEqual(h.archived, [])
+  assert.deepEqual(h.cancelled, [])
+
+  h.temp.appendEvent = append
+  const result = await h.temp.discard({ sessionId: chat.id })
+  assert.equal(result.discarded, true)
+  assert.deepEqual(result.stopping, [])
+  assert.equal(result.stoppingCount, 0)
+  const discardCodec = tempSessionDescriptors.find(descriptor => descriptor.method === 'discard').result
+  assert.deepEqual(discardCodec.create().parse(result), result)
+  const pending = (await journalLines()).filter(event => event.type === 'pending')
+  assert.equal(pending.length, 1)
+  assert.deepEqual(pending[0].sessionIds, [chat.id, child.id])
+  assert.deepEqual(h.archived, [{ sessionId: chat.id, options: { stopActivity: true } }])
+  assert.deepEqual(h.traces.slice(0, 4), [
+    `mark ${chat.id}`,
+    `mark ${child.id}`,
+    `archive ${chat.id}`,
+    `confirmed ${chat.id}`,
+  ])
+})
+
+test('both child modes stop and drop queued work', async () => {
+  const chat = fakeSession('session-modes-chat', { createdAt: 1 })
+  const oneShot = fakeSession('session-modes-one-shot', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 2,
+  })
+  const continuable = fakeSession('session-modes-continuable', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 3,
+  })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [oneShot.id, oneShot], [continuable.id, continuable]]),
+  })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(oneShot)
+  await h.temp.recordDescendant(continuable)
+  const oneShotAgent = workingAgent()
+  oneShotAgent.inbox.nextTurn.push({ id: 'queued-turn' })
+  const continuableAgent = workingAgent()
+  continuableAgent.inbox.nextStep.push({ id: 'queued-step' })
+  h.deps.agents = {
+    get: id => (id === oneShot.id ? oneShotAgent : id === continuable.id ? continuableAgent : undefined),
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.deepEqual(oneShotAgent.cancels, [{ kind: 'parent' }])
+  assert.deepEqual(continuableAgent.cancels, [{ kind: 'parent' }])
+  assert.equal(oneShotAgent.status, 'idle')
+  assert.equal(continuableAgent.status, 'idle')
+  assert.deepEqual(oneShotAgent.inbox.nextTurn, [])
+  assert.deepEqual(continuableAgent.inbox.nextStep, [])
+  assert.ok(h.temp.stopped.has(oneShot.id))
+  assert.ok(h.temp.stopped.has(continuable.id))
+})
+
+test('a remote one-shot job is stopped and awaited', async () => {
+  const chat = fakeSession('session-remote-chat', { createdAt: 1 })
+  const child = fakeSession('session-remote-child', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 2,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  let status = 'running'
+  const waits = []
+  // The real background subagent tool registers the one-shot job under the
+  // parent Agent, not under the child Session it creates.
+  h.deps.jobs = {
+    list: owner => (owner === chat.id && status !== 'killed' ? [jobView('session-job', owner, status)] : []),
+    kill: (id, owner, reason) => {
+      assert.equal(owner, chat.id)
+      assert.equal(reason, 'temporary session stopped')
+      status = 'stopping'
+      return 'requested'
+    },
+    wait: async (id, timeout, owner) => {
+      waits.push({ id, timeout, owner })
+      status = 'killed'
+      return jobView(id, owner, status)
+    },
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(waits.length, 1)
+  assert.equal(waits[0].id, 'session-job')
+  assert.equal(waits[0].owner, chat.id)
+  assert.ok(waits[0].timeout > 0 && waits[0].timeout <= 1000)
+  assert.ok(h.temp.stopped.has(child.id))
+  assert.ok(h.traces.includes('job session-job settled'))
+  assert.equal(existsSync(join(chatDir, 'session.v4.jsonl.zstd')), true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('an unsettled job keeps stopping', async () => {
+  const chat = fakeSession('session-job-chat', { createdAt: 1 })
+  const child = fakeSession('session-job-child', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 2,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const childDir = await materializeSession(child.id)
+  let status = 'running'
+  let killThrows = true
+  let waitStaysLive = true
+  h.deps.jobs = {
+    // Parent-owned work keeps the dependent child unconfirmed too.
+    list: owner => (owner === chat.id && status !== 'killed' ? [jobView('session-held-job', owner, status)] : []),
+    kill: () => {
+      if (killThrows) throw new Error('injected kill failure')
+      status = 'stopping'
+      return 'requested'
+    },
+    wait: async (id, timeout, owner) => {
+      if (!waitStaysLive) status = 'killed'
+      return jobView(id, owner, status)
+    },
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.equal(h.temp.stopped.has(child.id), false)
+  assert.deepEqual((await h.temp.list()).stopping.map(item => item.sessionId), [chat.id])
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  // The child has no job of its own, but its parent-owned job still blocks
+  // both its confirmation and any unload deletion.
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.stopped.has(child.id), false)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  killThrows = false
+  await h.temp.retryObserved()
+  assert.equal(h.temp.stopped.has(child.id), false)
+  waitStaysLive = false
+  await h.temp.retryObserved()
+  assert.ok(h.temp.stopped.has(chat.id))
+  assert.ok(h.temp.stopped.has(child.id))
+  assert.ok(h.traces.includes(`retry confirmed ${chat.id}`))
+  assert.ok(h.traces.includes(`retry confirmed ${child.id}`))
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a job list that cannot be read keeps stopping', async () => {
+  const chat = fakeSession('session-job-list-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  let unreadable = true
+  h.deps.jobs = {
+    list: () => {
+      if (unreadable) throw new Error('injected list failure')
+      return []
+    },
+    kill: () => 'requested',
+    wait: async () => ({ status: 'killed' }),
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  unreadable = false
+  await h.temp.retryObserved()
+  assert.ok(h.temp.stopped.has(chat.id))
+  assert.ok(warnings.some(message => message.includes('could not list jobs')))
+})
+
+test('a job that starts during whenIdle keeps stopping', async () => {
+  const chat = fakeSession('session-late-job-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  let live = false
+  let waits = 0
+  h.deps.jobs = {
+    list: owner => (owner === chat.id && live ? [jobView('session-late-job', owner)] : []),
+    kill: () => 'requested',
+    wait: async (id, timeout, owner) => {
+      waits += 1
+      return jobView(id, owner, live ? 'running' : 'killed')
+    },
+  }
+  let idleCalls = 0
+  const agent = workingAgent({
+    status: 'idle',
+    whenIdle: async () => {
+      idleCalls += 1
+      if (idleCalls === 1) live = true
+    },
+  })
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.ok(idleCalls >= 1)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(waits >= 1)
+  live = false
+  await h.temp.retryObserved()
+  assert.ok(h.temp.stopped.has(chat.id))
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a job that starts before removal blocks the final guard', async () => {
+  const chat = fakeSession('session-final-job-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  let live = false
+  h.deps.jobs = {
+    list: owner => (owner === chat.id && live ? [jobView('session-final-job', owner)] : []),
+    kill: () => 'requested',
+    wait: async () => ({ status: 'killed' }),
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  const confirm = h.temp.confirmStopped.bind(h.temp)
+  let calls = 0
+  h.temp.confirmStopped = async (record, options) => {
+    const result = await confirm(record, options)
+    calls += 1
+    if (calls === 2) live = true
+    return result
+  }
+  await h.temp.cleanupPending()
+  assert.ok(calls >= 2)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('an owned job is still live')))
+})
+
+test('a wake after confirmation is reconciled', async () => {
+  const chat = fakeSession('session-wake-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const agent = workingAgent()
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.ok(h.temp.stopped.has(chat.id))
+  agent.status = 'running'
+  agent.cancel = (cause) => { agent.cancels.push(cause) }
+  h.temp.retryDelayMs = 5
+  await waitFor(() => !h.temp.stopped.has(chat.id), 'the renewed work was not noticed')
+  assert.ok(agent.cancels.length >= 2)
+  agent.status = 'idle'
+  agent.cancel = (cause) => {
+    agent.cancels.push(cause)
+    agent.status = 'idle'
+  }
+  await waitFor(() => h.temp.stopped.has(chat.id), 'the renewed work was not stopped')
+})
+
+test('a wake and live job are visible before the retry sweep', async () => {
+  const chat = fakeSession('session-live-stop-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const agent = workingAgent()
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.ok(h.temp.stopped.has(chat.id))
+  h.temp.clearRetryTimer()
+  agent.status = 'running'
+  const woken = await h.temp.list()
+  assert.deepEqual(woken.stopping, [{ sessionId: chat.id, kind: 'main' }])
+  assert.equal(woken.stoppingCount, 1)
+  assert.equal(woken.sessions[0].pendingDelete, true)
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  agent.status = 'idle'
+  h.temp.stopped.add(chat.id)
+  h.deps.jobs = {
+    list: owner => (owner === chat.id ? [jobView('session-live-stop-job', owner)] : []),
+    kill: () => 'requested',
+    wait: async (id, timeout, owner) => jobView(id, owner, 'killed'),
+  }
+  const jobbed = await h.temp.list()
+  assert.deepEqual(jobbed.stopping, [{ sessionId: chat.id, kind: 'main' }])
+  assert.equal(jobbed.stoppingCount, 1)
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  h.deps.jobs.list = () => []
+  await h.temp.retryObserved()
+  assert.ok(h.temp.stopped.has(chat.id))
+  assert.deepEqual((await h.temp.list()).stopping, [])
+})
+
+test('a running fork stops with its subagents', async () => {
+  const chat = fakeSession('session-fork-stop-chat', { createdAt: 1 })
+  const fork = fakeSession('session-fork-stop-fork', {
+    isSeeded: true, parentSession: chat.id, createdAt: Date.now() + 1000,
+  })
+  const child = fakeSession('session-fork-stop-child', {
+    origin: 'subagent', parentSession: fork.id, createdAt: Date.now() + 2000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  await h.temp.recordDescendant(child)
+  const chatAgent = workingAgent()
+  const forkAgent = workingAgent()
+  const childAgent = workingAgent()
+  h.deps.agents = {
+    get: id => (id === chat.id ? chatAgent : id === fork.id ? forkAgent : id === child.id ? childAgent : undefined),
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.deepEqual(chatAgent.cancels, [{ kind: 'user' }])
+  assert.deepEqual(forkAgent.cancels, [{ kind: 'user' }])
+  assert.deepEqual(childAgent.cancels, [{ kind: 'parent' }])
+  assert.deepEqual(h.archived.map(item => item.sessionId), [chat.id, fork.id])
+  assert.deepEqual(h.traces.filter(line => line.startsWith('archive ')), [
+    `archive ${chat.id}`,
+    `archive ${fork.id}`,
+  ])
+  assert.deepEqual((await h.temp.list()).stopping, [])
+})
+
+test('a held abort stays stopping', async () => {
+  const chat = fakeSession('session-held-abort', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const held = workingAgent({ onCancel: () => {} })
+  h.deps.agents = { get: id => (id === chat.id ? held : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, true)
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.deepEqual((await h.temp.list()).stopping.map(item => item.sessionId), [chat.id])
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  held.status = 'idle'
+  await h.temp.retryObserved()
+  assert.ok(h.temp.stopped.has(chat.id))
+  const listed = await h.temp.list()
+  assert.deepEqual(listed.stopping, [])
+  assert.equal(listed.stoppingCount, 0)
+  assert.equal(listed.sessions[0].pendingDelete, true)
+})
+
+test('a chat stays stopping while its descendant is unsettled', async () => {
+  const chat = fakeSession('session-descendant-chat', { createdAt: 1 })
+  const child = fakeSession('session-descendant-child', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 2,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const held = workingAgent({ onCancel: () => {} })
+  h.deps.agents = { get: id => (id === child.id ? held : undefined) }
+  const result = await h.temp.discard({ sessionId: chat.id })
+  assert.ok(h.temp.stopped.has(chat.id))
+  assert.equal(h.temp.stopped.has(child.id), false)
+  assert.deepEqual(result.stopping, [{ sessionId: chat.id, kind: 'main' }])
+  assert.equal(result.stoppingCount, 1)
+  const listed = await h.temp.list()
+  assert.deepEqual(listed.stopping, [{ sessionId: chat.id, kind: 'main' }])
+  assert.equal(listed.stoppingCount, 1)
+  held.status = 'idle'
+  await h.temp.retryObserved()
+  assert.ok(h.temp.stopped.has(child.id))
+  assert.deepEqual((await h.temp.list()).stopping, [])
+})
+
+test('a side chat ignores an unrelated job owned by its source chat', async () => {
+  const source = fakeSession('session-side-source', { createdAt: 1 })
+  const side = fakeSession('session-side-temporary', {
+    isSeeded: true,
+    parentSession: source.id,
+    inheritedEventCount: 3,
+    events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { source: { kind: 'user' } } },
+      { type: 'turn/end', data: { turn: 1, reason: 'completed' } },
+      { type: 'fork/boundary', data: {} },
+    ],
+  })
+  const h = harness({ sessions: new Map([[side.id, side]]) })
+  h.live.set(source.id, source)
+  await h.temp.register({ sessionId: side.id, kind: 'side' })
+  const dir = await materializeSession(side.id)
+  let sourceJobStopped = false
+  h.deps.jobs = {
+    list: owner => (owner === source.id ? [jobView('source-job', source.id)] : []),
+    kill: () => { sourceJobStopped = true; return 'requested' },
+    wait: async () => {
+      sourceJobStopped = true
+      return jobView('source-job', source.id, 'killed')
+    },
+  }
+  const result = await h.temp.discard({ sessionId: side.id })
+  assert.equal(sourceJobStopped, false)
+  assert.ok(h.temp.stopped.has(side.id))
+  assert.deepEqual(result.stopping, [])
+  assert.equal(result.stoppingCount, 0)
+  assert.deepEqual((await h.temp.list()).stopping, [])
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a swallowed failure stays stopping', async () => {
+  const chat = fakeSession('session-swallowed', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  let archiveFails = true
+  h.deps.workspaceRegistry.archiveSession = async () => {
+    if (archiveFails) throw new Error('injected archive failure')
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.ok(warnings.some(message => message.includes('injected archive failure')))
+  archiveFails = false
+  await waitFor(() => h.temp.stopped.has(chat.id), 'the next sweep did not retry the archive')
+  assert.ok(h.traces.includes(`retry confirmed ${chat.id}`))
+})
+
+test('a retry settles through whenIdle', async () => {
+  const chat = fakeSession('session-when-idle', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const agent = workingAgent({ status: 'idle', whenIdle: () => gate })
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  release()
+  await waitFor(() => h.temp.stopped.has(chat.id), 'the next sweep did not settle whenIdle')
+  assert.ok(h.traces.includes(`idle ${chat.id}`))
+})
+
+test('a fork after the final rescan is stopped', async () => {
+  const chat = fakeSession('session-final-rescan-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.discard({ sessionId: chat.id })
+  const late = fakeSession('session-final-rescan-fork', {
+    isSeeded: true, parentSession: chat.id, createdAt: Date.now() + 1000,
+  })
+  h.live.set(late.id, late)
+  const agent = workingAgent()
+  h.deps.agents = { get: id => (id === late.id ? agent : undefined) }
+  await h.temp.recordDescendant(late)
+  assert.equal(h.temp.state.sessions[late.id].pendingDelete, true)
+  assert.deepEqual(h.archived.map(item => item.sessionId), [chat.id, late.id])
+  assert.deepEqual(agent.cancels, [{ kind: 'user' }])
+  assert.ok(h.temp.stopped.has(late.id))
+})
+
+test('a fork during a retry is stopped', async () => {
+  const chat = fakeSession('session-retry-late-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const held = workingAgent({ onCancel: () => {} })
+  h.deps.agents = { get: id => (id === chat.id ? held : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let blockArchive = false
+  let archiveAttempts = 0
+  const archive = h.deps.workspaceRegistry.archiveSession
+  h.deps.workspaceRegistry.archiveSession = async (sessionId, options) => {
+    archiveAttempts += 1
+    if (blockArchive && sessionId === chat.id) await gate
+    return archive(sessionId, options)
+  }
+  blockArchive = true
+  const retrying = h.temp.retryObserved()
+  await waitFor(() => archiveAttempts >= 1, 'the retry did not archive the held tree')
+  const late = fakeSession('session-retry-late-fork', {
+    isSeeded: true, parentSession: chat.id, createdAt: Date.now() + 1000,
+  })
+  h.live.set(late.id, late)
+  const lateAgent = workingAgent()
+  h.deps.agents = {
+    get: id => (id === chat.id ? held : id === late.id ? lateAgent : undefined),
+  }
+  const observing = h.temp.recordDescendant(late)
+  release()
+  await retrying
+  await observing
+  assert.equal(h.temp.state.sessions[late.id].pendingDelete, true)
+  assert.deepEqual(lateAgent.cancels, [{ kind: 'user' }])
+  assert.ok(h.temp.stopped.has(late.id))
+})
+
+test('a stopping tree is visible and not deleted', async () => {
+  const chat = fakeSession('session-visible-chat', { createdAt: 1 })
+  const child = fakeSession('session-visible-child', {
+    origin: 'subagent', parentSession: chat.id, createdAt: 2,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  const held = workingAgent({ onCancel: () => {} })
+  h.deps.agents = { get: id => (id === chat.id ? held : undefined) }
+  const result = await h.temp.discard({ sessionId: chat.id })
+  assert.deepEqual(result.stopping, [{ sessionId: chat.id, kind: 'main' }])
+  assert.equal(result.stoppingCount, 1)
+  const listed = await h.temp.list()
+  assert.deepEqual(listed.stopping.map(item => item.sessionId), [chat.id])
+  assert.equal(listed.stoppingCount, 1)
+  await h.temp.reap()
+  assert.equal(existsSync(join(chatDir, 'session.v4.jsonl.zstd')), true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a live member blocks deletion', async () => {
+  const chat = fakeSession('session-live-blocks-chat', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const held = workingAgent({ onCancel: () => {} })
+  h.deps.agents = { get: id => (id === chat.id ? held : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.notEqual(h.temp.state.sessions[chat.id], undefined)
+})
+
+test('unload stops before it deletes', async () => {
+  const chat = fakeSession('session-unload-stop', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const held = workingAgent({ onCancel: () => {} })
+  h.deps.agents = { get: id => (id === chat.id ? held : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  held.cancel = (cause) => {
+    held.cancels.push(cause)
+    held.status = 'idle'
+  }
+  await h.temp.cleanupPending()
+  assert.ok(held.cancels.length >= 2)
+  assert.ok(h.archived.filter(item => item.sessionId === chat.id).length >= 2)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('unload closes admission before its final cleanup and clears its retry', async () => {
+  const chat = fakeSession('session-unload-retry', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  await h.temp.discard({ sessionId: chat.id })
+  assert.ok(h.temp.stopped.has(chat.id))
+  assert.notEqual(h.temp.retryTimer, undefined)
+  h.temp.closeAdmission()
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.admissionClosed, true)
+  assert.equal(h.temp.retryTimer, undefined)
+  assert.equal(h.temp.needsRetry(), true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('unload keeps a stop whose archive failed', async () => {
+  const chat = fakeSession('session-unload-archive-failed', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  let archiveFails = true
+  h.deps.workspaceRegistry.archiveSession = async () => {
+    if (archiveFails) throw new Error('injected archive failure')
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  archiveFails = false
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.stopped.has(chat.id), true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('unload keeps a stop whose cancel failed', async () => {
+  const chat = fakeSession('session-unload-cancel-failed', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const agent = workingAgent()
+  agent.cancel = () => { throw new Error('injected cancel failure') }
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  await h.temp.discard({ sessionId: chat.id })
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.stopped.has(chat.id), false)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  agent.cancel = (cause) => {
+    agent.cancels.push(cause)
+    agent.status = 'idle'
+  }
+  await h.temp.cleanupPending()
+  assert.equal(h.temp.stopped.has(chat.id), true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
 })
 
 test('reap deletes non-live leftovers and keeps live Sessions', async () => {
@@ -1163,6 +1815,7 @@ test('the record shape round-trips every field', async () => {
     sequence: 2,
     degraded: false,
     stopping: [{ sessionId: forkRecord.sessionId, kind: 'fork' }],
+    stoppingCount: 1,
     sessions: [
       { sessionId: chat.id, createdAt: 1000, kind: 'main', pendingDelete: false },
       { sessionId: forkRecord.sessionId, createdAt: 4000, kind: 'fork', pendingDelete: true },
@@ -1173,6 +1826,7 @@ test('the record shape round-trips every field', async () => {
     sequence: 2,
     degraded: false,
     stopping: [{ sessionId: forkRecord.sessionId, kind: 'fork' }],
+    stoppingCount: 1,
     sessions: [
       { sessionId: chat.id, createdAt: 1000, kind: 'main', pendingDelete: false },
       { sessionId: forkRecord.sessionId, createdAt: 4000, kind: 'fork', pendingDelete: true },
@@ -1346,11 +2000,20 @@ test('a corrupt registry does not resurrect a discarded tree', async () => {
   await mkdir(stateDir, { recursive: true })
   await writeFile(stateFile, '{not json')
   const h = harness({ stored: [parent.header, child.header] })
+  const parentAgent = workingAgent()
+  const childAgent = workingAgent()
+  h.deps.agents = {
+    get: id => (id === parent.id ? parentAgent : id === child.id ? childAgent : undefined),
+  }
   await h.temp.load()
   assert.equal(h.temp.registryDegraded, true)
   assert.equal(h.temp.state.sessions[parent.id].pendingDelete, true)
   assert.equal(h.temp.state.sessions[child.id].pendingDelete, true)
-  assert.deepEqual((await h.temp.list()).stopping.map(item => item.sessionId), [parent.id])
+  assert.deepEqual((await h.temp.list()).stopping, [])
+  assert.deepEqual(parentAgent.cancels, [{ kind: 'user' }])
+  assert.deepEqual(childAgent.cancels, [{ kind: 'parent' }])
+  assert.ok(h.temp.stopped.has(parent.id))
+  assert.ok(h.temp.stopped.has(child.id))
   assert.equal(existsSync(join(parentDir, 'session.v4.jsonl.zstd')), true)
   assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
 })
@@ -3498,6 +4161,8 @@ test('a failed append retries without a restart', async () => {
     registry: { running: [fork.id] },
   })
   await h.temp.load()
+  const forkAgent = workingAgent()
+  h.deps.agents = { get: id => (id === fork.id ? forkAgent : undefined) }
   const append = h.temp.appendEvent
   let failures = 1
   h.temp.appendEvent = async function failOnce(event) {
@@ -3513,14 +4178,18 @@ test('a failed append retries without a restart', async () => {
   assert.equal(h.temp.state.sessions[fork.id], undefined)
   h.temp.appendEvent = append
   await waitFor(
-    () => h.temp.journal.entries[fork.id] !== undefined && !h.temp.pending.includes(fork),
+    () => h.temp.journal.entries[fork.id] !== undefined
+      && !h.temp.pending.includes(fork)
+      && h.temp.stopped.has(fork.id),
     'the protected observation did not retry without another event',
   )
   assert.equal(h.temp.journal.entries[fork.id].pending, true)
   assert.equal(h.temp.state.sessions[fork.id].pendingDelete, true)
   assert.equal(h.temp.pending.includes(fork), false)
   assert.equal(h.temp.retryQueue.has(fork.id), false)
-  assert.deepEqual(h.cancelled, [fork.id])
+  assert.deepEqual(forkAgent.cancels, [{ kind: 'user' }])
+  assert.ok(h.archived.some(item => item.sessionId === fork.id))
+  assert.ok(h.temp.stopped.has(fork.id))
 })
 
 test('a failed inherited-pending append repairs without a restart', async () => {
@@ -3946,6 +4615,7 @@ test('the list result carries epoch, sequence and stopping', async () => {
     sequence: 1,
     degraded: false,
     stopping: [],
+    stoppingCount: 0,
     sessions: [{ sessionId: chat.id, createdAt: 10, kind: 'main', pendingDelete: false }],
   })
   await h.temp.discard({ sessionId: chat.id })
@@ -3953,7 +4623,8 @@ test('the list result carries epoch, sequence and stopping', async () => {
     epoch: h.temp.publisher.epoch,
     sequence: 2,
     degraded: false,
-    stopping: [{ sessionId: chat.id, kind: 'main' }],
+    stopping: [],
+    stoppingCount: 0,
     sessions: [{ sessionId: chat.id, createdAt: 10, kind: 'main', pendingDelete: true }],
   })
 })

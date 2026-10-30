@@ -4,10 +4,11 @@
  * A temporary session is an ordinary DSH Session created by the browser. The
  * Host records its id and the exact per-session storage directory in the
  * registry index, and the ownership journal records why the Session is
- * temporary. The whole directory is removed when the Host exits (or on the next
- * boot, when a hard kill left it behind). This module owns that registry, the
- * ownership journal's use, the validated exit snapshot, and every filesystem
- * deletion so it can be tested without booting a Harness.
+ * temporary. A confirmed member's directory is removed by plugin unload, at
+ * process exit from the validated snapshot, or by the next boot after a hard
+ * kill. This module owns that registry, the ownership journal's use, the
+ * validated exit snapshot, and every filesystem deletion so it can be tested
+ * without booting a Harness.
  *
  * @module dsh-temp-session-plugin/core
  */
@@ -43,6 +44,12 @@ const RETRY_DELAY_MS = 25
 
 /** Longest delay between automatic retries of a protected observation. */
 const RETRY_MAX_DELAY_MS = 30000
+
+/** Longest wait for one Agent or owned job to settle before a stop is retried. */
+const STOP_WAIT_MS = 100
+
+/** Job lifecycles that still count as owned work. */
+const LIVE_JOB_STATUSES = new Set(['running', 'stopping'])
 
 /** Boundary note added to a forked, temporary side conversation. */
 const SIDE_INSTRUCTIONS = `This is a temporary side conversation forked from the main conversation.
@@ -161,7 +168,9 @@ export class TemporarySessions {
    * @param {object} deps.sessionPersistence - persistence service (`ctx.sessionPersistence`).
    * @param {object} [deps.sessionController] - Host session commands (`ctx.sessionController`).
    * @param {object} [deps.agents] - live Agent registry (`ctx.agents`), optional.
+   * @param {object} [deps.jobs] - owned background-job registry (`ctx.jobs`), optional.
    * @param {object} [deps.workspaceRegistry] - workspace archive set, optional.
+   * @param {(message: string) => void} [deps.trace] - ordered stop-path trace sink.
    * @param {{ warn: (message: string) => void, info?: (message: string) => void }} deps.logger - Host logger.
    * @param {{ dir: string, file: string, journal: string, marker: string, lock: string }} deps.paths - state location.
    */
@@ -189,6 +198,9 @@ export class TemporarySessions {
     // Observed children whose journal append failed; their identity and parent
     // anchor stay here until a later pass writes the event.
     this.retryQueue = new Set()
+    // Pending members whose stop has been confirmed in this instance. A member
+    // that is pending but not here still has work to stop and is retried.
+    this.stopped = new Set()
     // Side chats prepared and natively titled by this live instance. A failed
     // index save or reload leaves these empty so register can finish the work.
     this.sidePrepared = new Set()
@@ -240,7 +252,7 @@ export class TemporarySessions {
    */
   scheduleRetry() {
     if (this.retryTimer !== undefined
-      || this.retryQueue.size === 0
+      || !this.needsRetry()
       || this.admissionClosed
       || this.journalDegraded
       || this.loadFailed) return
@@ -248,7 +260,7 @@ export class TemporarySessions {
     const timer = setTimeout(() => {
       if (this.retryTimer !== timer) return
       this.retryTimer = undefined
-      if (this.retryQueue.size === 0
+      if (!this.needsRetry()
         || this.admissionClosed
         || this.loadFailed
         || this.journalDegraded) {
@@ -257,7 +269,7 @@ export class TemporarySessions {
       }
       this.retryDelayMs = Math.min(this.retryDelayMs * 2, RETRY_MAX_DELAY_MS)
       this.retryObserved().catch((error) => {
-        this.warn(`could not retry the protected observed queue: ${String(error)}`)
+        this.warn(`could not retry temporary-session cleanup: ${String(error)}`)
         this.scheduleRetry()
       })
     }, delay)
@@ -265,9 +277,36 @@ export class TemporarySessions {
     timer.unref?.()
   }
 
+  /**
+   * Whether a protected observation or a pending tree still needs a pass. A
+   * pending tree is reconciled even after every member is confirmed, because
+   * an Agent or owned job can start work again while the folder waits.
+   */
+  needsRetry() {
+    return this.retryQueue.size > 0 || this.hasPendingStops()
+  }
+
+  /** Whether any record is still pending deletion. */
+  hasPendingStops() {
+    for (const record of Object.values(this.state.sessions)) {
+      if (record?.pendingDelete === true) return true
+    }
+    return false
+  }
+
   /** Report a condition a human may need to read later. */
   warn(message) {
     this.deps.logger?.warn?.(message)
+  }
+
+  /** Emit one ordered stop-path step for the logger or a probe. */
+  trace(message) {
+    try {
+      if (typeof this.deps.trace === 'function') this.deps.trace(message)
+      else this.deps.logger?.info?.(message)
+    } catch {
+      // A trace sink must never break the stop it observes.
+    }
   }
 
   /** Close admission for new temporary writes before process cleanup. */
@@ -366,6 +405,7 @@ export class TemporarySessions {
     }
     this.loaded = true
     this.refreshSnapshot()
+    if (!this.journalDegraded) await this.resumePendingStops()
     return this.state
   }
 
@@ -2119,10 +2159,10 @@ export class TemporarySessions {
         if ((healed || reconciled.adopted || reconciled.observed)
           && !this.registryDegraded
           && !this.reconciliationDegraded) await this.save()
-        if (reconciled.adopted || reconciled.observed) await this.resumePendingStops()
+        await this.resumePendingStops({ retry: true })
         return reconciled.adopted || reconciled.observed || healed
       } finally {
-        if (this.retryQueue.size === 0) {
+        if (!this.needsRetry()) {
           this.retryDelayMs = RETRY_DELAY_MS
         } else if (!this.loadFailed && !this.journalDegraded && !this.admissionClosed) {
           this.scheduleRetry()
@@ -2248,6 +2288,48 @@ export class TemporarySessions {
   }
 
   /**
+   * Whether a pending chat still has unsettled work in its own tree. A chat
+   * whose own stop is confirmed remains stopping while a descendant record is
+   * pending and not confirmed. `scope` limits descendants to members of the
+   * tree that was just discarded; the public list has no scope.
+   * @param {object} record - pending chat record.
+   * @param {Set<string>} [scope] - ids that belong to the discarded tree.
+   * @returns {boolean} whether the chat's work is still stopping.
+   */
+  hasUnsettledStop(record, scope = undefined) {
+    if (record?.pendingDelete !== true) return false
+    if (!this.stopped.has(record.sessionId) || this.hasLiveStopWork(record)) return true
+    return this.descendantRecords(record.sessionId).some((child) =>
+      child.pendingDelete === true
+      && (!this.stopped.has(child.sessionId) || this.hasLiveStopWork(child))
+      && (scope === undefined || scope.has(child.sessionId)))
+  }
+
+  /**
+   * Whether a member that a previous pass confirmed now holds live work again.
+   * A public list is a read, so it cannot wait for the next retry timer: an
+   * Agent that started running, queued input, or an owned job must keep the
+   * member in the stopping state immediately and drops the stale confirmation.
+   * A job list that cannot be read is not evidence of absence.
+   * @param {object} record - pending member.
+   * @returns {boolean} whether live work is visible now.
+   */
+  hasLiveStopWork(record) {
+    const agent = this.deps.agents?.get?.(record.sessionId)
+    let live = agent !== undefined && agent !== null
+      && (agent.status !== 'idle' || this.hasQueuedWork(agent))
+    if (!live) {
+      try {
+        live = this.ownedJobsInChain(record.sessionId).length > 0
+      } catch {
+        live = true
+      }
+    }
+    if (live) this.stopped.delete(record.sessionId)
+    return live
+  }
+
+  /**
    * The chat record for a browser-facing id. Subagent records are not chats, so
    * the adopt, discard, and promote paths never see them.
    * @param {unknown} sessionId - requested Session id.
@@ -2275,6 +2357,11 @@ export class TemporarySessions {
       await this.load()
       this.sequence += 1
       const records = Object.values(this.state.sessions)
+      // hasUnsettledStop revalidates live work, so a wake or owned job that
+      // started after the last sweep cannot be reported as settled here.
+      const stopping = records
+        .filter(record => record.kind !== SUBAGENT_KIND && this.hasUnsettledStop(record))
+        .map(record => ({ sessionId: record.sessionId, kind: record.kind }))
       return {
         // Ended side chats stay listed (with pendingDelete) so a page reload
         // can keep hiding them until the Host deletes their logs. The browser
@@ -2282,9 +2369,8 @@ export class TemporarySessions {
         epoch: this.publisher.epoch,
         sequence: this.sequence,
         degraded: this.journalDegraded || this.registryDegraded || this.reconciliationDegraded,
-        stopping: records
-          .filter(record => record.pendingDelete === true && record.kind !== SUBAGENT_KIND)
-          .map(record => ({ sessionId: record.sessionId, kind: record.kind })),
+        stopping,
+        stoppingCount: stopping.length,
         sessions: records
           .filter(record => record.kind !== SUBAGENT_KIND)
           .map(record => recordView(record)),
@@ -2327,12 +2413,14 @@ export class TemporarySessions {
   }
 
   /**
-   * Mark one temporary Session and its whole tree for deletion. The browser
-   * hides an ended Session through the shipped archive path before calling
-   * this; the log is removed when the Host exits (or at the next boot after a
-   * hard kill). The tree's `pending` event is durable before any state changes.
+   * Mark one temporary Session and its whole tree for deletion. The Host
+   * journals the tree's `pending` event before it archives, cancels, or stops
+   * anything; the browser calls this before hiding the chat. A confirmed
+   * member folder can be removed by plugin unload, process exit, or the next
+   * boot's resumed stop, never by this call. The tree's `pending` event is
+   * durable before any state changes.
    * @param {{ sessionId: string }} request - Session to end.
-   * @returns {Promise<{ discarded: true }>} acknowledgement.
+   * @returns {Promise<{ discarded: true, stopping: object[], stoppingCount: number }>} acknowledgement.
    */
   discard(request) {
     return this.enqueue(async () => {
@@ -2342,30 +2430,295 @@ export class TemporarySessions {
       const record = this.chatRecord(sessionId)
       if (record === undefined) throw new Error('this Session is not a recorded temporary session')
       const tree = [record, ...this.descendantRecords(sessionId)]
-      // One event carries the whole tree, so no partial prefix can exist. A record
-      // whose journal append failed is not deletion evidence, so it is not named.
+      // One event carries every journal-owned member, so no partial prefix can
+      // exist. A record whose journal append failed is not deletion evidence.
       const owned = tree.filter(item => this.journal.entries[item.sessionId] !== undefined)
-      if (owned.length > 0) {
-        await this.appendEvent({
-          type: 'pending',
-          sessionIds: owned.map(item => item.sessionId),
-          reason: 'discard',
-          at: Date.now(),
-        })
+      if (!owned.includes(record)) {
+        throw new Error('cannot discard a temporary session the ownership journal does not own')
       }
-      for (const item of tree) item.pendingDelete = true
-      await this.save()
+      if (owned.length !== tree.length) {
+        this.warn(`discarding "${sessionId}" without ${String(tree.length - owned.length)} unowned member(s)`)
+      }
+      await this.appendEvent({
+        type: 'pending',
+        sessionIds: owned.map(item => item.sessionId),
+        reason: 'discard',
+        at: Date.now(),
+      })
+      this.markMembers(owned)
+      try {
+        await this.save()
+      } catch (error) {
+        // The pending event is durable; a failed index write is repaired from
+        // the journal at the next start and must not leave work running now.
+        this.warn(`could not save the pending tree for "${sessionId}": ${String(error)}`)
+      }
       this.refreshSnapshot()
-      const agent = this.deps.agents?.get?.(sessionId)
-      if (agent?.status === 'running' && this.deps.sessionController !== undefined) {
+      await this.stopMembers(owned)
+      const ownedIds = new Set(owned.map(item => item.sessionId))
+      const stopping = owned
+        .filter(item => item.kind !== SUBAGENT_KIND && this.hasUnsettledStop(item, ownedIds))
+        .map(item => ({ sessionId: item.sessionId, kind: item.kind }))
+      return { discarded: true, stopping, stoppingCount: stopping.length }
+    })
+  }
+
+  /**
+   * Mark every member pending and stopping after the durable tree event. The
+   * caller saves the registry before any stop request is issued.
+   * @param {object[]} members - journal-owned tree records.
+   * @returns {void}
+   */
+  markMembers(members) {
+    for (const record of members) {
+      record.pendingDelete = true
+      this.stopped.delete(record.sessionId)
+      this.trace(`mark ${record.sessionId}`)
+    }
+  }
+
+  /**
+   * Run the one stop path over records already marked pending: archive each
+   * chat with its own activity stop, cancel each live Agent, stop and await
+   * every owned job, then confirm settlement. A confirmed member stays pending
+   * for the deletion boundary; an unconfirmed one is retried.
+   * @param {object[]} members - records to stop.
+   * @param {{ retry?: boolean }} [options] - whether this pass is a retry.
+   * @returns {Promise<void>}
+   */
+  async stopMembers(members, options = {}) {
+    const active = members.filter(record => record?.pendingDelete === true
+      && !this.stopped.has(record.sessionId))
+    if (active.length === 0) return
+    const failed = new Set()
+    await this.archiveMembers(active, failed)
+    this.cancelMembers(active, failed)
+    for (const record of active) {
+      // Archiving or cancelling one member can fail; its owned out-of-process
+      // work is still stopped rather than left running behind the failure.
+      if (!await this.stopOwnedJobs(record.sessionId)) failed.add(record.sessionId)
+    }
+    for (const record of active) {
+      if (failed.has(record.sessionId)) continue
+      if (await this.confirmStopped(record, { retry: options.retry === true })) {
+        this.stopped.add(record.sessionId)
+      }
+    }
+    if (this.hasPendingStops()) this.scheduleRetry()
+  }
+
+  /**
+   * Archive every chat in a stopping tree with its own activity stop.
+   * @param {object[]} members - active pending members.
+   * @param {Set<string>} failed - members whose stop has failed.
+   * @returns {Promise<void>}
+   */
+  async archiveMembers(members, failed) {
+    const registry = this.deps.workspaceRegistry
+    if (typeof registry?.archiveSession !== 'function') return
+    for (const record of members) {
+      if (record.kind === SUBAGENT_KIND) continue
+      try {
+        await registry.archiveSession(record.sessionId, { stopActivity: true })
+        this.trace(`archive ${record.sessionId}`)
+      } catch (error) {
+        failed.add(record.sessionId)
+        this.warn(`could not archive "${record.sessionId}" for its stop: ${String(error)}`)
+      }
+    }
+  }
+
+  /**
+   * Cancel every live Agent, or the Host Session command when a chat outlives
+   * its Agent. A subagent with no Agent is covered by its job chain, including
+   * a background job registered to its parent.
+   * @param {object[]} members - active pending members.
+   * @param {Set<string>} failed - members whose stop has failed.
+   * @returns {void}
+   */
+  cancelMembers(members, failed) {
+    for (const record of members) {
+      const agent = this.deps.agents?.get?.(record.sessionId)
+      if (agent === undefined || agent === null) {
+        this.cancelWithoutAgent(record, failed)
+        continue
+      }
+      if (typeof agent.cancel === 'function') {
         try {
-          this.deps.sessionController.cancel({ sessionId })
+          agent.cancel({ kind: record.kind === SUBAGENT_KIND ? 'parent' : 'user' })
+          if (record.kind === SUBAGENT_KIND) this.trace(`cancel ${record.sessionId}`)
+          continue
         } catch (error) {
-          this.warn(`could not cancel temporary session "${sessionId}": ${String(error)}`)
+          failed.add(record.sessionId)
+          this.warn(`could not cancel "${record.sessionId}": ${String(error)}`)
+          continue
         }
       }
-      return { discarded: true }
-    })
+      if (record.kind !== SUBAGENT_KIND) {
+        this.cancelSessionCommand(record, failed)
+        continue
+      }
+      failed.add(record.sessionId)
+      this.warn(`could not cancel "${record.sessionId}": its live Agent has no cancel path`)
+    }
+  }
+
+  /**
+   * Cancel a chat that has a live Session but no Agent, when the Host command
+   * exists. A subagent without either has no local turn left to cancel.
+   * @param {object} record - pending member.
+   * @param {Set<string>} failed - members whose stop has failed.
+   * @returns {void}
+   */
+  cancelWithoutAgent(record, failed) {
+    if (record.kind === SUBAGENT_KIND) return
+    if (this.deps.sessions.get(record.sessionId) === undefined) return
+    this.cancelSessionCommand(record, failed)
+  }
+
+  /**
+   * Issue the Host session cancel command for a chat, recording a throw as a
+   * stop failure so the member is retried.
+   * @param {object} record - pending chat.
+   * @param {Set<string>} failed - members whose stop has failed.
+   * @returns {void}
+   */
+  cancelSessionCommand(record, failed) {
+    if (typeof this.deps.sessionController?.cancel !== 'function') {
+      failed.add(record.sessionId)
+      this.warn(`could not cancel "${record.sessionId}": its live Agent has no cancel path`)
+      return
+    }
+    try {
+      this.deps.sessionController.cancel({ sessionId: record.sessionId })
+    } catch (error) {
+      failed.add(record.sessionId)
+      this.warn(`could not cancel temporary session "${record.sessionId}": ${String(error)}`)
+    }
+  }
+
+  /**
+   * Kill and await every running or stopping job owned by one Session. A list
+   * failure, a throwing kill or a wait that does not reach a terminal status
+   * leaves the member unconfirmed.
+   * @param {string} sessionId - owning Session id.
+   * @returns {Promise<boolean>} whether every owned job settled.
+   */
+  async stopOwnedJobs(sessionId) {
+    let jobs
+    try {
+      jobs = this.ownedJobs(sessionId)
+    } catch (error) {
+      this.warn(`could not list jobs for "${sessionId}": ${String(error)}`)
+      return false
+    }
+    let settled = true
+    for (const job of jobs) {
+      try {
+        this.deps.jobs.kill(job.id, sessionId, 'temporary session stopped')
+      } catch (error) {
+        settled = false
+        this.warn(`could not stop job "${job.id}" for "${sessionId}": ${String(error)}`)
+        continue
+      }
+      let view
+      try {
+        view = await this.deps.jobs.wait(job.id, STOP_WAIT_MS, sessionId)
+      } catch (error) {
+        settled = false
+        this.warn(`could not await job "${job.id}" for "${sessionId}": ${String(error)}`)
+        continue
+      }
+      if (view === undefined || LIVE_JOB_STATUSES.has(view.status)) {
+        settled = false
+        this.warn(`job "${job.id}" for "${sessionId}" did not settle`)
+        continue
+      }
+      this.trace(`job ${job.id} settled`)
+    }
+    return settled
+  }
+
+  /**
+   * Every running or stopping job the named Session owns. A list that does not
+   * return an array is not evidence of absence.
+   * @param {string} sessionId - owning Session id.
+   * @returns {object[]} live job views.
+   */
+  ownedJobs(sessionId) {
+    if (typeof this.deps.jobs?.list !== 'function') return []
+    const jobs = this.deps.jobs.list(sessionId)
+    if (!Array.isArray(jobs)) throw new Error('the job registry did not return a list')
+    return jobs.filter(job => job?.owner === sessionId && LIVE_JOB_STATUSES.has(job.status))
+  }
+
+  /**
+   * Every live job owned by one member or a pending ancestor. A background
+   * one-shot subagent job is registered to its parent Agent, so a child's own
+   * job list cannot prove that the child's work stopped. A temporary side chat
+   * points at an ordinary source chat, whose unrelated jobs are not its work.
+   * @param {string} sessionId - member to inspect.
+   * @returns {object[]} live job views for the member and its pending ancestors.
+   */
+  ownedJobsInChain(sessionId) {
+    const jobs = []
+    const seen = new Set()
+    let current = sessionId
+    while (typeof current === 'string' && current !== '' && !seen.has(current)) {
+      if (current !== sessionId && this.state.sessions[current]?.pendingDelete !== true) break
+      seen.add(current)
+      jobs.push(...this.ownedJobs(current))
+      current = this.state.sessions[current]?.parentSessionId
+    }
+    return jobs
+  }
+
+  /**
+   * Whether live owned work in a member's chain still blocks confirmation and
+   * deletion. An unreadable list is not evidence of absence and blocks the same
+   * way a live job does.
+   * @param {string} sessionId - candidate Session id.
+   * @returns {boolean} whether deletion must wait.
+   */
+  hasLiveOwnedJobs(sessionId) {
+    try {
+      if (this.ownedJobsInChain(sessionId).length === 0) return false
+      this.warn(`keeping "${sessionId}": an owned job is still live`)
+      return true
+    } catch (error) {
+      this.warn(`keeping "${sessionId}": its jobs could not be listed (${String(error)})`)
+      return true
+    }
+  }
+
+  /**
+   * Confirm one pending member stopped: it and its pending ancestors own no
+   * live job, and either it has no Agent or has an idle Agent with no queued
+   * work whose `whenIdle()` settles within the bounded wait. A failed job
+   * listing is not confirmation.
+   * @param {object} record - pending member.
+   * @param {{ retry?: boolean }} [options] - whether this pass is a retry.
+   * @returns {Promise<boolean>} whether the member is confirmed stopped.
+   */
+  async confirmStopped(record, options = {}) {
+    if (this.hasLiveOwnedJobs(record.sessionId)) return false
+    const agent = this.deps.agents?.get?.(record.sessionId)
+    if (agent !== undefined && agent !== null) {
+      if (!await this.confirmIdle(agent, record.sessionId)) return false
+      // A job can start while whenIdle() is awaited, so the job check must
+      // follow the wait as well as precede it.
+      if (this.hasLiveOwnedJobs(record.sessionId)) return false
+      if (options.trace !== false) {
+        this.trace(record.kind === SUBAGENT_KIND
+          ? `confirmed ${record.sessionId}`
+          : `idle ${record.sessionId}`)
+      }
+    } else if (options.trace !== false) {
+      this.trace(options.retry === true
+        ? `retry confirmed ${record.sessionId}`
+        : `confirmed ${record.sessionId}`)
+    }
+    return true
   }
 
   /**
@@ -2424,8 +2777,8 @@ export class TemporarySessions {
 
   /**
    * Delete one record's storage directory when it is journal-authorised and no
-   * longer has a live Agent. The `deleted` event is durable before the removal;
-   * a failed append leaves the folder untouched.
+   * live work remains in its owner chain. The `deleted` event is durable before
+   * the removal; a failed append leaves the folder untouched.
    * @param {object} record - registry record.
    * @param {boolean} [liveConfirmed] - the caller already confirmed a live Session idle.
    * @param {(() => Promise<boolean> | boolean) | undefined} [confirmAfterAppend] - recheck
@@ -2475,6 +2828,9 @@ export class TemporarySessions {
       this.warn(`not deleting temporary session "${record.sessionId}": its Agent changed before removal`)
       return false
     }
+    // This is the final synchronous turn before removal. A job that appeared
+    // during the durable append or the idle wait must still block deletion.
+    if (this.hasLiveOwnedJobs(record.sessionId)) return false
     try {
       // The final liveness check and the removal are one synchronous turn, so
       // a same-process Session cannot become live between them.
@@ -2543,6 +2899,7 @@ export class TemporarySessions {
         this.warn(`not finishing deletion of "${sessionId}": its Session or Agent became live during its header check`)
         continue
       }
+      if (this.hasLiveOwnedJobs(sessionId)) continue
       if (!existsSync(entry.deletedDir)) continue
       try {
         rmSync(entry.deletedDir, { recursive: true, force: true })
@@ -2739,6 +3096,11 @@ export class TemporarySessions {
         continue
       }
       if (this.deps.sessions.get(sessionId) !== undefined || kept.has(sessionId)) continue
+      if (record.pendingDelete === true && !this.stopped.has(sessionId)) {
+        this.warn(`keeping "${sessionId}": its stop is not confirmed`)
+        continue
+      }
+      if (this.hasLiveOwnedJobs(sessionId)) continue
       const entry = this.journal.entries[sessionId]
       if (entry?.deleted === true && entry.deletedDir === entry.dir && !existsSync(entry.dir)) {
         delete this.state.sessions[sessionId]
@@ -2769,30 +3131,26 @@ export class TemporarySessions {
    * confirmed idle; this pass only re-issues the stop.
    * @returns {Promise<void>}
    */
-  async resumePendingStops() {
+  async resumePendingStops(options = {}) {
     for (const record of Object.values(this.state.sessions)) {
-      if (record?.pendingDelete !== true) continue
-      if (this.deps.sessions.get(record.sessionId) === undefined) continue
+      if (record?.pendingDelete !== true || !this.stopped.has(record.sessionId)) continue
+      let jobs
+      try {
+        jobs = this.ownedJobs(record.sessionId)
+      } catch {
+        this.stopped.delete(record.sessionId)
+        continue
+      }
       const agent = this.deps.agents?.get?.(record.sessionId)
-      let issued = false
-      if (agent !== undefined && typeof agent.cancel === 'function') {
-        try {
-          agent.cancel({ kind: record.kind === SUBAGENT_KIND ? 'parent' : 'user' })
-          issued = true
-        } catch (error) {
-          this.warn(`could not resume the stop for "${record.sessionId}": ${String(error)}`)
-        }
-      }
-      if (!issued && typeof this.deps.sessionController?.cancel === 'function') {
-        try {
-          this.deps.sessionController.cancel({ sessionId: record.sessionId })
-          issued = true
-        } catch (error) {
-          this.warn(`could not resume the stop for "${record.sessionId}": ${String(error)}`)
-        }
-      }
-      if (!issued) this.warn(`pending "${record.sessionId}" has a live Session but no cancel path`)
+      const renewed = jobs.length > 0
+        || (agent !== undefined && agent !== null
+          && (agent.status !== 'idle' || this.hasQueuedWork(agent)))
+      if (renewed) this.stopped.delete(record.sessionId)
     }
+    const records = Object.values(this.state.sessions).filter(record => record?.pendingDelete === true
+      && !this.stopped.has(record.sessionId))
+    if (records.length === 0) return
+    await this.stopMembers(records, options)
   }
 
   /**
@@ -2912,6 +3270,7 @@ export class TemporarySessions {
   async confirmIdle(agent, sessionId = undefined) {
     if (agent === undefined) return true
     if (agent.status !== 'idle') return false
+    if (this.hasQueuedWork(agent)) return false
     if (typeof agent.whenIdle === 'function') {
       let timer
       let settled
@@ -2919,7 +3278,7 @@ export class TemporarySessions {
         settled = await Promise.race([
           Promise.resolve().then(() => agent.whenIdle()).then(() => true, () => false),
           new Promise((resolve) => {
-            timer = setTimeout(() => resolve(false), 100)
+            timer = setTimeout(() => resolve(false), STOP_WAIT_MS)
           }),
         ])
       } finally {
@@ -2929,14 +3288,24 @@ export class TemporarySessions {
     }
     const current = sessionId === undefined ? agent : this.deps.agents?.get?.(sessionId)
     if (current === undefined) return true
-    return current === agent && current.status === 'idle'
+    return current === agent && current.status === 'idle' && !this.hasQueuedWork(current)
+  }
+
+  /**
+   * Whether an Agent still holds input that would wake it after cancellation.
+   * @param {object} agent - live Agent.
+   * @returns {boolean} whether a queued turn or step remains.
+   */
+  hasQueuedWork(agent) {
+    return (Array.isArray(agent.inbox?.nextTurn) && agent.inbox.nextTurn.length > 0)
+      || (Array.isArray(agent.inbox?.nextStep) && agent.inbox.nextStep.length > 0)
   }
 
   /**
    * On plugin unload, publish the registry synchronously, then delete the storage of Sessions
-   * already ended by the user. A pending member with a running Agent stays recorded for the next
-   * boot; a live but idle Session has no work left and may be removed only after `whenIdle()`
-   * settles within the bounded check.
+   * already ended by the user. A pending member with a running Agent, an unsettled job, or a
+   * failed stop stays recorded for the next boot; a live but idle Session has no work left and
+   * may be removed only after `whenIdle()` settles within the bounded check.
    */
   cleanupPending() {
     this.flushRegistrySync()
@@ -2946,20 +3315,29 @@ export class TemporarySessions {
         this.warn('skipping unload cleanup: the ownership evidence is degraded')
         return
       }
+      await this.resumePendingStops()
       for (const record of Object.values(this.state.sessions)) {
         if (record?.pendingDelete !== true) continue
-        const agent = this.deps.agents?.get?.(record.sessionId)
-        if (!(await this.confirmIdle(agent, record.sessionId))) {
-          this.warn(`keeping "${record.sessionId}" on unload: its Agent is not confirmed idle`)
+        // The stop pass owns failure reporting. A member whose archive, cancel
+        // or job stop failed is not deletion evidence even if it now has no
+        // live Agent of its own.
+        if (!this.stopped.has(record.sessionId)) {
+          this.warn(`keeping "${record.sessionId}" on unload: its stop is not confirmed`)
           continue
         }
+        if (!(await this.confirmStopped(record, { trace: false }))) {
+          this.warn(`keeping "${record.sessionId}" on unload: its stop is not confirmed`)
+          continue
+        }
+        this.stopped.add(record.sessionId)
         await this.removeStorage(
           record,
           true,
-          () => this.confirmIdle(this.deps.agents?.get?.(record.sessionId), record.sessionId),
+          () => this.confirmStopped(record, { trace: false }),
           () => {
             const current = this.deps.agents?.get?.(record.sessionId)
-            return current === undefined || (current === agent && current.status === 'idle')
+            return current === undefined
+              || (current.status === 'idle' && !this.hasQueuedWork(current))
           },
         )
       }

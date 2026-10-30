@@ -114,11 +114,16 @@ window.__ModuleLoader__.load({
         || !Array.isArray(value.sessions)) {
         throw new Error('temporary session listing returned an invalid payload')
       }
+      const stopping = value.stopping.map(item => stoppingEntry.create().parse(item))
+      const stoppingCount = Number.isSafeInteger(value.stoppingCount)
+        ? value.stoppingCount
+        : stopping.length
       return {
         epoch: value.epoch,
         sequence: value.sequence,
         degraded: value.degraded,
-        stopping: value.stopping.map(item => stoppingEntry.create().parse(item)),
+        stopping,
+        stoppingCount,
         sessions: value.sessions.map(item => listedRecord.create().parse(item)),
       }
     })
@@ -126,7 +131,13 @@ window.__ModuleLoader__.load({
       if (value === null || typeof value !== 'object' || value.discarded !== true) {
         throw new Error('temporary session discard returned an invalid receipt')
       }
-      return { discarded: true }
+      const stopping = Array.isArray(value.stopping)
+        ? value.stopping.map(item => stoppingEntry.create().parse(item))
+        : []
+      const stoppingCount = Number.isSafeInteger(value.stoppingCount)
+        ? value.stoppingCount
+        : stopping.length
+      return { discarded: true, stopping, stoppingCount }
     })
 
     const remoteContribution = {
@@ -332,7 +343,6 @@ window.__ModuleLoader__.load({
           if (record.kind === 'side') side.add(record.sessionId)
           if (record.pendingDelete === true || pending.has(record.sessionId)) {
             pending.add(record.sessionId)
-            stopping.add(record.sessionId)
           } else {
             ids.add(record.sessionId)
           }
@@ -912,12 +922,9 @@ window.__ModuleLoader__.load({
           if (ending.has(sessionId)) return
           ending.add(sessionId)
           try {
-            try {
-              await ctx.uiWorkspace.archiveSession(sessionId, { stopActivity: true })
-            } catch (error) {
-              // The Host still owns the record; the log is deleted at exit.
-              log?.warn?.(`could not archive an ended temporary session: ${String(error)}`)
-            }
+            // The Host journals the tree before it archives or stops anything.
+            // A browser-side archive here would run before the durable pending
+            // event and could hide a chat the Host refused to discard.
             const result = await ctx.remote.tempSession.discard({ sessionId })
             if (!result.ok) throw result.error
             store.markEnded(sessionId)

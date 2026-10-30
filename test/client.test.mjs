@@ -436,11 +436,13 @@ test('a mounted client follows host epochs', async () => {  const { registration
   assert.equal(delayed.accepted, false)
   assert.equal(store.getSnapshot().ids.has('session-delayed'), false)
 
-  // Pending is terminal until the record disappears from the list.
+  // Pending is terminal until the record disappears from the list. A Host
+  // list without a stopping entry means the work settled, so the view stays
+  // hidden without a stopping badge.
   store.applyList(list(2, 2, [record('session-terminal', true, 'main')]))
   assert.equal(store.getSnapshot().ids.has('session-terminal'), false)
   assert.equal(store.getSnapshot().pending.has('session-terminal'), true)
-  assert.equal(store.getSnapshot().stopping.has('session-terminal'), true)
+  assert.equal(store.getSnapshot().stopping.has('session-terminal'), false)
   store.applyList(list(2, 3, [record('session-terminal', false, 'main')]))
   assert.equal(store.getSnapshot().ids.has('session-terminal'), false)
   assert.equal(store.getSnapshot().pending.has('session-terminal'), true)
@@ -448,6 +450,31 @@ test('a mounted client follows host epochs', async () => {  const { registration
   // A new epoch supersedes the old sequence cursor for unrelated records.
   store.applyList(list(3, 1, [record('session-new-epoch')]))
   assert.equal(store.getSnapshot().ids.has('session-new-epoch'), true)
+})
+
+test('a settled pending chat is hidden without a stopping entry', async () => {
+  const { registration } = await loadBundle()
+  const plugin = registration.factory(() => React)
+  const captured = []
+  const { ctx } = makeContext()
+  ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
+  await plugin.apply(ctx)
+  const store = captured.find(options => options.id === 'temp-session-selection').inject().store
+  const record = { sessionId: 'session-settled', createdAt: 1, kind: 'main', pendingDelete: true }
+  // Hydration is optimistic until the Host list arrives.
+  store.hydrate([record])
+  assert.equal(store.getSnapshot().stopping.has('session-settled'), true)
+  const applied = store.applyList({
+    epoch: (store.getSnapshot().epoch ?? 0) + 1,
+    sequence: 1,
+    degraded: false,
+    stopping: [],
+    sessions: [record],
+  })
+  assert.equal(applied.accepted, true)
+  assert.equal(store.getSnapshot().ids.has('session-settled'), false)
+  assert.equal(store.getSnapshot().pending.has('session-settled'), true)
+  assert.equal(store.getSnapshot().stopping.has('session-settled'), false)
 })
 
 test('a refresh requested during a read runs again', async () => {
@@ -538,7 +565,7 @@ test('both closes happen independently', async () => {
   assert.equal(injected.store.getSnapshot().stopping.size, 2)
 })
 
-test('the composer dock ends a temporary Session through archive and discard', async () => {
+test('the composer dock ends a temporary Session through discard only', async () => {
   const { registration } = await loadBundle()
   const plugin = registration.factory(() => React)
   const captured = []
@@ -549,30 +576,38 @@ test('the composer dock ends a temporary Session through archive and discard', a
   const injected = dock.inject()
   injected.store.add('session-new')
   await injected.actions.end('session-new')
-  assert.deepEqual(calls.archived, ['session-new'])
+  // The Host archives after its durable pending event, so End must not archive
+  // or stop the chat first.
+  assert.deepEqual(calls.archived, [])
   assert.deepEqual(calls.discarded, ['session-new'])
   assert.equal(injected.store.getSnapshot().ids.has('session-new'), false)
 })
 
-test('an archive failure still closes the main view', async () => {
+test('a failed discard leaves the main view and record in place', async () => {
   const { registration } = await loadBundle()
   const plugin = registration.factory(() => React)
   const captured = []
   const { ctx, calls } = makeContext()
   ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
-  ctx.uiWorkspace.archiveSession = async () => { throw new Error('archive failed') }
   await plugin.apply(ctx)
+  let discardCalls = 0
+  ctx.remote.tempSession.discard = async () => {
+    discardCalls += 1
+    return { ok: false, error: new Error('discard failed') }
+  }
   calls.registered.push({ sessionId: 'session-current', title: 'current' })
   const dock = captured.find(options => options.name === 'conversation.input.dock')
   const injected = dock.inject()
   injected.store.add('session-current')
   await injected.actions.end('session-current')
-  assert.deepEqual(calls.discarded, ['session-current'])
-  assert.equal(calls.clearedMain, 1)
+  assert.equal(discardCalls, 1)
+  assert.deepEqual(calls.archived, [])
+  assert.deepEqual(calls.discarded, [])
+  assert.equal(calls.clearedMain, 0)
   const snapshot = injected.store.getSnapshot()
-  assert.equal(snapshot.ids.has('session-current'), false)
-  assert.equal(snapshot.stopping.has('session-current'), true)
-  assert.equal(snapshot.pending.has('session-current'), true)
+  assert.equal(snapshot.ids.has('session-current'), true)
+  assert.equal(snapshot.stopping.has('session-current'), false)
+  assert.equal(snapshot.pending.has('session-current'), false)
 })
 
 test('a restored pending side tab is closed without a fresh startSideChat', async () => {

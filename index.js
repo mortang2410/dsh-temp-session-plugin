@@ -2,9 +2,9 @@
  * Host half of the temporary-session bundle.
  *
  * It records Sessions the browser creates as temporary, titles them, and
- * deletes their stored logs when the Host exits. A boot-time reap handles the
- * crash case; a process signal handler covers application quit, which does not
- * run Cordis disposal.
+ * coordinates their confirmed stop and stored-log deletion on plugin unload,
+ * at process exit, or by the next boot after a hard kill. A process signal
+ * handler covers application quit, which does not run Cordis disposal.
  *
  * @module dsh-temp-session-plugin
  */
@@ -36,6 +36,7 @@ export async function apply(ctx) {
     sessionController: ctx.sessionController,
     get agents() { return ctx.get('agents') },
     get goals() { return ctx.get('goals') },
+    get jobs() { return ctx.get('jobs') },
     get workspaceRegistry() { return ctx.get('workspaceRegistry') },
     logger: log,
     paths,
@@ -62,7 +63,10 @@ export async function apply(ctx) {
 
   // Ended Sessions are deleted as soon as the plugin unloads (for example a
   // live profile reload). Live temporary Sessions stay for the next boot.
-  ctx.effect(() => () => temp.cleanupPending(), 'temp-session: ended cleanup')
+  ctx.effect(() => () => {
+    temp.closeAdmission()
+    return temp.cleanupPending()
+  }, 'temp-session: ended cleanup')
 
   // A hard KillAgent shutdown sends SIGTERM without Cordis disposal: delete
   // synchronously there and at normal process exit. The handler reads the

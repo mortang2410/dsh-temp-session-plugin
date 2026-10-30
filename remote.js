@@ -141,21 +141,32 @@ const listResult = strict('ListResult', (value) => {
     || !Array.isArray(value.sessions)) {
     throw new Error('temporary session listing returned an invalid payload')
   }
+  const stopping = value.stopping.map(item => stoppingEntry.create().parse(item))
+  const stoppingCount = Number.isSafeInteger(value.stoppingCount)
+    ? value.stoppingCount
+    : stopping.length
   return {
     epoch: value.epoch,
     sequence: value.sequence,
     degraded: value.degraded,
-    stopping: value.stopping.map(item => stoppingEntry.create().parse(item)),
+    stopping,
+    stoppingCount,
     sessions: value.sessions.map(item => listedRecord.create().parse(item)),
   }
 })
 
-/** Validate a discard result. */
+/** Validate a discard result, including the chats still stopping. */
 const discardResult = strict('DiscardResult', (value) => {
   if (value === null || typeof value !== 'object' || value.discarded !== true) {
     throw new Error('temporary session discard returned an invalid receipt')
   }
-  return { discarded: true }
+  const stopping = Array.isArray(value.stopping)
+    ? value.stopping.map(item => stoppingEntry.create().parse(item))
+    : []
+  const stoppingCount = Number.isSafeInteger(value.stoppingCount)
+    ? value.stoppingCount
+    : stopping.length
+  return { discarded: true, stopping, stoppingCount }
 })
 
 /** Method descriptors shared by the Host contribution and the browser mount. */
