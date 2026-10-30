@@ -93,14 +93,14 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 
 ## 工作原理
 
-- **Host**（`index.js`、`core.js`）：记录临时会话 id、类型（`main`/`side`）和 JSONL 返回的精确会话目录；设置标题；side 类型会清掉继承的 goal 并加一段边界提示；负责删除。注册表位于 `$DSH_HOME/temp-session/records.json`（权限 `0600`）。
+- **Host**（`index.js`、`core.js`）：记录临时会话 id、类型、直接父会话和 JSONL 返回的精确会话目录；设置标题；side 类型会清掉继承的 goal 并加一段边界提示；负责删除。可变的注册表索引位于 `$DSH_HOME/temp-session/records.json`（权限 `0600`），只追加的所有权日志 `$DSH_HOME/temp-session/ownership.jsonl` 在会话日志落盘前记下临时归属。
 - **Web Client**（`client.js`）：注册「新会话」选项、侧栏快捷入口、输入框临时条、标题栏标签、行菜单/徽标、选区浮层、`tempchat` 右侧栏 tab，以及侧栏隐藏过滤器。侧聊 = 普通 `session.fork` + `tempSession/register(kind: "side")`；提升 = `tempSession/promote`，删除临时记录，退出时不再清理。
 
 删除时机：
 
 | 时机 | 行为 |
 |---|---|
-| 退出应用 / `SIGTERM` / `SIGINT` | 同步删除所有已记录的临时会话目录。 |
+| 退出应用 / `SIGTERM` / `SIGINT` | 同步删除退出快照中已校验的会话目录；退出时不再解析注册表文件。 |
 | 插件卸载 / profile 热重载 | 只删除用户已「结束」的会话，仍在使用的保留。 |
 | 下次启动 | 在浏览器连上之前，删除没有存活 Agent 的记录，并清理归档标记。 |
 

@@ -12,7 +12,7 @@
 import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
   TemporarySessions,
-  installProcessCleanup,
+  installExitCleanup,
   statePaths,
 } from './core.js'
 import { tempSessionContribution } from './remote.js'
@@ -63,8 +63,11 @@ export async function apply(ctx) {
   ctx.effect(() => () => temp.cleanupPending(), 'temp-session: ended cleanup')
 
   // A hard KillAgent shutdown sends SIGTERM without Cordis disposal: delete
-  // synchronously there and at normal process exit.
-  ctx.effect(() => installProcessCleanup(paths.file, log, () => temp.registryForExit()), 'temp-session: process cleanup')
+  // synchronously there and at normal process exit. The handler reads the
+  // immutable validated snapshot and never parses the registry file; the
+  // binding deliberately outlives an unload, so an unloaded plugin still
+  // deletes the Sessions it validated.
+  installExitCleanup(() => temp.exitSnapshot(), log)
 
   /**
    * Host service behind the `tempSession` Remote namespace. Methods are

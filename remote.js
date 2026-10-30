@@ -10,6 +10,9 @@
  * @module dsh-temp-session-plugin/remote
  */
 
+/** Every kind the listing may carry; subagent records are never listed. */
+const LISTED_KINDS = ['main', 'side', 'fork']
+
 /** One strict codec without a Zod dependency. */
 const strict = (name, parse) => ({
   mode: 'strict',
@@ -70,15 +73,53 @@ const registerResult = strict('RegisterResult', (value) => {
   }
 })
 
-/** Validate one listed record. */
-const listedRecord = strict('ListedRecord', (value) => registerResult.create().parse(value))
+/** Validate one listed record, which may be a chat, a side chat or a fork. */
+const listedRecord = strict('ListedRecord', (value) => {
+  if (value === null
+    || typeof value !== 'object'
+    || typeof value.sessionId !== 'string'
+    || !Number.isSafeInteger(value.createdAt)
+    || !LISTED_KINDS.includes(value.kind)
+    || typeof value.pendingDelete !== 'boolean') {
+    throw new Error('temporary session listing returned an invalid record')
+  }
+  return {
+    sessionId: value.sessionId,
+    createdAt: value.createdAt,
+    kind: value.kind,
+    pendingDelete: value.pendingDelete,
+  }
+})
 
-/** Validate a listing result. */
+/** Validate one stopping entry: a Session whose record is pending deletion. */
+const stoppingEntry = strict('StoppingEntry', (value) => {
+  if (value === null
+    || typeof value !== 'object'
+    || typeof value.sessionId !== 'string'
+    || !LISTED_KINDS.includes(value.kind)) {
+    throw new Error('temporary session listing returned an invalid stopping entry')
+  }
+  return { sessionId: value.sessionId, kind: value.kind }
+})
+
+/** Validate a listing result: publisher epoch, response sequence, health and stopping state. */
 const listResult = strict('ListResult', (value) => {
-  if (value === null || typeof value !== 'object' || !Array.isArray(value.sessions)) {
+  if (value === null
+    || typeof value !== 'object'
+    || !Number.isSafeInteger(value.epoch)
+    || !Number.isSafeInteger(value.sequence)
+    || typeof value.degraded !== 'boolean'
+    || !Array.isArray(value.stopping)
+    || !Array.isArray(value.sessions)) {
     throw new Error('temporary session listing returned an invalid payload')
   }
-  return { sessions: value.sessions.map(item => listedRecord.create().parse(item)) }
+  return {
+    epoch: value.epoch,
+    sequence: value.sequence,
+    degraded: value.degraded,
+    stopping: value.stopping.map(item => stoppingEntry.create().parse(item)),
+    sessions: value.sessions.map(item => listedRecord.create().parse(item)),
+  }
 })
 
 /** Validate a discard result. */

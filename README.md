@@ -139,11 +139,13 @@ reference context, not a continuation of the main task.
 
 The bundle has two halves:
 
-- **Host** (`index.js`, `core.js`) — records a temporary session id, its kind
-  (`main` or `side`), and the exact per-session directory returned by the JSONL
-  store. It titles the session, detaches a side chat from the inherited goal,
-  and owns deletion. The registry lives at
-  `$DSH_HOME/temp-session/records.json` (mode `0600`).
+- **Host** (`index.js`, `core.js`) — records a temporary session id, its kind,
+  its direct parent Session and the exact per-session directory returned by the
+  JSONL store. It titles the session, detaches a side chat from the inherited
+  goal, and owns deletion. A mutable index lives at
+  `$DSH_HOME/temp-session/records.json` (mode `0600`); an append-only ownership
+  journal at `$DSH_HOME/temp-session/ownership.jsonl` records why a Session is
+  temporary before its transcript is indexed.
 - **Web client** (`client.js`) — registers the New Session pill, the sidebar
   shortcut, the composer strip, the header chip, the row menu item and badge,
   the selection action, the `tempchat` right-sidebar tab, and the hidden-side-chat
@@ -155,7 +157,7 @@ Deletion points:
 
 | Moment | What happens |
 |---|---|
-| App exit / `SIGTERM` / `SIGINT` | Every recorded temporary session directory is deleted synchronously. |
+| App exit / `SIGTERM` / `SIGINT` | Every directory in the validated exit snapshot is deleted synchronously; exit never parses the registry file. |
 | Plugin unload / live profile reload | Only sessions the user already ended are deleted; live ones stay. |
 | Next boot | Recorded sessions with no live agent are deleted before the browser connects, and their archive entries are cleared. |
 

@@ -14,6 +14,9 @@
   "files": [
     "index.js",
     "core.js",
+    "journal.js",
+    "publisher.js",
+    "records.js",
     "remote.js",
     "client.js",
     "cordis.patch.yml",
@@ -72,6 +75,6 @@
   },
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "check": "node --check index.js && node --check client.js && node --check core.js && node --check remote.js && node --test test/*.test.mjs"
+    "check": "node --check index.js && node --check client.js && node --check core.js && node --check journal.js && node --check publisher.js && node --check records.js && node --check remote.js && node --test test/*.test.mjs"
   }
 }

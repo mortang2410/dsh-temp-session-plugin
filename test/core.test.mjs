@@ -4,24 +4,36 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import { existsSync } from 'node:fs'
+import { chmod, mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, beforeEach, test } from 'node:test'
 import {
   TemporarySessions,
-  cleanupAllSync,
-  installProcessCleanup,
+  cleanupSnapshotSync,
+  installExitCleanup,
   isSafeSessionDir,
   statePaths,
 } from '../core.js'
+import { appendJournalEvent, replayJournal, writeJournalMarker } from '../journal.js'
+import { Publisher } from '../publisher.js'
+import { readRecord, recordFields } from '../records.js'
+import { tempSessionDescriptors } from '../remote.js'
 
 let root
 let stateFile
+let stateDir
+let journalFile
+let markerFile
 const warnings = []
+const NOW = 1_760_000_000_000
 
 function fakeSession(id, {
-  cwd = '/tmp/project', events = [], isSeeded = false, origin, parentSession, inheritedEventCount,
+  cwd = '/tmp/project', events = [], isSeeded = false, origin, parentSession, inheritedEventCount, createdAt,
 } = {}) {
   return {
     id,
@@ -32,13 +44,51 @@ function fakeSession(id, {
       id,
       cwd,
       isSeeded,
+      ...(createdAt === undefined ? {} : { createdAt }),
       ...(origin === undefined ? {} : { origin }),
       ...(parentSession === undefined ? {} : { parentSession }),
     },
   }
 }
 
-function harness({ sessions = new Map(), stored = [], registry } = {}) {
+/** The stored artifact directory the fake locator derives from a Session id. */
+function sessionDirOf(id) {
+  return join(root, 'sessions', 'project', id)
+}
+
+/** Every event line the ownership journal holds, in file order. */
+async function journalLines() {
+  let text
+  try {
+    text = await readFile(journalFile, 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return []
+    throw error
+  }
+  return text.split('\n').filter(line => line !== '').map(line => JSON.parse(line))
+}
+
+/** A state record as a pre-journal registry would have written it. */
+function legacyRecord(session, kind = 'main', parentSessionId = null) {
+  return {
+    sessionId: session.id,
+    dir: sessionDirOf(session.id),
+    cwd: session.header.cwd ?? null,
+    createdAt: session.header.createdAt ?? 1,
+    title: '',
+    kind,
+    parentSessionId,
+    pendingDelete: false,
+  }
+}
+
+/** Write a version-1 registry index directly, as a previous run would have. */
+async function writeRegistry(sessions) {
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(stateFile, JSON.stringify({ version: 1, sessions }, null, 2))
+}
+
+function harness({ sessions = new Map(), stored = [], registry, persistence = {} } = {}) {
   const live = new Map(sessions)
   const removed = []
   const renames = []
@@ -52,6 +102,11 @@ function harness({ sessions = new Map(), stored = [], registry } = {}) {
         path: join(root, 'sessions', 'project', header.id, 'session.v4.jsonl.zstd'),
       }),
       list: async () => stored.map(header => ({ header })),
+      stat: async id => {
+        const header = stored.find(candidate => candidate.id === id)
+        return header === undefined ? undefined : { header, revision: 'revision' }
+      },
+      ...persistence,
     },
     sessionController: {
       rename: async request => { renames.push(request.title); return { title: request.title, seq: 1 } },
@@ -64,6 +119,7 @@ function harness({ sessions = new Map(), stored = [], registry } = {}) {
   }
   return {
     temp: new TemporarySessions(deps),
+    deps,
     live,
     removed,
     renames,
@@ -81,12 +137,17 @@ async function materializeSession(id) {
 
 before(async () => {
   root = await mkdtemp(join(tmpdir(), 'dsh-temp-session-test-'))
-  stateFile = statePaths({ DSH_HOME: root }).file
+  const paths = statePaths({ DSH_HOME: root })
+  stateFile = paths.file
+  stateDir = paths.dir
+  journalFile = paths.journal
+  markerFile = paths.marker
 })
 
 beforeEach(async () => {
-  await rm(stateFile, { force: true })
+  await rm(join(root, 'temp-session'), { recursive: true, force: true })
   await rm(join(root, 'sessions'), { recursive: true, force: true })
+  warnings.length = 0
 })
 
 after(async () => {
@@ -172,7 +233,7 @@ test('a flush that publishes the log before failing keeps the record', async () 
 test('an unresolvable locator fails before anything is written', async () => {
   const session = fakeSession('session-nolocator')
   const h = harness({ sessions: new Map([[session.id, session]]) })
-  h.temp.deps.sessionPersistence = { locate: () => ({ kind: 'sqlite' }) }
+  h.temp.deps.sessionPersistence = { ...h.temp.deps.sessionPersistence, locate: () => ({ kind: 'sqlite' }) }
   let flushed = false
   h.temp.deps.sessions.flush = async () => { flushed = true; return true }
   await assert.rejects(h.temp.register({ sessionId: session.id }), /JSONL session store/)
@@ -298,7 +359,7 @@ test('reap recovers a missing directory from the stored header', async () => {
   assert.equal(after.sessions[session.id], undefined)
 })
 
-test('cleanupAllSync deletes every recorded directory but keeps tombstones', async () => {
+test('snapshot cleanup deletes every recorded directory but keeps tombstones', async () => {
   const first = fakeSession('session-sync-one')
   const second = fakeSession('session-sync-two')
   const h = harness({ sessions: new Map([[first.id, first], [second.id, second]]) })
@@ -306,7 +367,7 @@ test('cleanupAllSync deletes every recorded directory but keeps tombstones', asy
   await h.temp.register({ sessionId: second.id })
   const firstDir = await materializeSession(first.id)
   const secondDir = await materializeSession(second.id)
-  assert.equal(cleanupAllSync(stateFile), 2)
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 2)
   await assert.rejects(readFile(join(firstDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   await assert.rejects(readFile(join(secondDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
@@ -331,9 +392,14 @@ test('a corrupt registry never throws and never deletes blindly', async () => {
   await mkdir(join(root, 'temp-session'), { recursive: true })
   await writeFile(stateFile, '{not json')
   const h = harness()
-  assert.deepEqual(await h.temp.list(), { sessions: [] })
+  const listed = await h.temp.list()
+  assert.deepEqual(listed.sessions, [])
+  assert.deepEqual(listed.stopping, [])
+  assert.equal(listed.degraded, true)
+  assert.equal(listed.sequence, 1)
+  assert.ok(Number.isSafeInteger(listed.epoch) && listed.epoch > 0)
   await h.temp.reap()
-  assert.equal(cleanupAllSync(stateFile), 0)
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
 })
 
 test('unload leaves an unreadable registry file untouched and leaves no temporary file', async () => {
@@ -374,15 +440,17 @@ test('a subagent under a recorded chat is recorded at creation; other Sessions a
   await h.temp.recordDescendant(stranger)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.deepEqual(Object.keys(saved.sessions).sort(), ['session-chat', 'session-child'])
-  const { createdAt, ...record } = saved.sessions[child.id]
-  assert.ok(Number.isSafeInteger(createdAt))
+  const { createdAt, lastActivityAt, activitySince, ...record } = saved.sessions[child.id]
+  for (const clock of [createdAt, lastActivityAt, activitySince]) {
+    assert.ok(Number.isSafeInteger(clock) && clock > 0)
+  }
   assert.deepEqual(record, {
     sessionId: child.id,
-    dir: join(root, 'sessions', 'project', child.id),
-    cwd: '/tmp/project',
-    title: '',
     kind: 'subagent',
     parentSessionId: chat.id,
+    title: '',
+    dir: join(root, 'sessions', 'project', child.id),
+    cwd: '/tmp/project',
     pendingDelete: false,
   })
   // A Session without a header must not make the listener throw.
@@ -397,7 +465,7 @@ test('a subagent record is not a chat: it is not listed, adopted, discarded, or 
   await assert.rejects(h.temp.promote({ sessionId: child.id }), /not a recorded/)
 })
 
-test('a subagent under an unrecorded live ancestor is recorded under the nearest recorded id', async () => {
+test('a subagent under an unrecorded live ancestor is recorded with its true direct parent', async () => {
   const chat = fakeSession('session-chat')
   // The middle subagent was never announced to the plugin, so it is not recorded.
   const middle = fakeSession('session-middle', { origin: 'subagent', parentSession: chat.id })
@@ -406,15 +474,17 @@ test('a subagent under an unrecorded live ancestor is recorded under the nearest
   await h.temp.register({ sessionId: chat.id })
   await h.temp.recordDescendant(leaf)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
-  assert.equal(saved.sessions[leaf.id].parentSessionId, chat.id)
+  // The live chain proves the leaf belongs to the temporary tree; the record keeps
+  // the announced direct parent, and boot reconciliation will adopt the middle.
+  assert.equal(saved.sessions[leaf.id].parentSessionId, middle.id)
   assert.equal(saved.sessions[middle.id], undefined)
 })
 
 test('exit cleanup deletes a recorded child together with its chat', async () => {
-  const { chat, child } = await chatWithChild()
+  const { h, chat, child } = await chatWithChild()
   const chatDir = await materializeSession(chat.id)
   const childDir = await materializeSession(child.id)
-  assert.equal(cleanupAllSync(stateFile), 2)
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 2)
   await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
 })
@@ -449,14 +519,17 @@ test('promote drops the chat and its child records, so a later exit keeps the ch
   await h.temp.promote({ sessionId: chat.id })
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.deepEqual(saved.sessions, {})
-  assert.equal(cleanupAllSync(stateFile), 0)
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
   assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
   assert.equal(await readFile(join(chatDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 })
 
 test('boot reap deletes a child whose parent record is gone, and drops a child whose directory is gone', async () => {
-  const { h, child } = await chatWithChild()
+  const { h, chat, child } = await chatWithChild()
   const orphanDir = await materializeSession(child.id)
+  h.deps.sessionPersistence.list = async () => [chat, child].map(session => ({ header: session.header }))
+  h.temp.storedHeaders.set(chat.id, chat.header)
+  h.temp.storedHeaders.set(child.id, child.header)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
   // The parent record is removed without its cascade: the child must still be deleted.
   delete saved.sessions['session-chat']
@@ -469,7 +542,10 @@ test('boot reap deletes a child whose parent record is gone, and drops a child w
   // A child whose directory was never materialized is dropped without error.
   const chat2 = fakeSession('session-chat2')
   const gone = fakeSession('session-gone', { origin: 'subagent', parentSession: chat2.id })
-  const again = harness({ sessions: new Map([[chat2.id, chat2], [gone.id, gone]]) })
+  const again = harness({
+    sessions: new Map([[chat2.id, chat2], [gone.id, gone]]),
+    stored: [chat2.header, gone.header],
+  })
   await again.temp.register({ sessionId: chat2.id })
   await again.temp.recordDescendant(gone)
   again.live.clear()
@@ -511,7 +587,7 @@ test('reap keeps a settled child while its live chat stays, through every depth,
   assert.deepEqual(Object.keys(kept.sessions).sort(), ['session-chat', 'session-leaf', 'session-middle'])
   assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
   await h.temp.promote({ sessionId: chat.id })
-  assert.equal(cleanupAllSync(stateFile), 0)
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
   assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 })
 
@@ -530,11 +606,13 @@ test('exit cleanup also deletes a child whose registry save has not finished', a
   await started
   const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.equal(onDisk.sessions[child.id], undefined)
-  const removed = cleanupAllSync(stateFile, undefined, () => h.temp.state)
+  const removed = cleanupSnapshotSync(h.temp.exitSnapshot())
   await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   assert.equal(removed, 2)
-  // A boot reap after the exit: the child was never saved, so it has no record and its directory stays gone.
+  // A boot reap after the exit: the journal still owns the child, but the process is
+  // gone, so neither a live Session nor its stored header survives to rebuild it.
+  h.live.clear()
   await new TemporarySessions(h.temp.deps).reap()
   const afterReap = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.equal(afterReap.sessions[child.id], undefined)
@@ -564,7 +642,7 @@ test('discard sends cancel only to the chat, never to a subagent child the Host 
 })
 
 const PROCESS_CLEANUP_FLAG = Symbol.for('dsh.temp-session.process-cleanup')
-const EXIT_STATE_PROVIDER_KEY = Symbol.for('dsh.temp-session.exit-state-provider')
+const EXIT_SNAPSHOT_KEY = Symbol.for('dsh.temp-session.exit-snapshot')
 
 /**
  * Runs a body with the once-per-process guard and the exit state provider
@@ -574,10 +652,11 @@ const EXIT_STATE_PROVIDER_KEY = Symbol.for('dsh.temp-session.exit-state-provider
  * globals are restored.
  */
 async function withFreshProcessCleanup(body) {
-  const savedGuard = globalThis[PROCESS_CLEANUP_FLAG]
-  const savedProvider = globalThis[EXIT_STATE_PROVIDER_KEY]
-  delete globalThis[PROCESS_CLEANUP_FLAG]
-  delete globalThis[EXIT_STATE_PROVIDER_KEY]
+  const saved = new Map()
+  for (const key of [PROCESS_CLEANUP_FLAG, EXIT_SNAPSHOT_KEY]) {
+    saved.set(key, globalThis[key])
+    delete globalThis[key]
+  }
   const exitBefore = new Set(process.listeners('exit'))
   const signalsBefore = ['SIGTERM', 'SIGINT'].map(name => [name, new Set(process.listeners(name))])
   try {
@@ -591,48 +670,31 @@ async function withFreshProcessCleanup(body) {
         if (!before.has(listener)) process.off(name, listener)
       }
     }
-    if (savedGuard === undefined) delete globalThis[PROCESS_CLEANUP_FLAG]
-    else globalThis[PROCESS_CLEANUP_FLAG] = savedGuard
-    if (savedProvider === undefined) delete globalThis[EXIT_STATE_PROVIDER_KEY]
-    else globalThis[EXIT_STATE_PROVIDER_KEY] = savedProvider
+    for (const [key, value] of saved) {
+      if (value === undefined) delete globalThis[key]
+      else globalThis[key] = value
+    }
   }
 }
 
-test('exit cleanup reads the latest install registry, not the first install', () => withFreshProcessCleanup(async addedExitListeners => {
+test('exit cleanup reads the latest install snapshot, not the first install', () => withFreshProcessCleanup(async addedExitListeners => {
   const dirA = await materializeSession('session-a-first')
   const dirB = await materializeSession('session-b-latest')
-  const disposeFirst = installProcessCleanup(stateFile, undefined, () => ({
-    sessions: { 'session-a-first': { sessionId: 'session-a-first', dir: dirA } },
+  installExitCleanup(() => ({
+    degraded: false,
+    sessions: [{ sessionId: 'session-a-first', dir: dirA }],
   }))
-  installProcessCleanup(stateFile, undefined, () => ({
-    sessions: { 'session-b-latest': { sessionId: 'session-b-latest', dir: dirB } },
+  installExitCleanup(() => ({
+    degraded: false,
+    sessions: [{ sessionId: 'session-b-latest', dir: dirB }],
   }))
-  // The first instance unloads after the second installed, as in a live profile reload.
-  disposeFirst()
   assert.equal(addedExitListeners().length, 1)
   addedExitListeners()[0]()
   await assert.rejects(readFile(join(dirB, 'session.v4.jsonl.zstd')), /ENOENT/)
   assert.equal(await readFile(join(dirA, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 }))
 
-test('a disposer clears the exit registry, so exit falls back to the disk registry alone', () => withFreshProcessCleanup(async addedExitListeners => {
-  const dirLive = await materializeSession('session-live-memory')
-  const dirDisk = await materializeSession('session-disk-record')
-  await mkdir(join(stateFile, '..'), { recursive: true })
-  await writeFile(stateFile, JSON.stringify({
-    version: 1,
-    sessions: { 'session-disk-record': { sessionId: 'session-disk-record', dir: dirDisk } },
-  }))
-  const dispose = installProcessCleanup(stateFile, undefined, () => ({
-    sessions: { 'session-live-memory': { sessionId: 'session-live-memory', dir: dirLive } },
-  }))
-  dispose()
-  addedExitListeners()[0]()
-  await assert.rejects(readFile(join(dirDisk, 'session.v4.jsonl.zstd')), /ENOENT/)
-  assert.equal(await readFile(join(dirLive, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
-}))
-
-test('exit cleanup deletes a child queued behind a held registry save, with its chat', async () => {
+test('exit cleanup deletes only the journal-owned child when a save is held', async () => {
   const chat = fakeSession('session-chat')
   const first = fakeSession('session-first', { origin: 'subagent', parentSession: chat.id })
   const second = fakeSession('session-second', { origin: 'subagent', parentSession: chat.id })
@@ -651,12 +713,15 @@ test('exit cleanup deletes a child queued behind a held registry save, with its 
   await started
   void h.temp.recordDescendant(second)
   assert.equal(h.temp.state.sessions[second.id], undefined)
-  const removed = cleanupAllSync(stateFile, undefined, () => h.temp.registryForExit())
+  const removed = cleanupSnapshotSync(h.temp.exitSnapshot())
   await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   await assert.rejects(readFile(join(firstDir, 'session.v4.jsonl.zstd')), /ENOENT/)
-  await assert.rejects(readFile(join(secondDir, 'session.v4.jsonl.zstd')), /ENOENT/)
-  assert.equal(removed, 3)
-  // A boot after the exit finds no record and no directory for the queued child.
+  assert.equal(removed, 2)
+  // The queued child has no journal event, so exit never guesses it away.
+  assert.equal(await readFile(join(secondDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  // A boot after the exit adopts the stored child under its journal-owned parent, so the
+  // recovered ownership, not the exit path, deletes the folder.
+  h.deps.sessionPersistence.list = async () => [chat, first, second].map(session => ({ header: session.header }))
   h.live.clear()
   await new TemporarySessions(h.temp.deps).reap()
   const afterReap = JSON.parse(await readFile(stateFile, 'utf8'))
@@ -688,8 +753,8 @@ test('a failed child save keeps the record for exit cleanup and for the next suc
   assert.notEqual(h.temp.state.sessions[child.id], undefined)
   const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.equal(onDisk.sessions[child.id], undefined)
-  // Exit cleanup still sees the child's record in memory.
-  const removed = cleanupAllSync(stateFile, undefined, () => h.temp.registryForExit())
+  // Exit cleanup still sees the child's record in the immutable snapshot.
+  const removed = cleanupSnapshotSync(h.temp.exitSnapshot())
   await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
   assert.equal(removed, 2)
@@ -703,8 +768,8 @@ test('a failed child save keeps the record for exit cleanup and for the next suc
 /**
  * After an unload that left records only in memory: each child's record is on disk, a fresh
  * instance's boot reap keeps the children while the chat is live, and that instance's exit
- * cleanup deletes the children with the chat. The children are not live in the fresh boot,
- * so only the chat-owned rule can keep them.
+ * cleanup deletes the journal-owned children with the chat. A child whose announcement never
+ * reached the journal is published, then adopted on boot under its journal-owned parent.
  */
 async function assertUnloadPublishes(h, addedExitListeners, { chatDir, children }) {
   const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
@@ -717,7 +782,7 @@ async function assertUnloadPublishes(h, addedExitListeners, { chatDir, children 
     assert.notEqual(afterReap.sessions[child.id], undefined)
     assert.equal(await readFile(join(child.dir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
   }
-  installProcessCleanup(stateFile, undefined, () => successor.registryForExit())
+  installExitCleanup(() => successor.exitSnapshot())
   assert.equal(addedExitListeners().length, 1)
   addedExitListeners()[0]()
   for (const child of children) {
@@ -746,8 +811,10 @@ test('unload publishes a child queued behind a held save, so a fresh boot and ex
   void h.temp.recordDescendant(second)
   assert.notEqual(h.temp.state.sessions[first.id], undefined)
   assert.equal(h.temp.state.sessions[second.id], undefined)
-  // Unload runs while the queue is blocked. It must publish both memory-only records without waiting.
+  // Unload runs while the queue is blocked. It publishes both records without waiting;
+  // the boot after exit adopts the unjournaled child under its journal-owned chat.
   void h.temp.cleanupPending()
+  h.deps.sessionPersistence.list = async () => [chat, first, second].map(session => ({ header: session.header }))
   await assertUnloadPublishes(h, addedExitListeners, {
     chatDir,
     children: [{ id: first.id, dir: firstDir }, { id: second.id, dir: secondDir }],
@@ -774,29 +841,1386 @@ test('unload publishes a child whose save failed, so a fresh boot and exit still
   await assert.rejects(h.temp.recordDescendant(child), /ENOSPC/)
   assert.notEqual(h.temp.state.sessions[child.id], undefined)
   await h.temp.cleanupPending()
+  h.deps.sessionPersistence.list = async () => [chat, child].map(session => ({ header: session.header }))
   await assertUnloadPublishes(h, addedExitListeners, {
     chatDir,
     children: [{ id: child.id, dir: childDir }],
   })
 }))
 
-test('an exit listener from an earlier module generation reads the latest install registry', () => withFreshProcessCleanup(async addedExitListeners => {
+test('an exit listener from an earlier module generation reads the latest install snapshot', () => withFreshProcessCleanup(async addedExitListeners => {
   // Two module instances of core.js stand for two generations of one plugin after a watched-file reload.
   const generationOne = await import(new URL('../core.js?generation=1', import.meta.url).href)
   const generationTwo = await import(new URL('../core.js?generation=2', import.meta.url).href)
   assert.notEqual(generationOne, generationTwo)
   const dirA = await materializeSession('session-generation-one')
   const dirB = await materializeSession('session-generation-two')
-  const disposeFirst = generationOne.installProcessCleanup(stateFile, undefined, () => ({
-    sessions: { 'session-generation-one': { sessionId: 'session-generation-one', dir: dirA } },
+  generationOne.installExitCleanup(() => ({
+    degraded: false,
+    sessions: [{ sessionId: 'session-generation-one', dir: dirA }],
   }))
-  disposeFirst()
-  generationTwo.installProcessCleanup(stateFile, undefined, () => ({
-    sessions: { 'session-generation-two': { sessionId: 'session-generation-two', dir: dirB } },
+  generationTwo.installExitCleanup(() => ({
+    degraded: false,
+    sessions: [{ sessionId: 'session-generation-two', dir: dirB }],
   }))
-  // Only the first generation installed a handler; it must read the second generation's registry at exit.
+  // Only the first generation installed a handler; it must read the second generation's snapshot at exit.
   assert.equal(addedExitListeners().length, 1)
   addedExitListeners()[0]()
   await assert.rejects(readFile(join(dirB, 'session.v4.jsonl.zstd')), /ENOENT/)
   assert.equal(await readFile(join(dirA, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 }))
+
+// --- The shared record shape, the journal schema, reservations and the migration ---
+
+test('the record shape round-trips every field', async () => {
+  const chat = fakeSession('session-shape', { createdAt: 1000 })
+  const fork = fakeSession('session-shape-fork', { isSeeded: true, parentSession: chat.id, createdAt: 2000 })
+  const child = fakeSession('session-shape-child', { origin: 'subagent', parentSession: chat.id, createdAt: 3000 })
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [fork.id, fork], [child.id, child]]),
+    stored: [chat.header, fork.header, child.header],
+  })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.register({ sessionId: fork.id, kind: 'side' })
+  await h.temp.recordDescendant(child)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  // Every stored record survives validation with every field, and each path that
+  // writes a record writes the same shape.
+  for (const [key, value] of Object.entries(saved.sessions)) {
+    assert.deepEqual(readRecord(value, key, NOW), value)
+  }
+  const { lastActivityAt, activitySince, ...main } = saved.sessions[chat.id]
+  assert.deepEqual(main, {
+    sessionId: chat.id,
+    kind: 'main',
+    parentSessionId: null,
+    title: '',
+    dir: sessionDirOf(chat.id),
+    cwd: '/tmp/project',
+    createdAt: 1000,
+    pendingDelete: false,
+  })
+  for (const clock of [lastActivityAt, activitySince]) assert.ok(Number.isSafeInteger(clock) && clock > 0)
+  const { lastActivityAt: forkActivity, activitySince: forkSince, ...side } = saved.sessions[fork.id]
+  assert.deepEqual(side, {
+    sessionId: fork.id,
+    kind: 'side',
+    parentSessionId: chat.id,
+    title: '',
+    dir: sessionDirOf(fork.id),
+    cwd: '/tmp/project',
+    createdAt: 2000,
+    pendingDelete: false,
+  })
+  for (const clock of [forkActivity, forkSince]) assert.ok(Number.isSafeInteger(clock) && clock > 0)
+  const { lastActivityAt: childActivity, activitySince: childSince, ...subagent } = saved.sessions[child.id]
+  assert.deepEqual(subagent, {
+    sessionId: child.id,
+    kind: 'subagent',
+    parentSessionId: chat.id,
+    title: '',
+    dir: sessionDirOf(child.id),
+    cwd: '/tmp/project',
+    createdAt: 3000,
+    pendingDelete: false,
+  })
+  for (const clock of [childActivity, childSince]) assert.ok(Number.isSafeInteger(clock) && clock > 0)
+
+  // The `fork` kind is part of the one shape even before its recorder lands.
+  const forkRecord = recordFields({
+    sessionId: 'session-forkshape',
+    kind: 'fork',
+    parentSessionId: chat.id,
+    title: 'forked',
+    dir: '/tmp/dsh/sessions/project/session-forkshape',
+    cwd: '/tmp/project',
+    createdAt: 4000,
+    lastActivityAt: 5000,
+    activitySince: 4000,
+    pendingDelete: true,
+  }, NOW)
+  assert.deepEqual(forkRecord, {
+    sessionId: 'session-forkshape',
+    kind: 'fork',
+    parentSessionId: chat.id,
+    title: 'forked',
+    dir: '/tmp/dsh/sessions/project/session-forkshape',
+    cwd: '/tmp/project',
+    createdAt: 4000,
+    lastActivityAt: 5000,
+    activitySince: 4000,
+    pendingDelete: true,
+  })
+  assert.deepEqual(readRecord(JSON.parse(JSON.stringify(forkRecord)), forkRecord.sessionId, NOW), forkRecord)
+  assert.deepEqual(recordFields({ ...forkRecord, createdAt: undefined, lastActivityAt: undefined, activitySince: undefined }, NOW), {
+    ...forkRecord,
+    createdAt: NOW,
+    lastActivityAt: NOW,
+    activitySince: NOW,
+  })
+
+  // The browser listing validates the same kind set through the shared list codec.
+  const listCodec = tempSessionDescriptors.find(descriptor => descriptor.method === 'list').result
+  const listed = listCodec.create().parse({
+    epoch: 3,
+    sequence: 2,
+    degraded: false,
+    stopping: [{ sessionId: forkRecord.sessionId, kind: 'fork' }],
+    sessions: [
+      { sessionId: chat.id, createdAt: 1000, kind: 'main', pendingDelete: false },
+      { sessionId: forkRecord.sessionId, createdAt: 4000, kind: 'fork', pendingDelete: true },
+    ],
+  })
+  assert.deepEqual(listed, {
+    epoch: 3,
+    sequence: 2,
+    degraded: false,
+    stopping: [{ sessionId: forkRecord.sessionId, kind: 'fork' }],
+    sessions: [
+      { sessionId: chat.id, createdAt: 1000, kind: 'main', pendingDelete: false },
+      { sessionId: forkRecord.sessionId, createdAt: 4000, kind: 'fork', pendingDelete: true },
+    ],
+  })
+  assert.throws(() => listCodec.create().parse({
+    epoch: 3,
+    sequence: 2,
+    degraded: false,
+    stopping: [],
+    sessions: [{ sessionId: chat.id, createdAt: 1000, kind: 'subagent', pendingDelete: false }],
+  }), /invalid record/)
+})
+
+test('the journal schema round-trips every event', async () => {
+  const at = 5000
+  const events = [
+    { type: 'migration', ids: ['session-legacy'], preexisting: ['session-old'], at },
+    { type: 'reserved', sessionId: 'session-root', workspaceId: 'ws-1', cwd: '/tmp/project', at },
+    { type: 'reservationDropped', sessionId: 'session-root', at },
+    { type: 'owned', sessionId: 'session-legacy', kind: 'main', parentSessionId: null, dir: '/tmp/dsh/sessions/project/session-legacy', cwd: '/tmp/project', at },
+    { type: 'owned', sessionId: 'session-child', kind: 'subagent', parentSessionId: 'session-legacy', dir: '/tmp/dsh/sessions/project/session-child', cwd: '/tmp/project', at },
+    { type: 'pending', sessionIds: ['session-legacy', 'session-child'], reason: 'discard', at },
+    { type: 'pending', sessionIds: ['session-child'], reason: 'expiry', at: at + 1 },
+    { type: 'deleted', sessionId: 'session-legacy', kind: 'main', parentSessionId: null, dir: '/tmp/dsh/sessions/project/session-legacy', cwd: '/tmp/project', at: at + 2 },
+    { type: 'migrationComplete', at: at + 3 },
+  ]
+  for (const event of events) await appendJournalEvent(journalFile, event)
+  const replay = replayJournal(await readFile(journalFile, 'utf8'))
+  assert.deepEqual(replay.events, events)
+  assert.equal(replay.torn, false)
+  assert.equal(replay.degraded, false)
+  assert.deepEqual(replay.entries, {
+    'session-legacy': {
+      sessionId: 'session-legacy',
+      kind: 'main',
+      parentSessionId: null,
+      dir: '/tmp/dsh/sessions/project/session-legacy',
+      cwd: '/tmp/project',
+      ownedAt: at,
+      pending: true,
+      pendingReason: 'discard',
+      deleted: true,
+      deletedAt: at + 2,
+      deletedDir: '/tmp/dsh/sessions/project/session-legacy',
+      deletedCwd: '/tmp/project',
+    },
+    'session-child': {
+      sessionId: 'session-child',
+      kind: 'subagent',
+      parentSessionId: 'session-legacy',
+      dir: '/tmp/dsh/sessions/project/session-child',
+      cwd: '/tmp/project',
+      ownedAt: at,
+      pending: true,
+      pendingReason: 'expiry',
+      deleted: false,
+      deletedAt: null,
+      deletedDir: null,
+      deletedCwd: null,
+    },
+  })
+  assert.deepEqual(replay.reservations, {
+    'session-root': { sessionId: 'session-root', workspaceId: 'ws-1', cwd: '/tmp/project', at, dropped: true },
+  })
+  assert.deepEqual(replay.migration, { ids: ['session-legacy'], preexisting: ['session-old'], at })
+  assert.equal(replay.migrationComplete, at + 3)
+  // An event outside the schema is refused by the writer, so the file only ever
+  // holds events replay understands.
+  await assert.rejects(appendJournalEvent(journalFile, { type: 'owned', sessionId: '', kind: 'main', dir: '/x', cwd: null, at }), /invalid/)
+  await assert.rejects(appendJournalEvent(journalFile, { type: 'pending', sessionIds: [], reason: 'discard', at }), /invalid/)
+})
+
+test('a torn journal line is repaired before the next append', async () => {
+  const first = fakeSession('session-torn-one', { createdAt: 10 })
+  const second = fakeSession('session-torn-two', { createdAt: 20 })
+  const h = harness({ sessions: new Map([[first.id, first], [second.id, second]]) })
+  await h.temp.load()
+  await h.temp.register({ sessionId: first.id })
+  // A crash tore the final append: the last line has no newline and no valid event.
+  const text = await readFile(journalFile, 'utf8')
+  await writeFile(journalFile, `${text}{"type":"owned","sessionId":"session-torn`)
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.load()
+  assert.equal(restarted.journalDegraded, false)
+  assert.equal(restarted.journal.torn, false)
+  await restarted.register({ sessionId: second.id })
+  // Dropping the torn bytes before the append keeps the next replay clean.
+  const raw = await readFile(journalFile, 'utf8')
+  const replay = replayJournal(raw)
+  assert.equal(replay.torn, false)
+  assert.equal(replay.degraded, false)
+  assert.ok(replay.events.some(event => event.type === 'owned' && event.sessionId === second.id))
+  assert.equal(raw.includes('session-torn"'), false)
+})
+
+test('the reservation precedes and matches the create', async () => {
+  const stored = []
+  const h = harness({ stored })
+  await h.temp.load()
+  assert.deepEqual((await journalLines()).map(event => event.type), ['migration', 'migrationComplete'])
+  const reserved = await h.temp.reserve({ workspaceId: 'ws-1', cwd: '/tmp/project' })
+  assert.match(reserved.sessionId, /^session-/)
+  const afterReserve = await journalLines()
+  assert.deepEqual(afterReserve.slice(2), [
+    { type: 'reserved', sessionId: reserved.sessionId, workspaceId: 'ws-1', cwd: '/tmp/project', at: reserved.at },
+  ])
+  const created = { id: reserved.sessionId, cwd: '/tmp/project', createdAt: reserved.at + 1 }
+  // The Host's create sees the reservation already durable, and the plugin's id
+  // reaches it: this is the contract the browser half passes through.
+  const createCalls = []
+  async function createSession(request) {
+    assert.deepEqual((await journalLines()).at(-1), {
+      type: 'reserved',
+      sessionId: reserved.sessionId,
+      workspaceId: 'ws-1',
+      cwd: '/tmp/project',
+      at: reserved.at,
+    })
+    createCalls.push(request)
+    stored.push(created)
+    h.live.set(created.id, fakeSession(created.id, { createdAt: created.createdAt }))
+    return { sessionId: created.id }
+  }
+  const createdSession = await createSession({ workspaceId: 'ws-1', sessionId: reserved.sessionId })
+  assert.deepEqual(createCalls, [{ workspaceId: 'ws-1', sessionId: reserved.sessionId }])
+  const record = await h.temp.register({ sessionId: createdSession.sessionId })
+  assert.deepEqual(record, { sessionId: reserved.sessionId, createdAt: created.createdAt, kind: 'main', pendingDelete: false })
+  const lines = await journalLines()
+  assert.deepEqual(lines.map(event => event.type), ['migration', 'migrationComplete', 'reserved', 'owned'])
+  const owned = lines.at(-1)
+  assert.deepEqual(owned, {
+    type: 'owned',
+    sessionId: reserved.sessionId,
+    kind: 'main',
+    parentSessionId: null,
+    dir: sessionDirOf(reserved.sessionId),
+    cwd: '/tmp/project',
+    at: owned.at,
+  })
+  assert.ok(Number.isSafeInteger(owned.at))
+  assert.deepEqual(h.temp.exitSnapshot().sessions.map(item => item.sessionId), [reserved.sessionId])
+
+  // A stored header that disagrees with the reservation is never promoted.
+  const mismatch = await h.temp.reserve({ workspaceId: 'ws-1', cwd: '/tmp/project' })
+  const otherCwd = { id: mismatch.sessionId, cwd: '/tmp/other', createdAt: mismatch.at + 1 }
+  stored.push(otherCwd)
+  h.live.set(otherCwd.id, fakeSession(otherCwd.id, { createdAt: otherCwd.createdAt }))
+  await assert.rejects(h.temp.register({ sessionId: otherCwd.id }), /does not match its reservation/)
+  const after = await journalLines()
+  assert.equal(after.some(event => event.type === 'owned' && event.sessionId === mismatch.sessionId), false)
+  assert.equal(after.some(event => event.type === 'reservationDropped' && event.sessionId === mismatch.sessionId), false)
+})
+
+test('an ambiguous create retains the reservation', async () => {
+  const stored = []
+  const h = harness({ stored })
+  await h.temp.load()
+  // DSH created the Session, then the workspace attach failed: the plugin cannot
+  // tell whether the transcript exists, so the reservation stays.
+  const reserved = await h.temp.reserve({ workspaceId: 'ws-1', cwd: '/tmp/project' })
+  stored.push({ id: reserved.sessionId, cwd: '/tmp/project', createdAt: reserved.at + 1 })
+  h.live.set(reserved.sessionId, fakeSession(reserved.sessionId, { createdAt: reserved.at + 1 }))
+  let lines = await journalLines()
+  assert.equal(lines.some(event => event.type === 'owned'), false)
+  assert.equal(lines.some(event => event.type === 'reservationDropped'), false)
+  // The next start resolves it from the matching stored header.
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.load()
+  lines = await journalLines()
+  assert.equal(lines.filter(event => event.type === 'owned').length, 1)
+  assert.equal(lines.some(event => event.type === 'reservationDropped'), false)
+  assert.deepEqual(restarted.exitSnapshot().sessions.map(item => item.sessionId), [reserved.sessionId])
+
+  // A crash before create leaves no folder, and the next start drops the
+  // reservation only once every check reports absence.
+  const crashed = await h.temp.reserve({ workspaceId: 'ws-1', cwd: '/tmp/project' })
+  assert.equal(existsSync(sessionDirOf(crashed.sessionId)), false)
+  const afterCrash = new TemporarySessions(h.deps)
+  await afterCrash.load()
+  lines = await journalLines()
+  assert.deepEqual(lines.filter(event => event.type === 'reservationDropped').map(event => event.sessionId), [crashed.sessionId])
+  assert.equal(existsSync(sessionDirOf(crashed.sessionId)), false)
+
+  // A Session that already has the reserved id is refused and never touched.
+  const existing = fakeSession('session-existing', { createdAt: 90 })
+  const beforeCount = (await journalLines()).length
+  const liveHarness = harness({ sessions: new Map([[existing.id, existing]]), stored: [existing.header] })
+  await liveHarness.temp.load()
+  await assert.rejects(liveHarness.temp.reserve({ sessionId: existing.id, cwd: '/tmp/project' }), /already live/)
+  const storedHarness = harness({ stored: [existing.header] })
+  await storedHarness.temp.load()
+  await assert.rejects(storedHarness.temp.reserve({ sessionId: existing.id, cwd: '/tmp/project' }), /already has the reserved id/)
+  assert.equal((await journalLines()).length, beforeCount)
+})
+
+test('a skipped header is not absence', async () => {
+  const h = harness()
+  await h.temp.load()
+  const reserved = await h.temp.reserve({ cwd: '/tmp/project' })
+  await materializeSession(reserved.sessionId)
+  // A listing succeeds but silently skips the corrupt header, the way the JSONL
+  // backend does, and a direct stat reports the corruption.
+  h.deps.sessionPersistence.list = async () => []
+  h.deps.sessionPersistence.stat = async id => {
+    throw Object.assign(new Error(`session "${id}": stored log is corrupt`), { name: 'SessionPersistenceCorruptionError' })
+  }
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.load()
+  let lines = await journalLines()
+  assert.equal(lines.some(event => event.type === 'reservationDropped'), false)
+  assert.equal(lines.some(event => event.type === 'owned'), false)
+  assert.ok(warnings.some(message => message.includes('could not be read')))
+
+  // The store cannot even see the header, but the artifact on disk can: all three
+  // signals must agree before the reservation is dropped.
+  h.deps.sessionPersistence.stat = async () => undefined
+  const blind = new TemporarySessions(h.deps)
+  await blind.load()
+  lines = await journalLines()
+  assert.equal(lines.some(event => event.type === 'reservationDropped'), false)
+  assert.ok(warnings.some(message => message.includes('its storage artifact exists')))
+})
+
+test('the mark-existing window stays permanent', async () => {
+  const ordinary = fakeSession('session-ordinary', { createdAt: 10 })
+  const chat = fakeSession('session-chat', { createdAt: 20 })
+  const h = harness({
+    sessions: new Map([[ordinary.id, ordinary], [chat.id, chat]]),
+    stored: [ordinary.header, chat.header],
+  })
+  // The user made one open chat temporary; the browser crashed before it could
+  // register the other one, so that Session must stay permanent.
+  await h.temp.register({ sessionId: chat.id })
+  const ordinaryDir = await materializeSession(ordinary.id)
+  const chatDir = await materializeSession(chat.id)
+  const snapshot = h.temp.exitSnapshot()
+  assert.deepEqual(snapshot.sessions.map(item => item.sessionId), [chat.id])
+  assert.equal(cleanupSnapshotSync(snapshot), 1)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(ordinaryDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  // A restart does not adopt the Session either: only registration owns it.
+  const next = new TemporarySessions(h.deps)
+  await next.reap()
+  assert.equal(await readFile(join(ordinaryDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.equal(JSON.parse(await readFile(stateFile, 'utf8')).sessions[ordinary.id], undefined)
+})
+
+test('the owned event lands before the transcript', async () => {
+  const session = fakeSession('session-transcript', { createdAt: 100 })
+  const h = harness({ sessions: new Map([[session.id, session]]) })
+  let journalDuringFlush
+  h.temp.deps.sessions.flush = async () => {
+    journalDuringFlush = (await journalLines()).map(event => event.type)
+    return true
+  }
+  await h.temp.register({ sessionId: session.id })
+  assert.deepEqual(journalDuringFlush.slice(-1), ['owned'])
+  // A failed journal append refuses registration before the transcript is flushed.
+  const refused = fakeSession('session-unowned', { createdAt: 200 })
+  h.live.set(refused.id, refused)
+  await rm(journalFile, { force: true })
+  await mkdir(journalFile, { recursive: true })
+  let flushed = false
+  h.temp.deps.sessions.flush = async () => { flushed = true; return true }
+  await assert.rejects(h.temp.register({ sessionId: refused.id }), /EISDIR|illegal operation/)
+  assert.equal(flushed, false)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[refused.id], undefined)
+})
+
+test('the migration resumes after every boundary', async () => {
+  const first = fakeSession('session-legacy-one', { createdAt: 100 })
+  const second = fakeSession('session-legacy-two', { createdAt: 200 })
+  const stored = [first.header, second.header]
+  const legacy = {
+    [first.id]: legacyRecord(first),
+    [second.id]: legacyRecord(second),
+  }
+  /** A pre-journal install: a registry, its two artifacts, and a journal prefix. */
+  async function install(prefix) {
+    await rm(stateDir, { recursive: true, force: true })
+    await rm(join(root, 'sessions'), { recursive: true, force: true })
+    await materializeSession(first.id)
+    await materializeSession(second.id)
+    await writeRegistry(legacy)
+    for (const event of prefix) await appendJournalEvent(journalFile, event)
+  }
+  const migrationAt = 7000
+
+  // A crash right after the migration event.
+  await install([{ type: 'migration', ids: [first.id, second.id], preexisting: [], at: migrationAt }])
+  const afterMigration = harness({ stored })
+  await afterMigration.temp.load()
+  let lines = await journalLines()
+  assert.equal(lines.filter(event => event.type === 'migration').length, 1)
+  assert.equal(lines.find(event => event.type === 'migration').at, migrationAt)
+  assert.equal(lines.filter(event => event.type === 'migrationComplete').length, 1)
+  assert.deepEqual(lines.filter(event => event.type === 'owned').map(event => event.sessionId).sort(), [first.id, second.id].sort())
+  assert.deepEqual((await afterMigration.temp.list()).sessions.map(item => item.sessionId).sort(), [first.id, second.id].sort())
+  assert.deepEqual(JSON.parse(await readFile(markerFile, 'utf8')), {
+    version: 1,
+    migrationAt,
+    completedAt: lines.find(event => event.type === 'migrationComplete').at,
+  })
+
+  // A crash after the first import.
+  await install([
+    { type: 'migration', ids: [first.id, second.id], preexisting: [], at: migrationAt },
+    { type: 'owned', sessionId: first.id, kind: 'main', parentSessionId: null, dir: sessionDirOf(first.id), cwd: '/tmp/project', at: migrationAt + 1 },
+  ])
+  const afterImport = harness({ stored })
+  await afterImport.temp.load()
+  lines = await journalLines()
+  assert.equal(lines.filter(event => event.type === 'migration').length, 1)
+  assert.equal(lines.find(event => event.type === 'migration').at, migrationAt)
+  assert.deepEqual(lines.filter(event => event.type === 'owned').map(event => event.sessionId), [first.id, second.id])
+  assert.equal(lines.filter(event => event.type === 'migrationComplete').length, 1)
+  assert.deepEqual((await afterImport.temp.list()).sessions.map(item => item.sessionId).sort(), [first.id, second.id].sort())
+  assert.equal(lines.some(event => event.type === 'reservationDropped'), false)
+})
+
+test('the migration marker completes after the imports', async () => {
+  const first = fakeSession('session-marker-one', { createdAt: 100 })
+  const second = fakeSession('session-marker-two', { createdAt: 200 })
+  const stored = [first.header, second.header]
+  await materializeSession(first.id)
+  await materializeSession(second.id)
+  await writeRegistry({ [first.id]: legacyRecord(first), [second.id]: legacyRecord(second) })
+  const migrationAt = 8000
+  const completedAt = 9000
+  await appendJournalEvent(journalFile, { type: 'migration', ids: [first.id, second.id], preexisting: [], at: migrationAt })
+  for (const session of [first, second]) {
+    await appendJournalEvent(journalFile, { type: 'owned', sessionId: session.id, kind: 'main', parentSessionId: null, dir: sessionDirOf(session.id), cwd: '/tmp/project', at: migrationAt + 1 })
+  }
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: completedAt })
+  const before = (await journalLines()).length
+  const h = harness({ stored })
+  await h.temp.load()
+  // The journal is untouched: no new cutoff, no re-import, no second completion.
+  assert.equal((await journalLines()).length, before)
+  assert.deepEqual(JSON.parse(await readFile(markerFile, 'utf8')), { version: 1, migrationAt, completedAt })
+  assert.deepEqual((await h.temp.list()).sessions.map(item => item.sessionId).sort(), [first.id, second.id].sort())
+
+  // The marker writer itself refuses to claim completion before the journal records it.
+  await rm(stateDir, { recursive: true, force: true })
+  await appendJournalEvent(journalFile, { type: 'migration', ids: [], preexisting: [], at: migrationAt })
+  assert.throws(() => writeJournalMarker(
+    { journal: journalFile, marker: markerFile },
+    { migrationAt, completedAt },
+  ), /migrationComplete/)
+  await assert.rejects(readFile(markerFile, 'utf8'), /ENOENT/)
+})
+
+test('the migration repairs a collapsed legacy parent to the header direct parent', async () => {
+  const grand = fakeSession('session-grand', { createdAt: 1 })
+  const parent = fakeSession('session-parent', { origin: 'subagent', parentSession: grand.id, createdAt: 2 })
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: parent.id, createdAt: 3 })
+  await materializeSession(child.id)
+  // The old recorder stored the nearest recorded ancestor, not the true direct parent.
+  await writeRegistry({ [child.id]: legacyRecord(child, 'subagent', grand.id) })
+  const h = harness({ stored: [grand.header, parent.header, child.header] })
+  await h.temp.load()
+  const owned = (await journalLines()).find(event => event.type === 'owned' && event.sessionId === child.id)
+  assert.equal(owned.parentSessionId, parent.id)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[child.id].parentSessionId, parent.id)
+})
+
+test('a legacy side row keeps its side kind through migration and exit cleanup', async () => {
+  const source = fakeSession('session-side-source', { createdAt: 1 })
+  const side = fakeSession('session-side', { isSeeded: true, parentSession: source.id, createdAt: 2 })
+  const dir = await materializeSession(side.id)
+  await writeRegistry({ [side.id]: legacyRecord(side, 'side', source.id) })
+  const h = harness({ stored: [source.header, side.header] })
+  await h.temp.load()
+  const owned = (await journalLines()).find(event => event.type === 'owned' && event.sessionId === side.id)
+  assert.equal(owned.kind, 'side')
+  assert.deepEqual(h.temp.exitSnapshot().sessions.map(item => item.sessionId), [side.id])
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 1)
+  await assert.rejects(readFile(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a child announced while the first migration is deferred is adopted on restart', async () => {
+  const parent = fakeSession('session-deferred-parent', { createdAt: 1 })
+  const child = fakeSession('session-deferred-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await writeRegistry({ [parent.id]: legacyRecord(parent) })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 101,
+  })
+  const deferred = harness({ sessions: new Map([[child.id, child]]), stored: [parent.header, child.header] })
+  deferred.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await deferred.temp.load()
+  assert.equal(deferred.temp.migrationIncomplete, true)
+  await deferred.temp.recordDescendant(child)
+  assert.equal((await journalLines()).some(event => event.type === 'owned' && event.sessionId === child.id), false)
+
+  const restarted = harness({ stored: [parent.header, child.header] })
+  await restarted.temp.load()
+  const owned = (await journalLines()).find(event => event.type === 'owned' && event.sessionId === child.id)
+  assert.equal(owned.parentSessionId, parent.id)
+  assert.equal(restarted.temp.migrationIncomplete, false)
+  await restarted.temp.reap()
+  await assert.rejects(readFile(join(parentDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('an interrupted collapsed-parent migration repairs the registry on resume', async () => {
+  const grand = fakeSession('session-resume-grand', { createdAt: 1 })
+  const parent = fakeSession('session-resume-parent', { origin: 'subagent', parentSession: grand.id, createdAt: 2 })
+  const child = fakeSession('session-resume-child', { origin: 'subagent', parentSession: parent.id, createdAt: 3 })
+  const childDir = await materializeSession(child.id)
+  await writeRegistry({ [child.id]: legacyRecord(child, 'subagent', grand.id) })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [child.id], preexisting: [grand.id, parent.id, child.id], at: 100,
+  })
+  // The owned event is durable, but the migration did not complete and the corrected registry never published.
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id,
+    dir: childDir, cwd: '/tmp/project', at: 101,
+  })
+  const h = harness({ stored: [grand.header, parent.header, child.header] })
+  await h.temp.load()
+  assert.notEqual(h.temp.journal.migrationComplete, undefined)
+  assert.equal(h.temp.state.sessions[child.id].parentSessionId, parent.id)
+  assert.deepEqual(h.temp.exitSnapshot().sessions.map(item => item.sessionId), [child.id])
+  await h.temp.reap()
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('an adopted child of a pending parent inherits pending and is cleaned up', async () => {
+  const parent = fakeSession('session-pending-parent', { createdAt: 1 })
+  const child = fakeSession('session-pending-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await writeRegistry({ [parent.id]: { ...legacyRecord(parent), pendingDelete: true } })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [parent.id], reason: 'discard', at: 102 })
+  const h = harness({ stored: [parent.header, child.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id].pending, true)
+  assert.equal(h.temp.state.sessions[child.id].pendingDelete, true)
+  await h.temp.cleanupPending()
+  await assert.rejects(readFile(join(parentDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a lost pending event on an adopted child is repaired on the next load', async () => {
+  const parent = fakeSession('session-pending-repair-parent', { createdAt: 1 })
+  const child = fakeSession('session-pending-repair-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await writeRegistry({
+    [parent.id]: { ...legacyRecord(parent), pendingDelete: true },
+    [child.id]: legacyRecord(child, 'subagent', parent.id),
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [parent.id], reason: 'discard', at: 102 })
+  // The child's owned event landed, then the crash lost its inherited pending event.
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id,
+    dir: childDir, cwd: '/tmp/project', at: 103,
+  })
+  const h = harness({ stored: [parent.header, child.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id].pending, true)
+  assert.equal(h.temp.state.sessions[child.id].pendingDelete, true)
+  await h.temp.cleanupPending()
+  await assert.rejects(readFile(join(parentDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a stored subagent of a journal-deleted parent is deleted', async () => {
+  const parent = fakeSession('session-orphan-parent', { createdAt: 1 })
+  const child = fakeSession('session-orphan-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 102,
+  })
+  const h = harness({ stored: [parent.header, child.header] })
+  await h.temp.load()
+  const childEvents = (await journalLines())
+    .filter(event => event.sessionId === child.id && (event.type === 'owned' || event.type === 'deleted'))
+  assert.deepEqual(childEvents.map(event => event.type), ['owned', 'deleted'])
+  assert.equal(h.temp.journal.entries[child.id].deleted, true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a stored-list failure with a live header defers collapsed-parent repair without throwing', async () => {
+  const grand = fakeSession('session-live-grand', { createdAt: 1 })
+  const parent = fakeSession('session-live-parent', { origin: 'subagent', parentSession: grand.id, createdAt: 2 })
+  const child = fakeSession('session-live-child', { origin: 'subagent', parentSession: parent.id, createdAt: 3 })
+  const childDir = await materializeSession(child.id)
+  await writeRegistry({ [child.id]: legacyRecord(child, 'subagent', grand.id) })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [child.id], preexisting: [grand.id, parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id,
+    dir: childDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 102 })
+  const live = new Map([[child.id, child]])
+  const first = harness({ sessions: live, stored: [grand.header, parent.header, child.header] })
+  first.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await first.temp.load()
+  assert.equal(first.temp.state.sessions[child.id].parentSessionId, grand.id)
+  assert.deepEqual(first.temp.exitSnapshot().sessions, [])
+  assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+
+  const second = harness({ stored: [grand.header, parent.header, child.header] })
+  await second.temp.load()
+  assert.equal(second.temp.state.sessions[child.id].parentSessionId, parent.id)
+  assert.deepEqual(second.temp.exitSnapshot().sessions.map(item => item.sessionId), [child.id])
+  await second.temp.reap()
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('boot cleanup leaves a live subagent transcript until the child is no longer live', async () => {
+  const parent = fakeSession('session-live-orphan-parent', { createdAt: 1 })
+  const child = fakeSession('session-live-orphan-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 102,
+  })
+  const first = harness({ sessions: new Map([[child.id, child]]), stored: [parent.header, child.header] })
+  await first.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  assert.deepEqual(
+    (await journalLines()).filter(event => event.sessionId === child.id).map(event => event.type),
+    ['owned'],
+  )
+
+  const second = harness({ stored: [parent.header, child.header] })
+  await second.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+  assert.deepEqual(
+    (await journalLines()).filter(event => event.sessionId === child.id).map(event => event.type),
+    ['owned', 'deleted'],
+  )
+})
+
+test('boot cleanup leaves an already-deleted live subagent transcript', async () => {
+  const parent = fakeSession('session-deleted-live-parent', { createdAt: 1 })
+  const child = fakeSession('session-deleted-live-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id,
+    dir: childDir, cwd: '/tmp/project', at: 103,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id,
+    dir: childDir, cwd: '/tmp/project', at: 104,
+  })
+  const first = harness({ sessions: new Map([[child.id, child]]), stored: [parent.header, child.header] })
+  await first.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+
+  const second = harness({ stored: [parent.header, child.header] })
+  await second.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a child that becomes live during the deleted append keeps its transcript', async () => {
+  const parent = fakeSession('session-race-parent', { createdAt: 1 })
+  const child = fakeSession('session-race-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 102,
+  })
+  const h = harness({ stored: [parent.header, child.header] })
+  let checks = 0
+  const get = h.deps.sessions.get
+  h.deps.sessions.get = id => {
+    if (id !== child.id) return get(id)
+    checks += 1
+    // The child becomes live while the durable `deleted` append is awaiting.
+    return checks >= 2 ? child : undefined
+  }
+  await h.temp.reap()
+  assert.equal(checks, 3)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  assert.deepEqual(
+    (await journalLines()).filter(event => event.sessionId === child.id).map(event => event.type),
+    ['owned', 'deleted'],
+  )
+
+  const second = harness({ stored: [parent.header, child.header] })
+  await second.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a grandchild listed first inherits pending after its parent becomes pending', async () => {
+  const root = fakeSession('session-pending-root', { createdAt: 1 })
+  const child = fakeSession('session-pending-child', { origin: 'subagent', parentSession: root.id, createdAt: 2 })
+  const grand = fakeSession('session-pending-grand', { origin: 'subagent', parentSession: child.id, createdAt: 3 })
+  const rootDir = await materializeSession(root.id)
+  const childDir = await materializeSession(child.id)
+  const grandDir = await materializeSession(grand.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [root.id], preexisting: [root.id, child.id, grand.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: root.id, kind: 'main', parentSessionId: null,
+    dir: rootDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'pending', sessionIds: [root.id], reason: 'discard', at: 102,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: root.id,
+    dir: childDir, cwd: '/tmp/project', at: 103,
+  })
+  const h = harness({ stored: [grand.header, child.header, root.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id].pending, true)
+  assert.equal(h.temp.journal.entries[grand.id].pending, true)
+  assert.equal(h.temp.state.sessions[grand.id].pendingDelete, true)
+  await h.temp.cleanupPending()
+  for (const dir of [rootDir, childDir, grandDir]) {
+    assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+  }
+})
+
+test('stored descendants reconcile to a fixed point when the grandchild is listed first', async () => {
+  const parent = fakeSession('session-fixed-parent', { createdAt: 1 })
+  const child = fakeSession('session-fixed-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const grand = fakeSession('session-fixed-grand', { origin: 'subagent', parentSession: child.id, createdAt: 3 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  const grandDir = await materializeSession(grand.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id, grand.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 102,
+  })
+  const h = harness({ stored: [grand.header, child.header, parent.header] })
+  await h.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+  assert.equal(existsSync(join(grandDir, 'session.v4.jsonl.zstd')), false)
+  for (const sessionId of [child.id, grand.id]) {
+    assert.deepEqual(
+      (await journalLines()).filter(event => event.sessionId === sessionId).map(event => event.type),
+      ['owned', 'deleted'],
+    )
+  }
+})
+
+test('stored descendants reconcile to a fixed point when the child is listed first', async () => {
+  const parent = fakeSession('session-fixed-first-parent', { createdAt: 1 })
+  const child = fakeSession('session-fixed-first-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const grand = fakeSession('session-fixed-first-grand', { origin: 'subagent', parentSession: child.id, createdAt: 3 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  const grandDir = await materializeSession(grand.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id, grand.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: parentDir, cwd: '/tmp/project', at: 102,
+  })
+  const h = harness({ stored: [child.header, grand.header, parent.header] })
+  await h.temp.reap()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+  assert.equal(existsSync(join(grandDir, 'session.v4.jsonl.zstd')), false)
+  for (const sessionId of [child.id, grand.id]) {
+    assert.deepEqual(
+      (await journalLines()).filter(event => event.sessionId === sessionId).map(event => event.type),
+      ['owned', 'deleted'],
+    )
+  }
+})
+
+test('an owned id survives a corrupt registry', async () => {
+  const chat = fakeSession('session-owned', { createdAt: 50 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  // The index is corrupted; the journal and the stored header still prove ownership.
+  await writeFile(stateFile, '{"version":1,"sessions":{')
+  const boot = new TemporarySessions(h.deps)
+  await boot.load()
+  const snapshot = boot.exitSnapshot()
+  assert.equal(snapshot.degraded, false)
+  assert.equal(snapshot.sessions.length, 1)
+  const { lastActivityAt, activitySince, ...rebuilt } = snapshot.sessions[0]
+  for (const clock of [lastActivityAt, activitySince]) assert.ok(Number.isSafeInteger(clock) && clock > 0)
+  assert.deepEqual(rebuilt, {
+    sessionId: chat.id,
+    kind: 'main',
+    parentSessionId: null,
+    title: '',
+    dir,
+    cwd: '/tmp/project',
+    createdAt: 50,
+    pendingDelete: false,
+  })
+  // The damaged bytes are preserved, and exit removes the rebuilt folder.
+  assert.equal(await readFile(stateFile, 'utf8'), '{"version":1,"sessions":{')
+  assert.equal(cleanupSnapshotSync(snapshot), 1)
+  await assert.rejects(readFile(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+// --- The process-shared publisher ---
+
+test('a held queued save does not erase a newer publish', async () => {
+  const dir = join(root, 'publisher-held')
+  const file = join(dir, 'records.json')
+  const publisher = new Publisher({ file, lockFile: join(dir, 'records.lock') })
+  assert.equal(publisher.publish('{"version":1,"sessions":{"a":1}}\n'), true)
+  // A queued save captures its generation and then stages; while it is stalled a
+  // mutation and a newer synchronous publish land.
+  const held = publisher.begin()
+  assert.ok(held !== undefined)
+  assert.equal(held.generation, 0)
+  publisher.mutate()
+  assert.equal(publisher.publish('{"version":1,"sessions":{"a":2}}\n'), true)
+  await writeFile(held.staging, '{"version":1,"sessions":{"a":1}}\n')
+  assert.equal(publisher.commit(held), false)
+  assert.equal(await readFile(file, 'utf8'), '{"version":1,"sessions":{"a":2}}\n')
+  assert.equal(publisher.published, 1)
+  assert.deepEqual((await readdir(dir)).filter(name => name.endsWith('.tmp')), [])
+})
+
+test('a normal revision after a mutation publishes', async () => {
+  const dir = join(root, 'publisher-revision')
+  const file = join(dir, 'records.json')
+  const publisher = new Publisher({ file, lockFile: join(dir, 'records.lock') })
+  assert.equal(publisher.publish('first'), true)
+  assert.equal(publisher.published, 0)
+  publisher.mutate()
+  assert.equal(publisher.generation, 1)
+  const ticket = publisher.begin()
+  assert.equal(ticket.generation, 1)
+  await writeFile(ticket.staging, 'second')
+  assert.equal(publisher.commit(ticket), true)
+  assert.equal(publisher.published, 1)
+  assert.equal(await readFile(file, 'utf8'), 'second')
+  publisher.mutate()
+  assert.equal(publisher.publish('third'), true)
+  assert.equal(publisher.published, 2)
+  assert.equal(await readFile(file, 'utf8'), 'third')
+})
+
+test('an old module epoch cannot publish after a new one', async () => {
+  const generationOne = await import(new URL('../publisher.js?generation=1', import.meta.url).href)
+  const generationTwo = await import(new URL('../publisher.js?generation=2', import.meta.url).href)
+  assert.notEqual(generationOne.Publisher, generationTwo.Publisher)
+  const dir = join(root, 'publisher-epoch')
+  const file = join(dir, 'records.json')
+  const lockFile = join(dir, 'records.lock')
+  const first = new generationOne.Publisher({ file, lockFile })
+  assert.equal(first.publish('first'), true)
+  // The reload instantiates a new module copy, which increments the shared epoch.
+  const second = new generationTwo.Publisher({ file, lockFile })
+  assert.ok(second.epoch > first.epoch)
+  assert.equal(first.publish('stale'), false)
+  assert.equal(await readFile(file, 'utf8'), 'first')
+  assert.equal(second.publish('second'), true)
+  // The check and the rename are one synchronous section: a ticket captured under
+  // the newer epoch cannot commit after an even newer instance fences it.
+  const ticket = second.begin()
+  const third = new generationOne.Publisher({ file, lockFile })
+  assert.ok(third.epoch > second.epoch)
+  await writeFile(ticket.staging, 'stale')
+  assert.equal(second.commit(ticket), false)
+  assert.equal(await readFile(file, 'utf8'), 'second')
+  assert.deepEqual((await readdir(dir)).filter(name => name.endsWith('.tmp')), [])
+})
+
+test('a foreign lock refuses and a stale lock is stolen', async () => {
+  const dir = join(root, 'publisher-lock')
+  const file = join(dir, 'records.json')
+  const lockFile = join(dir, 'records.lock')
+  await mkdir(dir, { recursive: true })
+  // The running test runner's parent is alive and is not this process.
+  await writeFile(lockFile, `${process.ppid}\n`)
+  const refused = new Publisher({ file, lockFile })
+  assert.equal(refused.publish('refused'), false)
+  await assert.rejects(readFile(file, 'utf8'), /ENOENT/)
+  assert.equal(await readFile(lockFile, 'utf8'), `${process.ppid}\n`)
+  // A pid that has exited is not a writer any more.
+  const exited = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  assert.ok(exited.pid > 0)
+  await writeFile(lockFile, `${exited.pid}\n`)
+  const stolen = new Publisher({ file, lockFile })
+  assert.equal(stolen.publish('stolen'), true)
+  assert.equal(await readFile(file, 'utf8'), 'stolen')
+  assert.equal(await readFile(lockFile, 'utf8'), `${process.pid}\n`)
+  // A lock left empty by a crash between create and pid write is stale, not a live writer.
+  await writeFile(lockFile, '')
+  const malformed = new Publisher({ file, lockFile })
+  assert.equal(malformed.publish('malformed'), true)
+  assert.equal(await readFile(file, 'utf8'), 'malformed')
+  assert.equal(await readFile(lockFile, 'utf8'), `${process.pid}\n`)
+})
+
+test('the tree walk crosses fork boundaries', async () => {
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  const fork = fakeSession('session-fork', { isSeeded: true, parentSession: chat.id, createdAt: 20 })
+  const forkOfFork = fakeSession('session-fork2', { isSeeded: true, parentSession: fork.id, createdAt: 30 })
+  const underFork = fakeSession('session-sub', { origin: 'subagent', parentSession: fork.id, createdAt: 40 })
+  const underSub = fakeSession('session-sub2', { origin: 'subagent', parentSession: underFork.id, createdAt: 50 })
+  const stranger = fakeSession('session-stranger', { createdAt: 60 })
+  const record = (session, kind, parentSessionId) => recordFields({
+    sessionId: session.id,
+    kind,
+    parentSessionId,
+    dir: sessionDirOf(session.id),
+    cwd: '/tmp/project',
+    createdAt: session.header.createdAt,
+  }, NOW)
+  await writeRegistry({
+    [chat.id]: record(chat, 'main', null),
+    [fork.id]: record(fork, 'fork', chat.id),
+    [forkOfFork.id]: record(forkOfFork, 'fork', fork.id),
+    [underFork.id]: record(underFork, 'subagent', fork.id),
+    [underSub.id]: record(underSub, 'subagent', underFork.id),
+    [stranger.id]: record(stranger, 'main', null),
+  })
+  const h = harness({ stored: [chat.header, fork.header, forkOfFork.header, underFork.header, underSub.header, stranger.header] })
+  await h.temp.load()
+  assert.deepEqual(
+    h.temp.descendantRecords(chat.id).map(item => item.sessionId).sort(),
+    [fork.id, forkOfFork.id, underFork.id, underSub.id].sort(),
+  )
+  assert.deepEqual(h.temp.descendantRecords(fork.id).map(item => item.sessionId).sort(), [forkOfFork.id, underFork.id, underSub.id].sort())
+  assert.deepEqual(h.temp.descendantRecords(underFork.id).map(item => item.sessionId), [underSub.id])
+  assert.deepEqual(h.temp.descendantRecords(stranger.id), [])
+})
+
+// --- The validated exit snapshot and the degraded flags ---
+
+test('a failed child save still reaches the exit snapshot', async () => {
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id, createdAt: 20 })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const before = h.temp.exitSnapshot()
+  const save = h.temp.save
+  let failures = 1
+  h.temp.save = async function failOnce() {
+    if (failures > 0) {
+      failures -= 1
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    }
+    return save.call(this)
+  }
+  await assert.rejects(h.temp.recordDescendant(child), /ENOSPC/)
+  const after = h.temp.exitSnapshot()
+  // A separate immutable generation, not the live registry object.
+  assert.notEqual(after, before)
+  assert.ok(Object.isFrozen(after))
+  assert.ok(Object.isFrozen(after.sessions))
+  assert.ok(after.sessions.every(item => Object.isFrozen(item)))
+  assert.notEqual(after.sessions[0], h.temp.state.sessions[chat.id])
+  assert.deepEqual(after.sessions.map(item => item.sessionId), [chat.id, child.id])
+  // The durable published generation lags: the child's registry write failed.
+  const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(onDisk.sessions[child.id], undefined)
+  assert.ok(h.temp.publisher.generation > h.temp.publisher.published)
+})
+
+test('the installed exit callback uses the failed-save child', () => withFreshProcessCleanup(async addedExitListeners => {
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id, createdAt: 20 })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  const save = h.temp.save
+  let failures = 1
+  h.temp.save = async function failOnce() {
+    if (failures > 0) {
+      failures -= 1
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+    }
+    return save.call(this)
+  }
+  await assert.rejects(h.temp.recordDescendant(child), /ENOSPC/)
+  installExitCleanup(() => h.temp.exitSnapshot(), undefined)
+  // The registry names a permanent Session: the handler must not read it.
+  const controlDir = await materializeSession('session-permanent-control')
+  await writeRegistry({ 'session-permanent-control': legacyRecord(fakeSession('session-permanent-control', { createdAt: 1 })) })
+  assert.equal(addedExitListeners().length, 1)
+  addedExitListeners()[0]()
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(controlDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+}))
+
+test('runtime corruption does not un-validate the snapshot', async () => {
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const chatDir = await materializeSession(chat.id)
+  const controlDir = await materializeSession('session-permanent-control')
+  assert.equal(h.temp.exitSnapshot().degraded, false)
+  // The index is corrupted after the snapshot was validated.
+  await writeFile(stateFile, '{oops')
+  assert.equal(await h.temp.save(), false)
+  assert.equal(await readFile(stateFile, 'utf8'), '{oops')
+  const snapshot = h.temp.exitSnapshot()
+  assert.equal(snapshot.degraded, false)
+  assert.deepEqual(snapshot.sessions.map(item => item.sessionId), [chat.id])
+  // Exit deletes the validated temporary chat and preserves the permanent control.
+  assert.equal(cleanupSnapshotSync(snapshot), 1)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(controlDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+})
+
+test('exit after unload uses the snapshot', () => withFreshProcessCleanup(async addedExitListeners => {
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id, createdAt: 20 })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  const chatDir = await materializeSession(chat.id)
+  const childDir = await materializeSession(child.id)
+  installExitCleanup(() => h.temp.exitSnapshot(), undefined)
+  await h.temp.cleanupPending()
+  // The unload disposed the plugin instance; its validated snapshot stays bound.
+  assert.notEqual(globalThis[EXIT_SNAPSHOT_KEY], undefined)
+  const controlDir = await materializeSession('session-permanent-control')
+  await writeRegistry({ 'session-permanent-control': legacyRecord(fakeSession('session-permanent-control', { createdAt: 1 })) })
+  assert.equal(addedExitListeners().length, 1)
+  addedExitListeners()[0]()
+  await assert.rejects(readFile(join(childDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(join(controlDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+}))
+
+test('the degraded flags fail closed', async () => {
+  // A broken journal: no write of any kind, and the exit deletion set is empty.
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(journalFile, `{"type":"owned","sessionId":"session-chat","kind":"main","parentSessionId":null,"dir":"${sessionDirOf(chat.id)}","cwd":null,"at":1}\nnot an event\n`)
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  const chatDir = await materializeSession(chat.id)
+  await assert.rejects(h.temp.register({ sessionId: chat.id }), /journal is degraded/)
+  await assert.rejects(h.temp.reserve({ cwd: '/tmp/project' }), /journal is degraded/)
+  await assert.rejects(h.temp.discard({ sessionId: chat.id }), /journal is degraded/)
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
+  assert.equal((await readFile(journalFile, 'utf8')).split('\n').filter(Boolean).length, 2)
+  assert.equal(await readFile(join(chatDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.equal((await h.temp.list()).degraded, true)
+
+  // A damaged registry: journal-based recovery continues, registry writes refuse.
+  await rm(stateDir, { recursive: true, force: true })
+  const chatB = fakeSession('session-chat-b', { createdAt: 10 })
+  const childB = fakeSession('session-child-b', { origin: 'subagent', parentSession: chatB.id, createdAt: 20 })
+  const first = harness({
+    sessions: new Map([[chatB.id, chatB], [childB.id, childB]]),
+    stored: [chatB.header],
+  })
+  await first.temp.register({ sessionId: chatB.id })
+  const chatBDir = await materializeSession(chatB.id)
+  const childBDir = await materializeSession(childB.id)
+  await writeFile(stateFile, '{damaged')
+  const boot = new TemporarySessions(first.deps)
+  await boot.load()
+  assert.equal(boot.registryDegraded, true)
+  assert.deepEqual(boot.exitSnapshot().sessions.map(item => item.sessionId), [chatB.id])
+  assert.equal(await boot.save(), false)
+  assert.equal(await readFile(stateFile, 'utf8'), '{damaged')
+  // A new trusted observation still reaches the journal, and the snapshot keeps it.
+  await boot.recordDescendant(childB)
+  assert.ok((await journalLines()).some(event => event.type === 'owned' && event.sessionId === childB.id))
+  assert.deepEqual(boot.exitSnapshot().sessions.map(item => item.sessionId), [chatB.id, childB.id])
+  assert.equal(cleanupSnapshotSync(boot.exitSnapshot()), 2)
+  await assert.rejects(readFile(join(chatBDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  await assert.rejects(readFile(join(childBDir, 'session.v4.jsonl.zstd')), /ENOENT/)
+  assert.equal(await readFile(stateFile, 'utf8'), '{damaged')
+})
+
+test('the list result carries epoch, sequence and stopping', async () => {
+  const chat = fakeSession('session-chat', { createdAt: 10 })
+  const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id, createdAt: 20 })
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  assert.deepEqual(await h.temp.list(), {
+    epoch: h.temp.publisher.epoch,
+    sequence: 1,
+    degraded: false,
+    stopping: [],
+    sessions: [{ sessionId: chat.id, createdAt: 10, kind: 'main', pendingDelete: false }],
+  })
+  await h.temp.discard({ sessionId: chat.id })
+  assert.deepEqual(await h.temp.list(), {
+    epoch: h.temp.publisher.epoch,
+    sequence: 2,
+    degraded: false,
+    stopping: [{ sessionId: chat.id, kind: 'main' }],
+    sessions: [{ sessionId: chat.id, createdAt: 10, kind: 'main', pendingDelete: true }],
+  })
+})
+
+test('boot reap refuses a registry row with no journal ownership', async () => {
+  const session = fakeSession('session-unowned', { createdAt: 10 })
+  const dir = await materializeSession(session.id)
+  await writeRegistry({ [session.id]: legacyRecord(session) })
+  const h = harness()
+  await h.temp.load()
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.notEqual(h.temp.state.sessions[session.id], undefined)
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+})
+
+test('boot reap deletes nothing while the journal is degraded', async () => {
+  const session = fakeSession('session-degraded', { createdAt: 10 })
+  const dir = await materializeSession(session.id)
+  await writeRegistry({ [session.id]: legacyRecord(session) })
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(journalFile, 'not an event\n')
+  const h = harness()
+  await h.temp.load()
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  assert.equal((await h.temp.list()).degraded, true)
+})
+
+test('an unowned registry parent cannot mint child ownership', async () => {
+  const parent = fakeSession('session-unowned-parent', { createdAt: 10 })
+  const child = fakeSession('session-unowned-child', { origin: 'subagent', parentSession: parent.id, createdAt: 20 })
+  await writeRegistry({ [parent.id]: legacyRecord(parent) })
+  const h = harness({ sessions: new Map([[child.id, child]]) })
+  await h.temp.load()
+  await h.temp.recordDescendant(child)
+  assert.equal((await journalLines()).some(event => event.type === 'owned' && event.sessionId === child.id), false)
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+})
+
+test('the exit snapshot refuses a target that disagrees with the journal', async () => {
+  const session = fakeSession('session-target', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[session.id, session]]) })
+  await h.temp.register({ sessionId: session.id })
+  const ownedDir = await materializeSession(session.id)
+  const decoyDir = join(root, 'sessions', 'project', `${session.id}-decoy`)
+  await mkdir(decoyDir, { recursive: true })
+  await writeFile(join(decoyDir, 'session.v4.jsonl.zstd'), 'decoy')
+  h.temp.state.sessions[session.id].dir = decoyDir
+  h.temp.refreshSnapshot()
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
+  assert.equal(await readFile(join(ownedDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.equal(await readFile(join(decoyDir, 'session.v4.jsonl.zstd'), 'utf8'), 'decoy')
+  assert.ok(warnings.some(message => message.includes('disagrees with the ownership journal')))
+})
+
+test('a live root keeps its reservation at startup', async () => {
+  const h = harness()
+  const reserved = await h.temp.reserve({ workspaceId: 'ws-1', cwd: '/tmp/project' })
+  h.live.set(reserved.sessionId, fakeSession(reserved.sessionId, { createdAt: reserved.at + 1 }))
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.load()
+  assert.equal((await journalLines()).some(event => event.type === 'reservationDropped'), false)
+  assert.equal((await journalLines()).some(event => event.type === 'reserved' && event.sessionId === reserved.sessionId), true)
+})
+
+test('a failed torn-tail repair degrades the journal and refuses writes', async () => {
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(journalFile, [
+    '{"type":"migration","ids":[],"preexisting":[],"at":1}',
+    '{"type":"migrationComplete","at":2}',
+    '{"type":"reserved","sessionId":"session-torn","workspaceId":null,"cwd":"/tmp/project","at":3}',
+    '{"type":"reserved"',
+  ].join('\n'))
+  await chmod(stateDir, 0o500)
+  try {
+    const h = harness()
+    const loaded = new TemporarySessions(h.deps)
+    await loaded.load()
+    assert.equal((await loaded.list()).degraded, true)
+    await assert.rejects(loaded.reserve({ cwd: '/tmp/project' }), /journal is degraded/)
+  } finally {
+    await chmod(stateDir, 0o700)
+  }
+})
+
+test('the exit snapshot refuses a record that disagrees with its stored header', async () => {
+  const session = fakeSession('session-header', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[session.id, session]]), stored: [session.header] })
+  await h.temp.register({ sessionId: session.id })
+  const dir = await materializeSession(session.id)
+  h.temp.storedHeaders.set(session.id, { ...session.header, cwd: '/tmp/other' })
+  h.temp.refreshSnapshot()
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
+  assert.equal(await readFile(join(dir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.ok(warnings.some(message => message.includes('disagrees with its stored header')))
+})
+
+test('a legacy record that disagrees with its header is not imported or deleted', async () => {
+  const session = fakeSession('session-legacy-conflict', { createdAt: 10 })
+  const header = fakeSession(session.id, {
+    isSeeded: true, parentSession: 'session-permanent', createdAt: 20,
+  }).header
+  const dir = await materializeSession(session.id)
+  const conflicting = { ...legacyRecord(session), cwd: '/tmp/wrong' }
+  await writeRegistry({ [session.id]: conflicting })
+  const h = harness({ stored: [header] })
+  await h.temp.load()
+  await h.temp.reap()
+  assert.equal((await journalLines()).some(event => event.type === 'owned' && event.sessionId === session.id), false)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('the exit snapshot and boot reap require a stored header', async () => {
+  const session = fakeSession('session-no-header', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[session.id, session]]), stored: [session.header] })
+  await h.temp.register({ sessionId: session.id })
+  const dir = await materializeSession(session.id)
+  h.deps.sessionPersistence.list = async () => []
+  h.temp.storedHeaders = new Map()
+  h.live.clear()
+  h.temp.refreshSnapshot()
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
+  assert.equal(await readFile(join(dir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  await h.temp.reap()
+  assert.equal(await readFile(join(dir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.ok(warnings.some(message => message.includes('no stored header confirms it')))
+})
+
+test('a successful reap-time listing supplies the header for that same reap', async () => {
+  const session = fakeSession('session-fresh-header', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[session.id, session]]), stored: [session.header] })
+  await h.temp.register({ sessionId: session.id })
+  const dir = await materializeSession(session.id)
+  h.deps.sessionPersistence.list = async () => []
+  h.temp.storedHeaders = new Map()
+  h.live.clear()
+  h.temp.refreshSnapshot()
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  h.deps.sessionPersistence.list = async () => [{ header: session.header }]
+  await h.temp.reap()
+  await assert.rejects(readFile(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a journal-directory fsync failure leaves the migration gate closed', async () => {
+  const chat = fakeSession('session-fsync-gate', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  const originalFsync = fs.fsyncSync
+  let failed = false
+  fs.fsyncSync = fd => {
+    if (!failed && fs.fstatSync(fd).isDirectory()) {
+      failed = true
+      throw Object.assign(new Error('injected journal-directory fsync failure'), { code: 'EIO' })
+    }
+    return originalFsync(fd)
+  }
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(h.temp.load(), /ownership-journal directory/)
+    assert.equal(h.temp.migrationIncomplete, true)
+    await assert.rejects(h.temp.register({ sessionId: chat.id }), /migration is incomplete/)
+    const lines = await journalLines()
+    assert.equal(lines.some(event => event.type === 'migration'), true)
+    assert.equal(lines.some(event => event.type === 'migrationComplete'), false)
+  } finally {
+    fs.fsyncSync = originalFsync
+    syncBuiltinESMExports()
+  }
+})
+
+test('registration is refused while the first migration is deferred', async () => {
+  const session = fakeSession('session-migration', { createdAt: 10 })
+  const h = harness({ sessions: new Map([[session.id, session]]) })
+  h.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await h.temp.load()
+  await assert.rejects(h.temp.register({ sessionId: session.id }), /migration is incomplete/)
+  const restored = harness({ sessions: new Map([[session.id, session]]), stored: [session.header] })
+  await restored.temp.load()
+  await restored.temp.register({ sessionId: session.id })
+  assert.deepEqual(restored.temp.exitSnapshot().sessions.map(item => item.sessionId), [session.id])
+})
