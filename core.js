@@ -189,6 +189,10 @@ export class TemporarySessions {
     // Observed children whose journal append failed; their identity and parent
     // anchor stay here until a later pass writes the event.
     this.retryQueue = new Set()
+    // Side chats prepared and natively titled by this live instance. A failed
+    // index save or reload leaves these empty so register can finish the work.
+    this.sidePrepared = new Set()
+    this.sideTitled = new Map()
     this.retryTimer = undefined
     this.retryDelayMs = RETRY_DELAY_MS
     // Injected seam for a degraded reconciliation pass. Real detection is
@@ -485,7 +489,8 @@ export class TemporarySessions {
 
   /**
    * Fill fields a legacy record predates from its stored header: the storage
-   * directory and the direct parent.
+   * directory, the direct parent and the kind. A kind-less row is the
+   * pre-version record shape; the header is its only trustworthy source.
    * @param {object} value - stored member value.
    * @param {string} key - member key.
    * @param {Map<string, object> | undefined} stored - stored headers.
@@ -501,6 +506,7 @@ export class TemporarySessions {
     if (filled.parentSessionId === undefined && typeof header.parentSession === 'string') {
       filled.parentSessionId = header.parentSession
     }
+    if (filled.kind === undefined) filled.kind = kindOfHeader(header)
     return filled
   }
 
@@ -612,7 +618,8 @@ export class TemporarySessions {
   legacyRecordAgrees(record, header, storage, stored) {
     if (record === undefined || record === null || typeof record !== 'object') return false
     const headerKind = kindOfHeader(header)
-    const kindAgrees = record.kind === headerKind
+    const kindAgrees = record.kind === undefined
+      || record.kind === headerKind
       || (record.kind === 'side' && header.isSeeded === true && typeof header.parentSession === 'string')
     return kindAgrees
       && this.legacyParentAgrees(record, header, stored)
@@ -1048,6 +1055,12 @@ export class TemporarySessions {
           healed = true
         }
       }
+      if (existing.kind !== entry.kind) {
+        // A side-chat upgrade journals first and publishes the index second.
+        // Reconcile a crash in that interval from the durable ownership event.
+        existing.kind = entry.kind
+        healed = true
+      }
       if (entry.pending === true && existing.pendingDelete !== true) {
         existing.pendingDelete = true
         healed = true
@@ -1468,7 +1481,24 @@ export class TemporarySessions {
       }
       const existing = this.state.sessions[sessionId]
       if (existing?.kind === SUBAGENT_KIND) throw new Error('a subagent Session cannot become temporary')
-      if (existing !== undefined) return recordView(existing)
+      if (existing !== undefined) {
+        if (request.kind === 'side' && existing.kind === 'fork') {
+          return this.upgradeSideChat(existing, request)
+        }
+        if (existing.kind === 'side') {
+          const requestedTitle = typeof request.title === 'string' && request.title !== ''
+            ? request.title
+            : existing.title
+          const needsPreparation = !this.sidePrepared.has(existing.sessionId)
+          const needsTitle = requestedTitle !== ''
+            && this.deps.sessionController !== undefined
+            && this.sideTitled.get(existing.sessionId) !== requestedTitle
+          if (needsPreparation || needsTitle) {
+            return this.completeSideChat(existing, request, true)
+          }
+        }
+        return recordView(existing)
+      }
       const session = this.deps.sessions.get(sessionId)
       if (session === undefined) throw new Error('the Session is not live; open it before registering')
       const header = session.header
@@ -1547,17 +1577,95 @@ export class TemporarySessions {
         }
         throw error
       }
-      if (kind === 'side') this.prepareSideChat(sessionId)
+      if (kind === 'side') {
+        if (this.prepareSideChat(sessionId)) this.sidePrepared.add(sessionId)
+      }
       const controller = this.deps.sessionController
       if (controller !== undefined && title !== '') {
         try {
           await controller.rename({ sessionId, title })
+          this.sideTitled.set(sessionId, title)
         } catch (error) {
           this.warn(`could not title temporary session "${sessionId}": ${String(error)}`)
         }
       }
       return recordView(record)
     })
+  }
+
+  /**
+   * Upgrade an automatic fork record into a side chat in place. The record
+   * already has an `owned` entry; a second one carries the side presentation
+   * and keeps the true parent, storage target and pending state. The ownership
+   * event is appended once per upgrade; preparation and title publication are
+   * idempotent and can finish on a later register after a failed save.
+   * @param {object} record - the recorded automatic fork.
+   * @param {{ title?: string }} request - side-chat presentation.
+   * @returns {Promise<object>} the updated record view.
+   */
+  async upgradeSideChat(record, request) {
+    const now = Date.now()
+    if (typeof request.title === 'string' && request.title !== '' && request.title !== record.title) {
+      // Persist the requested title before the ownership change. A crash after
+      // the journal append can then heal the side kind without losing the title.
+      // Restore the old in-memory title when this save fails, because a retry
+      // must not mistake the failed mutation for already-persisted state.
+      const previousTitle = record.title
+      record.title = request.title
+      try {
+        await this.save()
+      } catch (error) {
+        record.title = previousTitle
+        throw error
+      }
+    }
+    await this.appendEvent({
+      type: 'owned',
+      sessionId: record.sessionId,
+      kind: 'side',
+      parentSessionId: record.parentSessionId,
+      dir: record.dir,
+      cwd: record.cwd,
+      at: now,
+    })
+    record.kind = 'side'
+    this.refreshSnapshot()
+    await this.save()
+    return this.completeSideChat(record, request, false)
+  }
+
+  /**
+   * Finish the work that follows the durable side kind and title. Keeping this
+   * idempotent lets a retry finish after a failed index save, while the live
+   * instance's prepared set still applies the boundary and native title once.
+   * @param {object} record - the side record.
+   * @param {{ title?: string }} request - the requested title, if any.
+   * @param {boolean} persist - whether the index still needs this record saved.
+   * @returns {Promise<object>} the updated record view.
+   */
+  async completeSideChat(record, request, persist) {
+    const requestedTitle = typeof request.title === 'string' && request.title !== ''
+      ? request.title
+      : record.title
+    if (requestedTitle !== record.title) {
+      record.title = requestedTitle
+      persist = true
+    }
+    if (persist) await this.save()
+    if (!this.sidePrepared.has(record.sessionId)) {
+      if (this.prepareSideChat(record.sessionId)) this.sidePrepared.add(record.sessionId)
+    }
+    if (record.title !== ''
+      && this.deps.sessionController !== undefined
+      && this.sideTitled.get(record.sessionId) !== record.title) {
+      try {
+        await this.deps.sessionController.rename({ sessionId: record.sessionId, title: record.title })
+        this.sideTitled.set(record.sessionId, record.title)
+      } catch (error) {
+        this.warn(`could not title temporary side chat "${record.sessionId}": ${String(error)}`)
+      }
+    }
+    return recordView(record)
   }
 
   /**
@@ -1613,7 +1721,12 @@ export class TemporarySessions {
     return this.enqueue(async () => {
       await this.load()
       if (this.loadFailed) return
-      await this.drainObserved()
+      const changed = await this.drainObserved()
+      // A descendant observed after the tree's final stop scan is pending now;
+      // re-issue the stop so it cannot wait for an arbitrary restart.
+      if (changed && Object.values(this.state.sessions).some(record => record?.pendingDelete === true)) {
+        await this.resumePendingStops()
+      }
     })
   }
 
@@ -2184,16 +2297,19 @@ export class TemporarySessions {
    * Failures here never block registration: the side chat still works with the
    * inherited context, just without the extra guidance.
    * @param {string} sessionId - the registered side Session.
+   * @returns {boolean} whether preparation was applied to a live Agent.
    */
   prepareSideChat(sessionId) {
     const agent = this.deps.agents?.get?.(sessionId)
-    if (agent === undefined || agent === null) return
+    if (agent === undefined || agent === null) return false
+    let prepared = true
     try {
       const goal = this.deps.goals?.get?.(agent)
       if (goal !== undefined && goal !== null && typeof this.deps.goals?.clear === 'function') {
         this.deps.goals.clear(agent, { id: goal.id, revision: goal.revision })
       }
     } catch (error) {
+      prepared = false
       this.warn(`could not clear the inherited goal for side chat "${sessionId}": ${String(error)}`)
     }
     try {
@@ -2204,8 +2320,10 @@ export class TemporarySessions {
         interpolate: false,
       })
     } catch (error) {
+      prepared = false
       this.warn(`could not add the side-chat instruction for "${sessionId}": ${String(error)}`)
     }
+    return prepared
   }
 
   /**
@@ -2373,34 +2491,13 @@ export class TemporarySessions {
   }
 
   /**
-   * Promote a temporary Session to a normal one: drop its record so exit and
-   * boot cleanup never delete its log. The caller also renames it to a lasting
-   * title when it supplies one.
+   * Promotion is disabled. The endpoint remains so an older browser or a
+   * stale call receives a specific refusal instead of an unknown method.
    * @param {{ sessionId: string, title?: string }} request - Session to keep.
-   * @returns {Promise<{ promoted: true }>} acknowledgement.
+   * @returns {Promise<never>} rejects with the removal notice.
    */
-  promote(request) {
-    return this.enqueue(async () => {
-      await this.load()
-      this.assertWritable('promote a temporary session')
-      const sessionId = request?.sessionId
-      const record = this.chatRecord(sessionId)
-      if (record === undefined) throw new Error('this Session is not a recorded temporary session')
-      // The kept chat's subagent logs must survive every later exit, so their records go too.
-      for (const child of this.descendantRecords(sessionId)) delete this.state.sessions[child.sessionId]
-      delete this.state.sessions[sessionId]
-      this.refreshSnapshot()
-      await this.save()
-      const title = typeof request.title === 'string' ? request.title : ''
-      if (title !== '' && this.deps.sessionController !== undefined) {
-        try {
-          await this.deps.sessionController.rename({ sessionId, title })
-        } catch (error) {
-          this.warn(`could not title promoted session "${sessionId}": ${String(error)}`)
-        }
-      }
-      return { promoted: true }
-    })
+  promote(request) { // eslint-disable-line no-unused-vars
+    return Promise.reject(new Error('promotion is disabled'))
   }
 
   /**

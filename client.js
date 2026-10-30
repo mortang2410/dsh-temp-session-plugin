@@ -27,6 +27,30 @@ window.__ModuleLoader__.load({
       }
       return { sessionId: value.sessionId }
     })
+    const reserveRequest = strict('ReserveRequest', (value) => {
+      if (value !== undefined && (value === null || typeof value !== 'object')) {
+        throw new Error('temporary session reservation requires an object')
+      }
+      const workspaceId = typeof value?.workspaceId === 'string' && value.workspaceId !== '' ? value.workspaceId : null
+      const cwd = typeof value?.cwd === 'string' && value.cwd !== '' ? value.cwd : null
+      return { workspaceId, cwd }
+    })
+    const reserveResult = strict('ReserveResult', (value) => {
+      if (value === null
+        || typeof value !== 'object'
+        || typeof value.sessionId !== 'string'
+        || !Number.isSafeInteger(value.at)
+        || (value.workspaceId !== null && typeof value.workspaceId !== 'string')
+        || (value.cwd !== null && typeof value.cwd !== 'string')) {
+        throw new Error('temporary session reservation returned an invalid receipt')
+      }
+      return {
+        sessionId: value.sessionId,
+        workspaceId: value.workspaceId,
+        cwd: value.cwd,
+        at: value.at,
+      }
+    })
     const registerRequest = strict('RegisterRequest', (value) => {
       const base = sessionRequest.create().parse(value)
       if (value.kind !== undefined && value.kind !== 'main' && value.kind !== 'side') {
@@ -37,16 +61,6 @@ window.__ModuleLoader__.load({
         title: typeof value.title === 'string' ? value.title : '',
         kind: value.kind === 'side' ? 'side' : 'main',
       }
-    })
-    const promoteRequest = strict('PromoteRequest', (value) => {
-      const base = sessionRequest.create().parse(value)
-      return { ...base, title: typeof value.title === 'string' ? value.title : '' }
-    })
-    const promoteResult = strict('PromoteResult', (value) => {
-      if (value === null || typeof value !== 'object' || value.promoted !== true) {
-        throw new Error('temporary session promotion returned an invalid receipt')
-      }
-      return { promoted: true }
     })
     const registerResult = strict('RegisterResult', (value) => {
       if (value === null
@@ -64,12 +78,49 @@ window.__ModuleLoader__.load({
         pendingDelete: value.pendingDelete,
       }
     })
-    const listedRecord = strict('ListedRecord', (value) => registerResult.create().parse(value))
+    const listedKinds = ['main', 'side', 'fork']
+    const listedRecord = strict('ListedRecord', (value) => {
+      if (value === null
+        || typeof value !== 'object'
+        || typeof value.sessionId !== 'string'
+        || !Number.isSafeInteger(value.createdAt)
+        || !listedKinds.includes(value.kind)
+        || typeof value.pendingDelete !== 'boolean') {
+        throw new Error('temporary session listing returned an invalid record')
+      }
+      return {
+        sessionId: value.sessionId,
+        createdAt: value.createdAt,
+        kind: value.kind,
+        pendingDelete: value.pendingDelete,
+      }
+    })
+    const stoppingEntry = strict('StoppingEntry', (value) => {
+      if (value === null
+        || typeof value !== 'object'
+        || typeof value.sessionId !== 'string'
+        || !listedKinds.includes(value.kind)) {
+        throw new Error('temporary session listing returned an invalid stopping entry')
+      }
+      return { sessionId: value.sessionId, kind: value.kind }
+    })
     const listResult = strict('ListResult', (value) => {
-      if (value === null || typeof value !== 'object' || !Array.isArray(value.sessions)) {
+      if (value === null
+        || typeof value !== 'object'
+        || !Number.isSafeInteger(value.epoch)
+        || !Number.isSafeInteger(value.sequence)
+        || typeof value.degraded !== 'boolean'
+        || !Array.isArray(value.stopping)
+        || !Array.isArray(value.sessions)) {
         throw new Error('temporary session listing returned an invalid payload')
       }
-      return { sessions: value.sessions.map(item => listedRecord.create().parse(item)) }
+      return {
+        epoch: value.epoch,
+        sequence: value.sequence,
+        degraded: value.degraded,
+        stopping: value.stopping.map(item => stoppingEntry.create().parse(item)),
+        sessions: value.sessions.map(item => listedRecord.create().parse(item)),
+      }
     })
     const discardResult = strict('DiscardResult', (value) => {
       if (value === null || typeof value !== 'object' || value.discarded !== true) {
@@ -81,6 +132,15 @@ window.__ModuleLoader__.load({
     const remoteContribution = {
       package: 'dsh-temp-session-plugin',
       descriptors: [
+        {
+          id: 'dsh-temp-session-plugin#tempSession/reserve',
+          service: 'tempSessionsHost',
+          namespace: 'tempSession',
+          method: 'reserve',
+          invocation: { kind: 'direct' },
+          parameters: [{ name: 'request', wire: 'request', source: 'json', codec: reserveRequest }],
+          result: reserveResult,
+        },
         {
           id: 'dsh-temp-session-plugin#tempSession/register',
           service: 'tempSessionsHost',
@@ -108,15 +168,6 @@ window.__ModuleLoader__.load({
           parameters: [{ name: 'request', wire: 'request', source: 'json', codec: sessionRequest }],
           result: discardResult,
         },
-        {
-          id: 'dsh-temp-session-plugin#tempSession/promote',
-          service: 'tempSessionsHost',
-          namespace: 'tempSession',
-          method: 'promote',
-          invocation: { kind: 'direct' },
-          parameters: [{ name: 'request', wire: 'request', source: 'json', codec: promoteRequest }],
-          result: promoteResult,
-        },
       ],
     }
 
@@ -142,10 +193,8 @@ window.__ModuleLoader__.load({
       sideNoBoundary: '当前会话还没有完成的回合，暂时无法继承上下文',
       sideTab: '临时会话',
       sideBar: '临时会话 · 退出应用后删除',
-      promote: '提升为长期会话',
-      promoteHint: '保留这段对话，使它不再随应用退出而删除',
-      promotedTitle: '会话 · {time}',
-      promoteFailed: '提升长期会话失败：{message}',
+      stopping: '正在停止',
+      stoppingHint: '正在停止这个会话；确认停止前不会删除它的记录',
       sideLoading: '正在打开临时会话…',
     }
     const en = {
@@ -170,10 +219,8 @@ window.__ModuleLoader__.load({
       sideNoBoundary: 'This conversation has no completed turn to inherit yet',
       sideTab: 'Temporary chat',
       sideBar: 'Temporary chat · deleted when the app exits',
-      promote: 'Keep as long-term chat',
-      promoteHint: 'Keep this conversation; stop deleting it when the app exits',
-      promotedTitle: 'Chat · {time}',
-      promoteFailed: 'Could not keep the chat: {message}',
+      stopping: 'Stopping',
+      stoppingHint: 'Stopping this chat; its record stays until the stop is confirmed',
       sideLoading: 'Opening the temporary chat…',
     }
 
@@ -198,8 +245,9 @@ window.__ModuleLoader__.load({
 .dts-sidechat{display:flex;flex-direction:column;width:100%;height:100%;min-width:0;min-height:0}
 .dts-sidebar{flex:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;border-bottom:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
 .dts-sidebarLabel{display:inline-flex;align-items:center;gap:6px;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-.dts-sidebarPromote{flex:none;padding:3px 8px;border:1px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:transparent;color:var(--dsw-alias-label-primary);font-family:inherit;font-size:12px;line-height:18px;cursor:pointer}
-.dts-sidebarPromote:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.dts-stopping{display:flex;flex-direction:column;gap:4px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l3);border-radius:var(--dsw-radius-sm);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}
+.dts-stoppingRow{display:flex;align-items:center;gap:6px;min-width:0}
+.dts-stoppingId{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dts-sidechatBody{flex:1;min-height:0;display:flex;flex-direction:column;width:100%;overflow:hidden}
 .dts-sidechatLoading{padding:12px;font-size:13px;color:var(--dsw-alias-label-secondary)}
 .dts-selectionAction{position:fixed;z-index:1300;transform:translate(-50%,0);display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:12px;line-height:1;white-space:nowrap;cursor:pointer;box-shadow:0 4px 14px var(--dsw-alias-bg-mask-1)}
@@ -246,48 +294,102 @@ window.__ModuleLoader__.load({
     /**
      * Small external store for the browser's view of temporary Sessions.
      * `ids` are active (badge/count) sessions; `side` are forked side chats
-     * hidden from the main sidebar, including ones already ended.
+     * hidden from the main sidebar, including ones already ended. The epoch
+     * and sequence order list replies; `pending` is terminal until the Host
+     * drops the record.
      */
     function createStore() {
-      let snapshot = { ids: new Set(), side: new Set(), selection: null, choice: null, notice: null }
+      let snapshot = {
+        ids: new Set(),
+        side: new Set(),
+        stopping: new Set(),
+        pending: new Set(),
+        epoch: null,
+        sequence: -1,
+        degraded: false,
+        selection: null,
+        choice: null,
+        notice: null,
+      }
       let noticeSeq = 0
       const listeners = new Set()
       const emit = () => { for (const listener of listeners) listener() }
+      const applyList = (value) => {
+        if (snapshot.epoch !== null) {
+          if (value.epoch < snapshot.epoch) return { accepted: false, newlyPending: [] }
+          if (value.epoch === snapshot.epoch && value.sequence <= snapshot.sequence) {
+            return { accepted: false, newlyPending: [] }
+          }
+        }
+        const beforePending = new Set(snapshot.pending)
+        const present = new Set(value.sessions.map(record => record.sessionId))
+        const pending = new Set()
+        for (const id of snapshot.pending) if (present.has(id)) pending.add(id)
+        const ids = new Set()
+        const side = new Set()
+        const stopping = new Set()
+        for (const record of value.sessions) {
+          if (record.kind === 'side') side.add(record.sessionId)
+          if (record.pendingDelete === true || pending.has(record.sessionId)) {
+            pending.add(record.sessionId)
+            stopping.add(record.sessionId)
+          } else {
+            ids.add(record.sessionId)
+          }
+        }
+        for (const item of value.stopping) {
+          stopping.add(item.sessionId)
+          pending.add(item.sessionId)
+        }
+        snapshot = {
+          ...snapshot,
+          ids,
+          side,
+          stopping,
+          pending,
+          epoch: value.epoch,
+          sequence: value.sequence,
+          degraded: value.degraded,
+        }
+        emit()
+        return {
+          accepted: true,
+          newlyPending: [...pending].filter(id => !beforePending.has(id)),
+        }
+      }
       return {
         subscribe(listener) {
           listeners.add(listener)
           return () => { listeners.delete(listener) }
         },
         getSnapshot() { return snapshot },
+        applyList,
         hydrate(records) {
-          const ids = new Set()
-          const side = new Set()
-          for (const record of records) {
-            if (record.kind === 'side') side.add(record.sessionId)
-            if (record.pendingDelete !== true) ids.add(record.sessionId)
-          }
-          snapshot = { ...snapshot, ids, side }
-          emit()
+          applyList({
+            epoch: snapshot.epoch ?? 0,
+            sequence: snapshot.sequence + 1,
+            degraded: false,
+            stopping: records
+              .filter(record => record.pendingDelete === true)
+              .map(record => ({ sessionId: record.sessionId, kind: record.kind })),
+            sessions: records,
+          })
         },
         add(id, kind = 'main') {
           const ids = new Set(snapshot.ids)
           ids.add(id)
           const side = kind === 'side' ? new Set(snapshot.side).add(id) : snapshot.side
-          snapshot = { ...snapshot, ids, side }
+          const stopping = new Set(snapshot.stopping)
+          stopping.delete(id)
+          snapshot = { ...snapshot, ids, side, stopping }
           emit()
         },
         markEnded(id) {
           const ids = new Set(snapshot.ids)
           ids.delete(id)
-          snapshot = { ...snapshot, ids }
-          emit()
-        },
-        promote(id) {
-          const ids = new Set(snapshot.ids)
-          ids.delete(id)
-          const side = new Set(snapshot.side)
-          side.delete(id)
-          snapshot = { ...snapshot, ids, side }
+          const stopping = new Set(snapshot.stopping).add(id)
+          const pending = new Set(snapshot.pending).add(id)
+          snapshot = { ...snapshot, ids, stopping, pending }
           emit()
         },
         setSelection(selection) {
@@ -430,6 +532,21 @@ window.__ModuleLoader__.load({
         }, '\u00d7'))
     }
 
+    /** Per-chat stopping entries, visible even after the chat views close. */
+    function StoppingNotice({ t, store }) {
+      const { stopping } = React.useSyncExternalStore(store.subscribe, store.getSnapshot)
+      if (stopping.size === 0) return null
+      return h('div', {
+        className: 'dts-stopping',
+        role: 'status',
+        'aria-label': `${t('stopping')} (${stopping.size})`,
+      },
+      h('span', null, `${t('stopping')} (${stopping.size})`),
+      [...stopping].map(sessionId => h('span', { key: sessionId, className: 'dts-stoppingRow', title: t('stoppingHint') },
+        h(ClockChatIcon, { size: 12 }),
+        h('span', { className: 'dts-stoppingId' }, sessionId))))
+    }
+
     // ---- Forked side chats in the right sidebar ----
 
     const TEMPCHAT_PREFIX = 'dsh-resource://tempchat/session/'
@@ -457,15 +574,6 @@ window.__ModuleLoader__.load({
       const trimmed = String(text).trim()
       const clipped = trimmed.length > 4000 ? `${trimmed.slice(0, 4000)}\u2026` : trimmed
       return `${clipped.split('\n').map(line => `> ${line}`).join('\n')}\n\n`
-    }
-
-    /** A lasting Session title derived from the selected text. */
-    function promotionTitle(text, t, time) {
-      const first = String(text).split('\n')
-        .map(line => line.replace(/^>\s?/, '').trim())
-        .find(line => line !== '')
-      if (first === undefined) return t('promotedTitle', { time })
-      return first.length > 40 ? `${first.slice(0, 40)}\u2026` : first
     }
 
     /** Remove hidden side-chat Sessions from a Sessions list snapshot. */
@@ -514,13 +622,7 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'dts-sidebar' },
               h('span', { className: 'dts-sidebarLabel' },
                 h(BubbleBadgeIcon),
-                h('span', null, t('sideBar'))),
-              h('button', {
-                type: 'button',
-                className: 'dts-sidebarPromote',
-                title: t('promoteHint'),
-                onClick: () => { void actions.promote(sessionId) },
-              }, t('promote')))
+                h('span', null, t('sideBar'))))
           : null,
         h('div', { className: 'dts-sidechatBody' },
           resource.value === undefined
@@ -571,9 +673,11 @@ window.__ModuleLoader__.load({
       const store = createStore()
       const ending = new Set()
       const sideRefs = new Map()
-      const sideQuotes = new Map()
+      const sideParents = new Map()
       const closingSide = new Set()
       let startingSide = false
+      let refreshPromise = null
+      let refreshRequested = false
 
       const log = typeof ctx.logger === 'function' ? ctx.logger('temp-session') : ctx.logger
 
@@ -602,11 +706,139 @@ window.__ModuleLoader__.load({
           .find(session => (session.retainedBy?.mainView ?? 0) > 0)?.id
       }
 
+      /** Close the main view for a newly pending current chat. */
+      const closeMainView = (sessionIds) => {
+        if (sessionIds.length === 0) return
+        if (!sessionIds.includes(currentSessionId())) return
+        try {
+          ctx.uiWorkspace.clearMain?.()
+        } catch (error) {
+          log?.warn?.(`could not close a stopping main view: ${String(error)}`)
+        }
+      }
+
+      /**
+       * Close the side tab for every pending chat. The inventory includes saved
+       * layouts whose parent Session is not adopted yet; `closeIn` is a no-op
+       * there, so callers retry this on inventory changes and later list reads
+       * until the tab is actually gone.
+       */
+      const closeSideTabs = (sessionIds) => {
+        if (sessionIds.length === 0 || ctx.sidebarRight === undefined) return
+        const closeIn = typeof ctx.sidebarRight.closeIn === 'function'
+          ? ctx.sidebarRight.closeIn.bind(ctx.sidebarRight)
+          : undefined
+        if (closeIn === undefined) return
+        const closed = new Set()
+        const inventory = ctx.sidebarRight.openTabs?.getSnapshot?.() ?? []
+        for (const item of inventory) {
+          const sideId = parseTempChatAddress(item.contentId)
+          if (sideId === undefined || !sessionIds.includes(sideId)) continue
+          if (typeof item.sessionId !== 'string' || item.tabId === undefined) continue
+          const key = `${item.sessionId}:${item.tabId}`
+          if (closed.has(key)) continue
+          try {
+            closeIn(item.sessionId, item.tabId)
+            closed.add(key)
+          } catch (error) {
+            log?.warn?.(`could not close a restored stopping side chat: ${String(error)}`)
+          }
+        }
+        for (const sessionId of sessionIds) {
+          for (const [sideId, parentId] of sideParents) {
+            if (sideId !== sessionId) continue
+            try {
+              const tab = (ctx.sidebarRight.tabsIn?.(parentId) ?? [])
+                .find(candidate => parseTempChatAddress(candidate.contentId) === sessionId)
+              if (tab?.id !== undefined) {
+                const key = `${parentId}:${tab.id}`
+                if (!closed.has(key)) {
+                  closeIn(parentId, tab.id)
+                  closed.add(key)
+                }
+              }
+            } catch (error) {
+              log?.warn?.(`could not close a stopping side chat: ${String(error)}`)
+            }
+          }
+        }
+      }
+
+      /** Close the views for a chat that just became pending. */
+      const closePendingViews = (sessionIds) => {
+        closeMainView(sessionIds)
+        closeSideTabs(sessionIds)
+      }
+
+      const openTabs = ctx.sidebarRight?.openTabs
+      if (typeof openTabs?.subscribe === 'function') {
+        ctx.effect(() => openTabs.subscribe(() => {
+          closeSideTabs([...store.getSnapshot().pending])
+        }), 'temp-session: restored sidebar tabs')
+      }
+      const currentInfo = ctx.sessions.currentProvideInfo
+      if (typeof currentInfo?.subscribe === 'function') {
+        ctx.effect(() => currentInfo.subscribe(() => {
+          closeMainView([...store.getSnapshot().pending])
+        }), 'temp-session: pending main view')
+      }
+
+      /** Read the Host list once and apply pending transitions. */
+      const readList = async () => {
+        try {
+          const result = await ctx.remote.tempSession.list()
+          if (result.ok) {
+            const transition = store.applyList(result.value)
+            if (transition.accepted) {
+              // A pending fork can become current after it was marked pending.
+              // Check every still-pending id, not only newly pending ones.
+              closeMainView([...store.getSnapshot().pending])
+              // A restored tab may have been unadopted on the first attempt.
+              // Retry every still-pending side until its inventory entry is gone.
+              closeSideTabs([...store.getSnapshot().pending])
+            }
+          } else {
+            log?.warn?.(`could not list temporary sessions: ${result.error.message}`)
+          }
+        } catch (error) {
+          log?.warn?.(`could not list temporary sessions: ${String(error)}`)
+        }
+      }
+
+      /**
+       * Read the Host list, ordered by epoch and sequence, and apply pending
+       * transitions. A refresh requested while another is in flight runs once
+       * more before the shared promise settles, so an action never loses its
+       * post-mutation read to a slower periodic refresh.
+       */
+      const refresh = () => {
+        if (refreshPromise !== null) {
+          refreshRequested = true
+          return refreshPromise
+        }
+        refreshPromise = (async () => {
+          try {
+            do {
+              refreshRequested = false
+              await readList()
+            } while (refreshRequested)
+          } finally {
+            refreshPromise = null
+          }
+        })()
+        return refreshPromise
+      }
+
       /** Title shared by the workspace-create entry and the New Session option. */
       const tempTitle = () => t('title', { time: timeLabel() })
       let creatingMain = false
 
       const actions = {
+        /** Re-read the Host list now; used by tests and lifecycle callers. */
+        async refresh() {
+          await refresh()
+        },
+
         /** Create an ordinary Session in one workspace (the menu's first row). */
         startNormal(workspaceId) {
           try {
@@ -622,7 +854,20 @@ window.__ModuleLoader__.load({
           if (creatingMain === true) return
           creatingMain = true
           try {
-            const sessionId = await ctx.sessions.create({ workspaceId })
+            const workspace = ctx.workspaces.list.getSnapshot().items
+              .find(item => item.workspaceId === workspaceId)
+            if (typeof workspace?.path !== 'string' || workspace.path === '') {
+              throw new Error('the workspace path is unavailable; refusing to create an unregistered temporary session')
+            }
+            const reserved = await ctx.remote.tempSession.reserve({
+              workspaceId,
+              cwd: workspace.path,
+            })
+            if (!reserved.ok) throw reserved.error
+            const sessionId = await ctx.sessions.create({
+              workspaceId,
+              sessionId: reserved.value.sessionId,
+            })
             const result = await ctx.remote.tempSession.register({
               sessionId,
               title: tempTitle(),
@@ -633,6 +878,7 @@ window.__ModuleLoader__.load({
             }
             store.add(result.value.sessionId, result.value.kind)
             ctx.uiWorkspace.openSession(result.value.sessionId)
+            await refresh()
           } catch (error) {
             log?.warn?.(`could not create a temporary session: ${String(error)}`)
             store.notify(t('failed', { message: messageOf(error) }))
@@ -655,6 +901,7 @@ window.__ModuleLoader__.load({
             })
             if (!result.ok) throw result.error
             store.add(result.value.sessionId, result.value.kind)
+            await refresh()
           } catch (error) {
             log?.warn?.(`could not mark a temporary session: ${String(error)}`)
             store.notify(t('markFailed', { message: messageOf(error) }))
@@ -674,6 +921,8 @@ window.__ModuleLoader__.load({
             const result = await ctx.remote.tempSession.discard({ sessionId })
             if (!result.ok) throw result.error
             store.markEnded(sessionId)
+            closePendingViews([sessionId])
+            await refresh()
           } catch (error) {
             log?.warn?.(`could not end a temporary session: ${String(error)}`)
             store.notify(t('endFailed', { message: messageOf(error) }))
@@ -691,6 +940,17 @@ window.__ModuleLoader__.load({
           if (startingSide === true) return
           startingSide = true
           let forkId
+          const abandonPendingSide = async (sessionId) => {
+            const reference = sideRefs.get(sessionId)
+            sideRefs.delete(sessionId)
+            sideParents.delete(sessionId)
+            try { reference?.release?.() } catch (error) {
+              log?.warn?.(`side-chat release failed: ${String(error)}`)
+            }
+            store.markEnded(sessionId)
+            closePendingViews([sessionId])
+            await refresh()
+          }
           try {
             const parentId = currentSessionId()
             if (parentId === undefined) {
@@ -713,8 +973,15 @@ window.__ModuleLoader__.load({
               forkId = undefined
               throw result.error
             }
+            // The parent can become pending while the fork request is in
+            // flight. The receipt is authoritative even when no list read has
+            // reached this client yet.
+            if (result.value.pendingDelete === true) {
+              await abandonPendingSide(forkId)
+              return
+            }
             store.add(result.value.sessionId, 'side')
-            sideQuotes.set(forkId, selectedText)
+            sideParents.set(forkId, parentId)
             const reference = ctx.sessions.retain(forkId, { source: 'controllerOperation' })
             sideRefs.set(forkId, reference)
             try {
@@ -727,10 +994,15 @@ window.__ModuleLoader__.load({
             } catch (error) {
               log?.warn?.(`could not prefill the side-chat draft: ${String(error)}`)
             }
+            if (store.getSnapshot().pending.has(forkId)) {
+              await abandonPendingSide(forkId)
+              return
+            }
             ctx.sidebarRight.openResource(tempChatAddress(forkId), {
               kind: 'tempchat',
               preferNewPane: true,
             })
+            await refresh()
           } catch (error) {
             log?.warn?.(`could not start a temporary side chat: ${String(error)}`)
             store.notify(t('sideFailed', { message: messageOf(error) }))
@@ -739,39 +1011,21 @@ window.__ModuleLoader__.load({
           }
         },
 
-        /** Drop the temporary record so exit cleanup keeps the fork forever. */
-        async promote(sessionId) {
-          try {
-            const result = await ctx.remote.tempSession.promote({
-              sessionId,
-              title: promotionTitle(sideQuotes.get(sessionId) ?? '', t, timeLabel()),
-            })
-            if (!result.ok) throw result.error
-            store.promote(sessionId)
-            sideQuotes.delete(sessionId)
-            void ctx.sessions.refreshProjections?.(sessionId)?.catch?.((error) => {
-              log?.warn?.(`could not refresh the promoted session title: ${String(error)}`)
-            })
-          } catch (error) {
-            log?.warn?.(`could not promote a temporary side chat: ${String(error)}`)
-            store.notify(t('promoteFailed', { message: messageOf(error) }))
-          }
-        },
-
-        /** Close a side chat: discard its log unless it was promoted. */
+        /** Close a side chat: discard its log unless its record is already pending. */
         async closeSide(sessionId) {
           if (closingSide.has(sessionId)) return
           closingSide.add(sessionId)
           try {
             const reference = sideRefs.get(sessionId)
             sideRefs.delete(sessionId)
+            sideParents.delete(sessionId)
             try { reference?.release?.() } catch (error) { log?.warn?.(`side-chat release failed: ${String(error)}`) }
             if (store.getSnapshot().ids.has(sessionId)) {
               const result = await ctx.remote.tempSession.discard({ sessionId })
               if (!result.ok) throw result.error
               store.markEnded(sessionId)
             }
-            sideQuotes.delete(sessionId)
+            await refresh()
           } catch (error) {
             log?.warn?.(`could not close a temporary side chat: ${String(error)}`)
             store.notify(t('endFailed', { message: messageOf(error) }))
@@ -1011,22 +1265,34 @@ window.__ModuleLoader__.load({
 
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay',
+        id: 'temp-session-stopping',
+        order: 101,
+        locale: NS,
+        inject: () => ({ t, store }),
+      }, StoppingNotice))
+
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay',
         id: 'temp-session-notice',
         order: 100,
         locale: NS,
         inject: () => ({ store }),
       }, Notice))
 
+      // Follow Host lifecycle changes and use the publisher epoch to reject
+      // delayed replies; a slow interval covers changes no client event names.
+      ctx.effect(() => {
+        const dispose = ctx.sessions.list.subscribe?.(() => { void refresh() })
+        return () => { if (typeof dispose === 'function') dispose() }
+      }, 'temp-session: lifecycle refresh')
+      ctx.effect(() => {
+        const timer = setInterval(() => { void refresh() }, 30000)
+        timer.unref?.()
+        return () => { clearInterval(timer) }
+      }, 'temp-session: periodic refresh')
+
       // Hydrate the marker set from the Host, so a page reload keeps badges.
-      void (async () => {
-        try {
-          const result = await ctx.remote.tempSession.list()
-          if (result.ok) store.hydrate(result.value.sessions)
-          else log?.warn?.(`could not list temporary sessions: ${result.error.message}`)
-        } catch (error) {
-          log?.warn?.(`could not list temporary sessions: ${String(error)}`)
-        }
-      })()
+      void refresh()
     }
 
     return {

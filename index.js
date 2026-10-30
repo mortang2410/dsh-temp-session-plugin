@@ -80,6 +80,10 @@ export async function apply(ctx) {
       super(inner, 'tempSessionsHost', { namespace: 'tempSession' })
     }
 
+    reserve(request) {
+      return temp.reserve(request)
+    }
+
     register(request) {
       return temp.register(request)
     }

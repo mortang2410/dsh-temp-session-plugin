@@ -9,8 +9,8 @@ shapes:
 - a **side chat** opened in the right sidebar from selected text, forked from
   the current conversation, with the selection prefilled in the composer.
 
-Both run the real agent and both are deleted when the application exits — unless
-you choose to **promote** a side chat to a long-term session.
+Both run the real agent and both are deleted when the application exits. There
+is no promotion path: a temporary chat cannot become permanent.
 
 The plugin is a standard DSH bundle (Host plugin + Web client module). It is
 plain JavaScript with no build step, so it installs directly from GitHub.
@@ -27,21 +27,20 @@ plain JavaScript with no build step, so it installs directly from GitHub.
 - **Selection side chat** — select text in a conversation and click the floating
   **Temporary chat** action. A forked copy of the conversation opens in the
   right sidebar, with the selection prefilled as a quote in the composer.
-- **Promote to keep** — turn a side chat into a normal long-term session with
-  one click. The Host drops its temporary record and the row appears in the
-  sidebar; nothing is deleted on exit.
+- **No promotion** - the browser has no keep button, and a stale host promote
+  call is refused with `promotion is disabled`.
 - **Full native session** — temporary chats run the real agent with the usual
   tools, model, permissions, streaming, and inherited context.
 - **Clear marking** — a dashed strip above the composer says the chat is
   temporary and offers the end action, even for a blank session. Once the first
   message is sent, the row is titled `Temporary chat · HH:mm`, gains a small
   badge while idle, and the conversation header shows a `Temporary` chip.
-- **Hidden side chats** — while temporary, forked side chats stay out of the
-  sidebar and search; they appear only when promoted.
+- **Hidden side chats** - while temporary, forked side chats stay out of the
+  sidebar and search for their whole lifetime.
 - **End without opening** — end a main temporary chat from the strip above the
   composer. It is archived (hidden from the list) immediately. Closing a side-chat tab discards it.
-- **Deleted on quit** — the Host removes every non-promoted temporary session's
-  log directory on exit (normal exit, `SIGTERM`, or `SIGINT`).
+- **Deleted on quit** - the Host removes every temporary session's log
+  directory on exit (normal exit, `SIGTERM`, or `SIGINT`).
 - **Crash recovery** — if the process was killed hard, the next boot deletes the
   leftover logs before the browser can list them.
 - **Bilingual UI** — Chinese and English, following the DSH language setting.
@@ -128,8 +127,7 @@ the New Session row to adopt it as temporary.
    selection is prefilled as a quote, and the tab is marked temporary.
 4. Ask your side question in the right pane. The main conversation stays as it
    was. While temporary, the fork is hidden from the sidebar.
-5. Choose **Keep as long-term chat** in the side bar to promote it, or close the
-   tab to discard it at exit.
+5. Close the tab to discard the side chat.
 
 You can keep multiple temporary chats open at once. Each side chat inherits the
 parent conversation up to its last completed turn; the inherited history is
@@ -150,8 +148,8 @@ The bundle has two halves:
   shortcut, the composer strip, the header chip, the row menu item and badge,
   the selection action, the `tempchat` right-sidebar tab, and the hidden-side-chat
   filter. A side chat is a normal `session.fork` plus a
-  `tempSession/register(kind: "side")` Remote call; promoting it is
-  `tempSession/promote`, which drops the record so cleanup never touches it.
+  `tempSession/register(kind: "side")` Remote call. `tempSession/promote` stays
+  only to refuse stale callers with `promotion is disabled`.
 
 Deletion points:
 
@@ -169,9 +167,9 @@ Safety boundaries:
   subagent Session is refused.
 - A subagent the Host creates under a recorded chat is recorded automatically
   (`kind: "subagent"`) and follows that chat through exit, discard, and unload
-  cleanup. Promoting the chat drops those records. A subagent is recorded only when
-  its parent chain reaches a recorded id through live subagent Sessions. A chain that
-  passes through an ordinary fork, or never reaches a recorded id, is never recorded.
+  cleanup. A discard drops its records. A descendant is recorded only when its
+  parent chain reaches a recorded temporary id through live ordinary forks or
+  subagent Sessions. A chain with no recorded ancestor is never recorded.
 - Deletion only targets a directory whose final path segment contains the
   session id, is absolute, and is nested at least three levels deep.
 - Records are stored under `$DSH_HOME`, and the registry is written atomically.
@@ -222,14 +220,15 @@ written:
 
 ## Verification
 
-- `npm run check`: 43 Host/client tests with no dependencies.
+- `npm run check`: 183 Host/client tests with no dependencies.
 - Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
   (both choices), no sidebar-foot temporary entry, selection action, fork,
   native right-sidebar conversation, quoted draft prefill, hidden sidebar row,
-  promotion, tab-close discard, `SIGTERM` log deletion, and boot cleanup.
+  tab-close discard, `SIGTERM` log deletion, and boot cleanup.
 - Not verified: a real model answer inside a side chat (the test environment had
-  no credentials; the fork was cut from a completed-but-failed turn). The
-  Desktop app uses the same Host and client pieces but was not re-run separately.
+  no credentials; the fork was cut from a completed-but-failed turn), and a
+  stale promote refusal through a real browser or Gateway. The Desktop app uses
+  the same Host and client pieces but was not re-run separately.
 
 ## Development
 
@@ -256,7 +255,7 @@ Source map:
 | `index.js` | Host plugin: services, Remote contribution, boot/signal cleanup |
 | `core.js` | Registry, path safety, async/sync deletion (no Cordis dependency) |
 | `remote.js` | Host Typert Remote descriptors |
-| `client.js` | Browser module: entries, side chat, badge, end/promote actions, notice |
+| `client.js` | Browser module: entries, side chat, badge, end/stopping actions, notice |
 | `cordis.patch.yml` | Bundle layer inserting the Host row |
 | `locale/*.json` | Plugin-manager title and description |
 

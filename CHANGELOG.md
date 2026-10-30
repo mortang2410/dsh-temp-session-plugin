@@ -8,14 +8,34 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A fork made from a temporary chat is temporary at every depth, including a
+  fork of a fork and a fork of a recorded subagent. Its true direct parent is
+  recorded, and a late descendant of a pending tree inherits pending/stopping
+  and is enqueued for a stop.
+- The browser follows the Host publisher epoch and per-response sequence,
+  ignores delayed replies, keeps pending state terminal until the record is
+  dropped, and shows a per-chat stopping entry independent of closed chat views.
 - A subagent child of a recorded temporary chat is recorded when the Host announces it
   (`session/created`), with `kind: "subagent"` and `parentSessionId` (the nearest recorded ancestor).
-  Exit, discard, and unload cleanup delete it with its chat, and `promote()` drops its records so the
-  kept chat's subagent logs survive. A chain that does not reach a recorded id through live Sessions is
-  never recorded. The record shape gains two fields; the file's top-level shape and version are unchanged.
+  Exit, discard, and unload cleanup delete it with its chat. A chain that does not reach a
+  recorded id through live Sessions is never recorded. The record shape gains two fields; the
+  file's top-level shape and version are unchanged.
+
+### Changed
+
+- Promotion is removed. The browser has no promote control, and a stale host
+  `promote()` call is refused with `promotion is disabled`.
+- A side-chat registration upgrades its existing fork record in place to
+  `kind: "side"` and prepares it once.
 
 ### Fixed
 
+- A side-chat upgrade that loses its first title save or final index save now
+  finishes goal detachment, boundary instruction and native title on the next
+  register, including after a reload.
+- A restored pending side tab is retried after its saved layout is adopted, a
+  pending fork selected later in the main view is closed, and a side chat that
+  becomes pending while its fork is in flight is never opened.
 - `register()` now resolves the storage directory and publishes the registry record before the
   session log is materialized. Previously it flushed the log first and saved the record after, so
   a turn persisted during registration was visible while the Session was still unregistered, to
@@ -30,7 +50,7 @@ All notable changes to this project are documented here. The format follows
 - Subagent records of a temporary chat are narrowed and kept longer. A subagent whose parent chain
   passes through a live, unrecorded ordinary (non-subagent) Session is no longer recorded, so discard
   and unload cleanup cannot delete a transcript the chat does not own. A live profile reload keeps a
-  settled child record and its log while the chat stays live, so a later promotion still keeps them.
+  settled child record and its log while the chat stays live, and a later discard deletes them.
   Process exit also deletes a child whose registry save has not finished, because its record is read
   from memory as well as from disk. Discard no longer sends `cancel` to subagent children, which the
   Host refuses: a running child keeps running until it settles, and its record is marked for deletion
@@ -71,13 +91,13 @@ All notable changes to this project are documented here. The format follows
 - Temporary **side chats**: select text in a conversation, click the floating
   action, and a forked copy opens in the right sidebar with the selection
   prefilled as a quote. The fork inherits the parent context and workspace,
-  stays out of the sidebar and search while temporary, and can be **promoted**
-  to a long-term session.
+  stays out of the sidebar and search while temporary. This release also
+  introduced promotion, which Unreleased removes.
 - `tempSession/register` now carries a `kind` (`main` or `side`); the Host
   accepts a fork only when its child-owned tail is unused, clears the inherited
   goal, and adds a side-chat boundary instruction.
-- `tempSession/promote` drops the temporary record so exit and boot cleanup keep
-  the log; the browser renames it from the selection.
+- `tempSession/promote` dropped the temporary record so exit and boot cleanup
+  kept the log; Unreleased removes that path and refuses stale calls.
 
 ### Changed
 

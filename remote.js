@@ -41,6 +41,34 @@ const registerRequest = strict('RegisterRequest', (value) => {
   }
 })
 
+/** Validate a reservation request for a root the Host is about to create. */
+const reserveRequest = strict('ReserveRequest', (value) => {
+  if (value !== undefined && (value === null || typeof value !== 'object')) {
+    throw new Error('temporary session reservation requires an object')
+  }
+  const workspaceId = typeof value?.workspaceId === 'string' && value.workspaceId !== '' ? value.workspaceId : null
+  const cwd = typeof value?.cwd === 'string' && value.cwd !== '' ? value.cwd : null
+  return { workspaceId, cwd }
+})
+
+/** Validate a reservation receipt. */
+const reserveResult = strict('ReserveResult', (value) => {
+  if (value === null
+    || typeof value !== 'object'
+    || typeof value.sessionId !== 'string'
+    || !Number.isSafeInteger(value.at)
+    || (value.workspaceId !== null && typeof value.workspaceId !== 'string')
+    || (value.cwd !== null && typeof value.cwd !== 'string')) {
+    throw new Error('temporary session reservation returned an invalid receipt')
+  }
+  return {
+    sessionId: value.sessionId,
+    workspaceId: value.workspaceId,
+    cwd: value.cwd,
+    at: value.at,
+  }
+})
+
 /** Validate a promotion request and its optional lasting title. */
 const promoteRequest = strict('PromoteRequest', (value) => {
   const base = sessionRequest.create().parse(value)
@@ -132,6 +160,15 @@ const discardResult = strict('DiscardResult', (value) => {
 
 /** Method descriptors shared by the Host contribution and the browser mount. */
 export const tempSessionDescriptors = [
+  {
+    id: 'dsh-temp-session-plugin#tempSession/reserve',
+    service: 'tempSessionsHost',
+    namespace: 'tempSession',
+    method: 'reserve',
+    invocation: { kind: 'direct' },
+    parameters: [{ name: 'request', wire: 'request', source: 'json', codec: reserveRequest }],
+    result: reserveResult,
+  },
   {
     id: 'dsh-temp-session-plugin#tempSession/register',
     service: 'tempSessionsHost',

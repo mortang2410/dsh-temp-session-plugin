@@ -23,6 +23,7 @@ import { appendJournalEvent, replayJournal, writeJournalMarker } from '../journa
 import { Publisher } from '../publisher.js'
 import { readRecord, recordFields } from '../records.js'
 import { tempSessionDescriptors } from '../remote.js'
+import { cleanupAllSync as oldCleanupAllSync } from './fixtures/old-reader-c9e1f51.mjs'
 
 let root
 let stateFile
@@ -203,6 +204,28 @@ test('safe deletion requires the Session id in the leaf directory', () => {
   assert.equal(isSafeSessionDir(undefined, 'session-abc'), false)
 })
 
+test('the old reader deletes a new fork record', async () => {
+  const parent = fakeSession('session-old-reader-parent')
+  const fork = fakeSession('session-old-reader-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 2,
+  })
+  const forkDir = await materializeSession(fork.id)
+  await writeRegistry({
+    [fork.id]: {
+      sessionId: fork.id,
+      dir: forkDir,
+      cwd: fork.header.cwd,
+      createdAt: 2,
+      title: 'temporary',
+      kind: 'fork',
+      parentSessionId: parent.id,
+      pendingDelete: false,
+    },
+  })
+  assert.equal(oldCleanupAllSync(stateFile), 1)
+  assert.equal(existsSync(forkDir), false)
+})
+
 test('register stores a fresh Session, titles it, and lists it', async () => {
   const session = fakeSession('session-register')
   const h = harness({ sessions: new Map([[session.id, session]]) })
@@ -344,18 +367,6 @@ test('discard marks the record and cancels running work', async () => {
   assert.equal(listed[0].pendingDelete, true)
 })
 
-test('promote drops the record and renames the lasting Session', async () => {
-  const session = fakeSession('session-promote')
-  const h = harness({ sessions: new Map([[session.id, session]]) })
-  await h.temp.register({ sessionId: session.id, title: '临时会话 · 10:02' })
-  assert.deepEqual(await h.temp.promote({ sessionId: session.id, title: '保留的会话' }), { promoted: true })
-  assert.deepEqual(h.renames, ['临时会话 · 10:02', '保留的会话'])
-  assert.deepEqual((await h.temp.list()).sessions, [])
-  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
-  assert.equal(saved.sessions[session.id], undefined)
-  await assert.rejects(h.temp.promote({ sessionId: 'other' }), /not a recorded/)
-})
-
 test('reap deletes non-live leftovers and keeps live Sessions', async () => {
   const dead = fakeSession('session-dead')
   const alive = fakeSession('session-alive')
@@ -492,6 +503,19 @@ async function chatWithChild() {
   return { h, chat, child }
 }
 
+/** Observe side-chat goal clearing and boundary instruction installation. */
+function observeSidePreparation(h, sessionId, sections, cleared) {
+  h.deps.agents = {
+    get: id => (id === sessionId
+      ? { status: 'idle', ctx: { systemPrompt: { section: value => sections.push(value) } } }
+      : undefined),
+  }
+  h.deps.goals = {
+    get: () => ({ id: 'goal-inherited', revision: 3 }),
+    clear: (_agent, request) => { cleared.push(request) },
+  }
+}
+
 test('a recorded chat records its announced subagent and post-migration fork', async () => {
   const chat = fakeSession('session-chat')
   const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
@@ -534,7 +558,7 @@ test('a subagent record is not a chat: it is not listed, adopted, discarded, or 
   assert.deepEqual((await h.temp.list()).sessions.map(item => item.sessionId), [chat.id])
   await assert.rejects(h.temp.register({ sessionId: child.id }), /subagent/)
   await assert.rejects(h.temp.discard({ sessionId: child.id }), /not a recorded/)
-  await assert.rejects(h.temp.promote({ sessionId: child.id }), /not a recorded/)
+  await assert.rejects(h.temp.promote({ sessionId: child.id }), /promotion is disabled/)
 })
 
 test('a subagent under an unrecorded live ancestor is recorded with its true direct parent', async () => {
@@ -584,16 +608,37 @@ test('a child recorded after its chat was discarded inherits the pending deletio
   assert.equal(saved.sessions[late.id].pendingDelete, true)
 })
 
-test('promote drops the chat and its child records, so a later exit keeps the child log', async () => {
+test('a late fork inherits pending', async () => {
+  const chat = fakeSession('session-late-fork-chat')
+  const late = fakeSession('session-late-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [late.id, late]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.discard({ sessionId: chat.id })
+  const cancellations = []
+  h.deps.agents = {
+    get: id => (id === late.id
+      ? { status: 'running', cancel: request => cancellations.push(request) }
+      : undefined),
+  }
+  await h.temp.recordDescendant(late)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[late.id].pendingDelete, true)
+  assert.deepEqual(cancellations, [{ kind: 'user' }])
+})
+
+test('a stale promote call is refused', async () => {
+  assert.ok(tempSessionDescriptors.some(descriptor => descriptor.method === 'promote'))
   const { h, chat, child } = await chatWithChild()
   const chatDir = await materializeSession(chat.id)
   const childDir = await materializeSession(child.id)
-  await h.temp.promote({ sessionId: chat.id })
+  await assert.rejects(h.temp.promote({ sessionId: chat.id }), /promotion is disabled/)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
-  assert.deepEqual(saved.sessions, {})
-  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
-  assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.deepEqual(Object.keys(saved.sessions).sort(), [chat.id, child.id].sort())
+  assert.deepEqual(h.temp.exitSnapshot().sessions.map(item => item.sessionId).sort(), [chat.id, child.id].sort())
   assert.equal(await readFile(join(chatDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 })
 
 test('boot reap deletes a child whose parent record is gone, and drops a child whose directory is gone', async () => {
@@ -625,7 +670,7 @@ test('boot reap deletes a child whose parent record is gone, and drops a child w
   assert.deepEqual(JSON.parse(await readFile(stateFile, 'utf8')).sessions, {})
 })
 
-test('a recorded fork owns its subagent, and the whole tree is temporary', async () => {
+test('a subagent under a fork belongs to the fork', async () => {
   const chat = fakeSession('session-chat')
   // The fork is a live descendant of the chat and is announced before its child.
   const fork = fakeSession('session-plain-fork', {
@@ -652,7 +697,55 @@ test('a recorded fork owns its subagent, and the whole tree is temporary', async
   }
 })
 
-test('reap keeps a settled child while its live chat stays, through every depth, and promotion keeps its log', async () => {
+test('a fork of a fork is temporary', async () => {
+  const chat = fakeSession('session-depth-chat')
+  const fork = fakeSession('session-depth-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const forkOfFork = fakeSession('session-depth-fork2', {
+    parentSession: fork.id, isSeeded: true, createdAt: Date.now() + 2000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork], [forkOfFork.id, forkOfFork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  await h.temp.recordDescendant(forkOfFork)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[forkOfFork.id].kind, 'fork')
+  assert.equal(saved.sessions[forkOfFork.id].parentSessionId, fork.id)
+  assert.deepEqual(h.temp.descendantRecords(chat.id).map(item => item.sessionId).sort(), [fork.id, forkOfFork.id].sort())
+})
+
+test('a fork of a subagent is temporary', async () => {
+  const chat = fakeSession('session-sub-fork-chat')
+  const subagent = fakeSession('session-sub-fork-agent', {
+    origin: 'subagent', parentSession: chat.id, createdAt: Date.now(),
+  })
+  const fork = fakeSession('session-sub-fork-child', {
+    parentSession: subagent.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [subagent.id, subagent], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(subagent)
+  await h.temp.recordDescendant(fork)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[fork.id].kind, 'fork')
+  assert.equal(saved.sessions[fork.id].parentSessionId, subagent.id)
+  assert.ok((await journalLines()).some(event => event.type === 'owned' && event.sessionId === fork.id))
+})
+
+test('a fork of a permanent chat is left alone', async () => {
+  const permanent = fakeSession('session-permanent-parent')
+  const fork = fakeSession('session-permanent-fork', {
+    parentSession: permanent.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[permanent.id, permanent], [fork.id, fork]]) })
+  await h.temp.recordDescendant(fork)
+  assert.equal(h.temp.state.sessions[fork.id], undefined)
+  assert.equal((await journalLines()).some(event => event.sessionId === fork.id), false)
+  assert.ok(warnings.some(message => message.includes('no journal anchor')))
+})
+
+test('reap keeps a settled child while its live chat stays, through every depth', async () => {
   const chat = fakeSession('session-chat')
   const middle = fakeSession('session-middle', { origin: 'subagent', parentSession: chat.id })
   const leaf = fakeSession('session-leaf', { origin: 'subagent', parentSession: middle.id })
@@ -667,9 +760,6 @@ test('reap keeps a settled child while its live chat stays, through every depth,
   await h.temp.reap()
   const kept = JSON.parse(await readFile(stateFile, 'utf8'))
   assert.deepEqual(Object.keys(kept.sessions).sort(), ['session-chat', 'session-leaf', 'session-middle'])
-  assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
-  await h.temp.promote({ sessionId: chat.id })
-  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
   assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 })
 
@@ -2004,6 +2094,236 @@ test('a legacy side row keeps its side kind through migration and exit cleanup',
   assert.deepEqual(h.temp.exitSnapshot().sessions.map(item => item.sessionId), [side.id])
   assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 1)
   await assert.rejects(readFile(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
+})
+
+test('a kind-less record is migrated from its header', async () => {
+  const source = fakeSession('session-kindless-source', { createdAt: 1 })
+  const fork = fakeSession('session-kindless-fork', {
+    isSeeded: true, parentSession: source.id, createdAt: 2,
+  })
+  await materializeSession(fork.id)
+  const legacy = legacyRecord(fork, 'fork', source.id)
+  delete legacy.kind
+  await writeRegistry({ [fork.id]: legacy })
+  const h = harness({ stored: [source.header, fork.header] })
+  await h.temp.load()
+  const owned = (await journalLines()).find(event => event.type === 'owned' && event.sessionId === fork.id)
+  assert.equal(owned.kind, 'fork')
+  const listed = await h.temp.list()
+  assert.equal(listed.sessions.find(item => item.sessionId === fork.id)?.kind, 'fork')
+})
+
+test('a fork upgraded to a side chat reloads as a side chat', async () => {
+  const chat = fakeSession('session-side-upgrade-chat')
+  const fork = fakeSession('session-side-upgrade-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  const sections = []
+  h.deps.agents = {
+    get: id => (id === fork.id
+      ? { status: 'idle', ctx: { systemPrompt: { section: value => sections.push(value) } } }
+      : undefined),
+  }
+  await h.temp.discard({ sessionId: chat.id })
+  const upgraded = await h.temp.register({
+    sessionId: fork.id, kind: 'side', title: 'Side title',
+  })
+  assert.equal(upgraded.kind, 'side')
+  assert.equal(upgraded.pendingDelete, true)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[fork.id].kind, 'side')
+  assert.equal(saved.sessions[fork.id].title, 'Side title')
+  assert.equal(saved.sessions[fork.id].pendingDelete, true)
+  const owned = (await journalLines()).filter(event => event.type === 'owned' && event.sessionId === fork.id)
+  assert.equal(owned.at(-1).kind, 'side')
+  assert.equal(sections.length, 1)
+  await h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' })
+  assert.equal(sections.length, 1)
+  const reloaded = new TemporarySessions(h.deps)
+  await reloaded.load()
+  const listed = (await reloaded.list()).sessions.find(item => item.sessionId === fork.id)
+  assert.equal(listed.kind, 'side')
+  assert.equal(listed.pendingDelete, true)
+})
+
+test('a side-chat upgrade heals an interrupted index save', async () => {
+  const chat = fakeSession('session-side-heal-chat')
+  const fork = fakeSession('session-side-heal-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  saved.sessions[fork.id].title = 'Interrupted side title'
+  await writeRegistry(saved.sessions)
+  await appendJournalEvent(journalFile, {
+    type: 'owned',
+    sessionId: fork.id,
+    kind: 'side',
+    parentSessionId: chat.id,
+    dir: sessionDirOf(fork.id),
+    cwd: fork.header.cwd,
+    at: Date.now(),
+  })
+  const reloaded = new TemporarySessions(h.deps)
+  await reloaded.load()
+  assert.equal(reloaded.state.sessions[fork.id].kind, 'side')
+  assert.equal(reloaded.state.sessions[fork.id].title, 'Interrupted side title')
+  assert.deepEqual(
+    reloaded.exitSnapshot().sessions.map(item => item.sessionId).sort(),
+    [chat.id, fork.id].sort(),
+  )
+})
+
+test('a side-chat upgrade completes after a failed index save', async () => {
+  const chat = fakeSession('session-side-retry-chat')
+  const fork = fakeSession('session-side-retry-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  const sections = []
+  const cleared = []
+  observeSidePreparation(h, fork.id, sections, cleared)
+  const save = h.temp.save.bind(h.temp)
+  let saves = 0
+  h.temp.save = async () => {
+    saves += 1
+    if (saves === 2) throw new Error('injected final side save failure')
+    return save()
+  }
+  await assert.rejects(
+    h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' }),
+    /injected final side save failure/,
+  )
+  assert.equal(saves, 2)
+  assert.equal(h.temp.state.sessions[fork.id].kind, 'side')
+  assert.deepEqual(sections, [])
+  assert.deepEqual(cleared, [])
+
+  const upgraded = await h.temp.register({
+    sessionId: fork.id, kind: 'side', title: 'Side title',
+  })
+  assert.equal(upgraded.kind, 'side')
+  assert.equal(saves, 3)
+  assert.deepEqual(cleared, [{ id: 'goal-inherited', revision: 3 }])
+  assert.equal(sections.length, 1)
+  assert.deepEqual(h.renames, ['Side title'])
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[fork.id].kind, 'side')
+  assert.equal(saved.sessions[fork.id].title, 'Side title')
+
+  // A later register does not apply the boundary or title a second time.
+  await h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' })
+  assert.equal(saves, 3)
+  assert.equal(sections.length, 1)
+  assert.deepEqual(h.renames, ['Side title'])
+
+  // A changed requested title republishes the native title once.
+  await h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Second title' })
+  assert.deepEqual(h.renames, ['Side title', 'Second title'])
+  assert.equal(sections.length, 1)
+})
+
+test('side preparation retries after an Agent becomes available', async () => {
+  const chat = fakeSession('session-side-agent-chat')
+  const fork = fakeSession('session-side-agent-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  await h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' })
+  const sections = []
+  h.deps.agents = {
+    get: id => (id === fork.id
+      ? { status: 'idle', ctx: { systemPrompt: { section: value => sections.push(value) } } }
+      : undefined),
+  }
+  await h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' })
+  assert.equal(sections.length, 1)
+  await h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' })
+  assert.equal(sections.length, 1)
+})
+
+test('a failed side title save is retried before the side journal event', async () => {
+  const chat = fakeSession('session-side-title-chat')
+  const fork = fakeSession('session-side-title-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  const save = h.temp.save.bind(h.temp)
+  let firstSave = true
+  h.temp.save = async () => {
+    if (firstSave) {
+      firstSave = false
+      throw new Error('injected pre-save failure')
+    }
+    if (h.temp.state.sessions[fork.id]?.kind === 'side') {
+      throw new Error('injected final save failure')
+    }
+    return save()
+  }
+  await assert.rejects(
+    h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' }),
+    /injected pre-save failure/,
+  )
+  // The failed mutation is not treated as persisted state on the retry.
+  assert.equal(h.temp.state.sessions[fork.id].title, '')
+  await assert.rejects(
+    h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' }),
+    /injected final save failure/,
+  )
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[fork.id].kind, 'fork')
+  assert.equal(saved.sessions[fork.id].title, 'Side title')
+  const reloaded = new TemporarySessions(h.deps)
+  await reloaded.load()
+  assert.equal(reloaded.state.sessions[fork.id].kind, 'side')
+  assert.equal(reloaded.state.sessions[fork.id].title, 'Side title')
+})
+
+test('a reloaded side chat completes preparation on the next register', async () => {
+  const chat = fakeSession('session-side-reload-chat')
+  const fork = fakeSession('session-side-reload-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
+  const sections = []
+  const cleared = []
+  observeSidePreparation(h, fork.id, sections, cleared)
+  const save = h.temp.save.bind(h.temp)
+  let saves = 0
+  h.temp.save = async () => {
+    saves += 1
+    if (saves === 2) throw new Error('injected final side save failure')
+    return save()
+  }
+  await assert.rejects(
+    h.temp.register({ sessionId: fork.id, kind: 'side', title: 'Side title' }),
+    /injected final side save failure/,
+  )
+  const reloaded = new TemporarySessions(h.deps)
+  await reloaded.load()
+  assert.equal(reloaded.state.sessions[fork.id].kind, 'side')
+  assert.deepEqual(sections, [])
+
+  await reloaded.register({ sessionId: fork.id, kind: 'side', title: 'Side title' })
+  assert.deepEqual(cleared, [{ id: 'goal-inherited', revision: 3 }])
+  assert.equal(sections.length, 1)
+  assert.deepEqual(h.renames, ['Side title'])
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[fork.id].kind, 'side')
+  assert.equal(saved.sessions[fork.id].title, 'Side title')
 })
 
 test('a child announced while the first migration is deferred is adopted on restart', async () => {
