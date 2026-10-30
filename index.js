@@ -67,7 +67,7 @@ export async function apply(ctx) {
   // immutable validated snapshot and never parses the registry file; the
   // binding deliberately outlives an unload, so an unloaded plugin still
   // deletes the Sessions it validated.
-  installExitCleanup(() => temp.exitSnapshot(), log)
+  installExitCleanup(() => temp.exitSnapshot(), log, paths.journal, () => temp.closeAdmission())
 
   /**
    * Host service behind the `tempSession` Remote namespace. Methods are

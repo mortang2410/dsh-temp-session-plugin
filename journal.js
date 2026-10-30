@@ -278,13 +278,15 @@ function syncDirectory(path) {
 }
 
 /**
- * Append one event and make it durable before returning.
+ * Append one event and make it durable before returning. This synchronous form
+ * is the one the process exit and signal handlers can use: no promise can
+ * settle after those handlers begin.
  * @param {string} file - journal path.
  * @param {object} event - event to append; validated first.
- * @returns {Promise<{ line: string, event: object }>} the serialized line.
+ * @returns {{ line: string, event: object }} the serialized line.
  * @throws {TypeError} for an invalid event, and the write failure itself.
  */
-export async function appendJournalEvent(file, event) {
+export function appendJournalEventSync(file, event) {
   const normalized = validateJournalEvent(event)
   if (normalized === undefined) throw new TypeError('refusing to append an invalid ownership-journal event')
   const line = `${JSON.stringify(normalized)}\n`
@@ -308,6 +310,17 @@ export async function appendJournalEvent(file, event) {
     throw new Error('could not fsync the ownership-journal directory')
   }
   return { line, event: normalized }
+}
+
+/**
+ * Append one event and make it durable before returning.
+ * @param {string} file - journal path.
+ * @param {object} event - event to append; validated first.
+ * @returns {Promise<{ line: string, event: object }>} the serialized line.
+ * @throws {TypeError} for an invalid event, and the write failure itself.
+ */
+export async function appendJournalEvent(file, event) {
+  return appendJournalEventSync(file, event)
 }
 
 /**

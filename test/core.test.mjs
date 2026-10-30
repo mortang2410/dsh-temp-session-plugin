@@ -1072,6 +1072,546 @@ test('a torn journal line is repaired before the next append', async () => {
   assert.equal(raw.includes('session-torn"'), false)
 })
 
+test('replay folds the journal', async () => {
+  const at = 7000
+  const dir = join(root, 'sessions', 'project', 'session-fold')
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: 'session-fold', kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: ['session-fold'], reason: 'discard', at: at + 1 })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: 'session-fold', kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: at + 2,
+  })
+  const replay = replayJournal(await readFile(journalFile, 'utf8'))
+  assert.equal(replay.degraded, false)
+  assert.deepEqual(replay.entries['session-fold'], {
+    sessionId: 'session-fold',
+    kind: 'main',
+    parentSessionId: null,
+    dir,
+    cwd: '/tmp/project',
+    ownedAt: at,
+    pending: true,
+    pendingReason: 'discard',
+    deleted: true,
+    deletedAt: at + 2,
+    deletedDir: dir,
+    deletedCwd: '/tmp/project',
+  })
+})
+
+test('the folded state survives compaction', async () => {
+  const old = Date.now() - 31 * 24 * 60 * 60 * 1000
+  const chat = fakeSession('session-folded', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: old,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: chat.header.cwd, at: old,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [chat.id], reason: 'discard', at: old })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: chat.header.cwd, at: old,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: old })
+  const h = harness({ stored: [chat.header] })
+  await h.temp.load()
+  await h.temp.pruneJournal(new Map())
+  const lines = await journalLines()
+  assert.deepEqual(
+    lines
+      .filter(event => event.sessionId === chat.id || event.sessionIds?.includes(chat.id))
+      .map(event => event.type),
+    ['owned', 'pending', 'deleted'],
+  )
+  assert.equal(h.temp.journal.entries[chat.id].deletedDir, dir)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  const restarted = harness({ stored: [] })
+  await restarted.temp.load()
+  assert.equal(restarted.temp.journal.entries[chat.id].deleted, true)
+  assert.equal(restarted.temp.journal.entries[chat.id].deletedDir, dir)
+})
+
+test('a corrupt registry does not resurrect a discarded tree', async () => {
+  const parent = fakeSession('session-corrupt-parent', { createdAt: 1 })
+  const child = fakeSession('session-corrupt-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const parentDir = await materializeSession(parent.id)
+  const childDir = await materializeSession(child.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null, dir: parentDir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [parent.id], reason: 'discard', at: 102 })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(stateFile, '{not json')
+  const h = harness({ stored: [parent.header, child.header] })
+  await h.temp.load()
+  assert.equal(h.temp.registryDegraded, true)
+  assert.equal(h.temp.state.sessions[parent.id].pendingDelete, true)
+  assert.equal(h.temp.state.sessions[child.id].pendingDelete, true)
+  assert.deepEqual((await h.temp.list()).stopping.map(item => item.sessionId), [parent.id])
+  assert.equal(existsSync(join(parentDir, 'session.v4.jsonl.zstd')), true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a deleted target must agree', async () => {
+  const chat = fakeSession('session-target', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  const other = join(root, 'sessions', 'project', 'session-other-target')
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir: other, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const h = harness({ stored: [chat.header] })
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('disagrees with its owned event')))
+})
+
+test('a deleted target must agree with its stored header', async () => {
+  const chat = fakeSession('session-header-target', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const mismatched = fakeSession(chat.id, { cwd: '/tmp/other-project', createdAt: 1 })
+  const h = harness({ stored: [mismatched.header] })
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('stored header')))
+})
+
+test('an interrupted delete finishes only from a trustworthy target', async () => {
+  const old = Date.now() - 31 * 24 * 60 * 60 * 1000
+  const chat = fakeSession('session-old-interrupted', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  const permanent = fakeSession('session-permanent-control', { createdAt: 1 })
+  const permanentDir = await materializeSession(permanent.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: old,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: old,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: old,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: old })
+  const h = harness({ stored: [] })
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+  assert.equal(existsSync(join(permanentDir, 'session.v4.jsonl.zstd')), true)
+  assert.equal((await journalLines()).some(event => event.sessionId === chat.id), false)
+
+  const unsafe = fakeSession('session-unsafe-target', { createdAt: 1 })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: unsafe.id, kind: 'main', parentSessionId: null, dir: '/tmp', cwd: '/tmp', at: old,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: unsafe.id, kind: 'main', parentSessionId: null, dir: '/tmp', cwd: '/tmp', at: old,
+  })
+  const second = harness({ stored: [] })
+  await second.temp.reap()
+  assert.ok(warnings.some(message => message.includes('journal target is unsafe')))
+  assert.equal(existsSync('/tmp'), true)
+})
+
+test('a malformed parseable owned event is rejected', async () => {
+  const control = fakeSession('session-malformed-control', { createdAt: 1 })
+  const dir = await materializeSession(control.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [control.id], preexisting: [control.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: control.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: control.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  await writeFile(journalFile, `${await readFile(journalFile, 'utf8')}{"type":"owned","sessionId":"session-malformed-control","kind":"bogus","dir":"${dir}","cwd":"/tmp/project","at":104}\n`)
+  const h = harness({ stored: [control.header] })
+  await h.temp.reap()
+  assert.equal(h.temp.journalDegraded, true)
+  assert.equal(h.temp.exitSnapshot().degraded, true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a corrupt or semantic journal error blocks deletion', async () => {
+  const control = fakeSession('session-semantic-control', { createdAt: 1 })
+  const dir = await materializeSession(control.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [control.id], preexisting: [control.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: control.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: control.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  await writeFile(journalFile, `${await readFile(journalFile, 'utf8')}{"type":"pending","sessionIds":["session-never-owned"],"reason":"discard","at":104}\n`)
+  const h = harness({ stored: [control.header] })
+  await h.temp.reap()
+  assert.equal(h.temp.journalDegraded, true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a missing migration event degrades the journal', async () => {
+  const control = fakeSession('session-no-migration', { createdAt: 1 })
+  const dir = await materializeSession(control.id)
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: control.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 102 })
+  const h = harness({ stored: [control.header] })
+  await h.temp.reap()
+  assert.equal(h.temp.journalDegraded, true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a held writer is repaired at next start', () => withFreshProcessCleanup(async () => {
+  const chat = fakeSession('session-held-writer', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const before = new Set(process.listeners('SIGTERM'))
+  const kill = process.kill
+  let reraised
+  try {
+    process.kill = (_pid, signal) => { reraised = signal; return true }
+    installExitCleanup(() => h.temp.exitSnapshot(), h.deps.logger, journalFile)
+    const handler = process.listeners('SIGTERM').find(listener => !before.has(listener))
+    assert.ok(handler)
+    handler('SIGTERM')
+  } finally {
+    process.kill = kill
+  }
+  assert.equal(reraised, 'SIGTERM')
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+  // The writer still recreates the transcript after the signal cleanup.
+  await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: Date.now(),
+  })
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  const restarted = harness({ stored: [chat.header] })
+  await restarted.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+  assert.equal(restarted.temp.journal.entries[chat.id].deleted, true)
+}))
+
+test('the marker separates a first install from a removed journal', async () => {
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(markerFile, JSON.stringify({ version: 1, migrationAt: 1, completedAt: 2 }))
+  const h = harness()
+  await h.temp.load()
+  assert.equal(h.temp.journalDegraded, true)
+  await h.temp.reap()
+  assert.equal(existsSync(journalFile), false)
+})
+
+test('a clean install runs the first migration', async () => {
+  const h = harness()
+  await h.temp.load()
+  const lines = await journalLines()
+  assert.deepEqual(lines.map(event => event.type), ['migration', 'migrationComplete'])
+  assert.equal(h.temp.migrationIncomplete, false)
+})
+
+test('a torn migrationComplete is accepted from a valid marker', async () => {
+  const chat = fakeSession('session-torn-marker', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  const migration = {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  }
+  const owned = {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  }
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(journalFile, `${JSON.stringify(migration)}\n${JSON.stringify(owned)}\n{"type":"migrationComplete","at":102`)
+  await writeFile(markerFile, JSON.stringify({ version: 1, migrationAt: 100, completedAt: 102 }))
+  const h = harness({ stored: [chat.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journalDegraded, false)
+  assert.equal(h.temp.journal.torn, false)
+  assert.equal(h.temp.migrationIncomplete, false)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a signal append failure blocks deletion', () => withFreshProcessCleanup(async () => {
+  const chat = fakeSession('session-signal-failure', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const badJournal = join(stateDir, 'signal-bad-journal')
+  await mkdir(badJournal, { recursive: true })
+  const before = new Set(process.listeners('SIGTERM'))
+  const kill = process.kill
+  let reraised
+  try {
+    process.kill = (_pid, signal) => { reraised = signal; return true }
+    installExitCleanup(() => h.temp.exitSnapshot(), h.deps.logger, badJournal)
+    const handler = process.listeners('SIGTERM').find(listener => !before.has(listener))
+    assert.ok(handler)
+    handler('SIGTERM')
+  } finally {
+    process.kill = kill
+  }
+  assert.equal(reraised, 'SIGTERM')
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.equal((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id), false)
+}))
+
+test('the installed signal handler tombstones before re-raising', async () => {
+  const chat = fakeSession('session-signal-handler', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  const before = Object.fromEntries(['exit', 'SIGTERM', 'SIGINT'].map(name => [name, new Set(process.listeners(name))]))
+  const keys = [Symbol.for('dsh.temp-session.process-cleanup'), Symbol.for('dsh.temp-session.exit-snapshot')]
+  const saved = new Map(keys.map(key => [key, globalThis[key]]))
+  const kill = process.kill
+  let reraised
+  let tombstoneAtRaise = false
+  let closed = false
+  try {
+    process.kill = (_pid, signal) => {
+      reraised = signal
+      const text = existsSync(journalFile) ? fs.readFileSync(journalFile, 'utf8') : ''
+      tombstoneAtRaise = text.split('\n').some(line => {
+        if (line === '') return false
+        try {
+          const event = JSON.parse(line)
+          return event.type === 'deleted' && event.sessionId === chat.id
+        } catch {
+          return false
+        }
+      })
+      return true
+    }
+    installExitCleanup(
+      () => ({
+        degraded: false,
+        sessions: [{ sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project' }],
+      }),
+      { warn: () => {} },
+      journalFile,
+      () => { closed = true },
+    )
+    const handler = process.listeners('SIGTERM').find(listener => !before.SIGTERM.has(listener))
+      ?? process.listeners('SIGTERM').find(listener => listener.name === 'onSignal')
+    assert.ok(handler)
+    handler('SIGTERM')
+    assert.equal(closed, true)
+    assert.equal(reraised, 'SIGTERM')
+    assert.equal(tombstoneAtRaise, true)
+    assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+    assert.ok((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id))
+  } finally {
+    process.kill = kill
+    for (const name of ['exit', 'SIGTERM', 'SIGINT']) {
+      for (const listener of process.listeners(name)) {
+        if (!before[name].has(listener)) process.off(name, listener)
+      }
+    }
+    for (const [key, value] of saved) {
+      if (value === undefined) delete globalThis[key]
+      else globalThis[key] = value
+    }
+  }
+})
+
+test('an exit fsync failure deletes nothing', () => withFreshProcessCleanup(async () => {
+  const chat = fakeSession('session-exit-fsync-failure', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const original = fs.fsyncSync
+  const before = new Set(process.listeners('SIGTERM'))
+  const kill = process.kill
+  let reraised
+  try {
+    fs.fsyncSync = () => { throw new Error('fsync failed') }
+    syncBuiltinESMExports()
+    process.kill = (_pid, signal) => { reraised = signal; return true }
+    installExitCleanup(() => h.temp.exitSnapshot(), h.deps.logger, journalFile)
+    const handler = process.listeners('SIGTERM').find(listener => !before.has(listener))
+    assert.ok(handler)
+    handler('SIGTERM')
+  } finally {
+    process.kill = kill
+    fs.fsyncSync = original
+    syncBuiltinESMExports()
+  }
+  assert.equal(reraised, 'SIGTERM')
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id))
+  const restarted = harness({ stored: [chat.header] })
+  await restarted.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+}))
+
+test('the process exit event deletes nothing on fsync failure', () => withFreshProcessCleanup(async addedExitListeners => {
+  const chat = fakeSession('session-exit-event-fsync-failure', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const original = fs.fsyncSync
+  try {
+    fs.fsyncSync = () => { throw new Error('fsync failed') }
+    syncBuiltinESMExports()
+    installExitCleanup(() => h.temp.exitSnapshot(), h.deps.logger, journalFile)
+    const listener = addedExitListeners()[0]
+    assert.ok(listener)
+    listener()
+  } finally {
+    fs.fsyncSync = original
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id))
+  const restarted = harness({ stored: [chat.header] })
+  await restarted.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+}))
+
+test('closing admission refuses new temporary writes', async () => {
+  const chat = fakeSession('session-admission', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  h.temp.closeAdmission()
+  await assert.rejects(h.temp.register({ sessionId: chat.id }), /admission is closed/)
+})
+
+test('exit cleanup writes its tombstone before removal', async () => {
+  const chat = fakeSession('session-exit-tombstone', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const snapshot = h.temp.exitSnapshot()
+  const later = fakeSession('session-after-snapshot', { createdAt: 2 })
+  h.live.set(later.id, later)
+  await h.temp.register({ sessionId: later.id })
+  const laterDir = await materializeSession(later.id)
+  assert.equal(cleanupSnapshotSync(snapshot, h.deps.logger, journalFile), 1)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+  assert.equal(existsSync(join(laterDir, 'session.v4.jsonl.zstd')), true)
+  assert.ok((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id))
+})
+
+test('a journal failure blocks ordinary exit', async () => {
+  const chat = fakeSession('session-exit-failure', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  const badJournal = join(stateDir, 'not-a-journal')
+  await mkdir(badJournal, { recursive: true })
+  assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot(), h.deps.logger, badJournal), 0)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('a signal leaves a finishable journal', async () => {
+  const chat = fakeSession('session-signal', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: Date.now(),
+  })
+  const restarted = harness({ stored: [chat.header] })
+  await restarted.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('unload deletes only idle pending members', async () => {
+  const ended = fakeSession('session-unload-ended', { createdAt: 1 })
+  const registry = { running: [ended.id] }
+  const h = harness({ sessions: new Map([[ended.id, ended]]), registry })
+  await h.temp.register({ sessionId: ended.id })
+  const dir = await materializeSession(ended.id)
+  await h.temp.discard({ sessionId: ended.id })
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  registry.running = []
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('an announcement before prune keeps its anchor', async () => {
+  const parent = fakeSession('session-queue-parent', { createdAt: 1 })
+  const child = fakeSession('session-queue-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const dir = await materializeSession(parent.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id, child.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 102 })
+  const h = harness({ stored: [parent.header, child.header] })
+  h.temp.pending.push(child)
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.equal(h.temp.state.sessions[parent.id].pendingDelete, false)
+  assert.ok((await journalLines()).some(event => event.type === 'owned' && event.sessionId === parent.id))
+})
+
+test('pruning keeps every needed entry', async () => {
+  const now = Date.now()
+  const old = now - 31 * 24 * 60 * 60 * 1000
+  const parent = fakeSession('session-prune-parent', { createdAt: 1 })
+  const child = fakeSession('session-prune-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
+  const reserved = 'session-prune-reserved'
+  const dropped = 'session-prune-dropped'
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id], at: now,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null, dir: join(root, 'sessions', 'project', parent.id), cwd: '/tmp/project', at: now,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [parent.id], reason: 'discard', at: now })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id, dir: join(root, 'sessions', 'project', child.id), cwd: '/tmp/project', at: now,
+  })
+  await appendJournalEvent(journalFile, { type: 'reserved', sessionId: reserved, workspaceId: null, cwd: null, at: now })
+  await appendJournalEvent(journalFile, { type: 'reserved', sessionId: dropped, workspaceId: null, cwd: null, at: now })
+  await appendJournalEvent(journalFile, { type: 'reservationDropped', sessionId: dropped, at: now })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: 'session-prune-old', kind: 'main', parentSessionId: null, dir: join(root, 'sessions', 'project', 'session-prune-old'), cwd: null, at: old,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: 'session-prune-young', kind: 'main', parentSessionId: null, dir: join(root, 'sessions', 'project', 'session-prune-young'), cwd: null, at: now,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: now })
+  const h = harness({ sessions: new Map([[reserved, fakeSession(reserved, { createdAt: 1 })]]) })
+  await h.temp.load()
+  await h.temp.pruneJournal(new Map([[child.id, child.header]]))
+  const lines = await journalLines()
+  assert.deepEqual(lines.filter(event => event.type === 'migration' || event.type === 'migrationComplete').length, 2)
+  assert.ok(lines.some(event => event.type === 'owned' && event.sessionId === parent.id))
+  assert.ok(lines.some(event => event.type === 'pending' && event.sessionIds.includes(parent.id)))
+  assert.ok(lines.some(event => event.type === 'owned' && event.sessionId === child.id))
+  assert.ok(lines.some(event => event.type === 'reserved' && event.sessionId === reserved))
+  assert.equal(lines.some(event => event.sessionId === dropped), false)
+  assert.equal(lines.some(event => event.sessionId === 'session-prune-old'), false)
+  assert.ok(lines.some(event => event.sessionId === 'session-prune-young'))
+})
+
 test('the reservation precedes and matches the create', async () => {
   const stored = []
   const h = harness({ stored })
@@ -1587,6 +2127,256 @@ test('boot cleanup leaves an already-deleted live subagent transcript', async ()
   assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
 })
 
+test('reap rechecks liveness after the deleted append', async () => {
+  const chat = fakeSession('session-live-after-append', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 102 })
+  const h = harness({ stored: [chat.header] })
+  await h.temp.load()
+  const append = h.temp.appendEvent.bind(h.temp)
+  h.temp.appendEvent = async (event) => {
+    const result = await append(event)
+    if (event.type === 'deleted') h.live.set(chat.id, chat)
+    return result
+  }
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('became live during deletion')))
+  assert.ok(h.temp.state.sessions[chat.id])
+})
+
+test('reap keeps an Agent that becomes live during the deleted append', async () => {
+  const chat = fakeSession('session-agent-live-after-append', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 102 })
+  const h = harness({ stored: [chat.header] })
+  let agentLive = false
+  h.deps.agents = {
+    get: id => (id === chat.id && agentLive ? { status: 'running' } : undefined),
+  }
+  const append = h.temp.appendEvent.bind(h.temp)
+  h.temp.appendEvent = async event => {
+    const result = await append(event)
+    if (event.type === 'deleted') agentLive = true
+    return result
+  }
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('Session or Agent became live during deletion')))
+  assert.ok(h.temp.state.sessions[chat.id])
+})
+
+test('a tombstone keeps a Session that becomes live during its header check', async () => {
+  const chat = fakeSession('session-live-during-tombstone-stat', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const h = harness({ stored: [chat.header] })
+  h.deps.sessionPersistence.list = async () => []
+  const stat = h.deps.sessionPersistence.stat
+  h.deps.sessionPersistence.stat = async id => {
+    const snapshot = await stat(id)
+    if (id === chat.id) h.live.set(chat.id, chat)
+    return snapshot
+  }
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('became live during its header check')))
+})
+
+test('a tombstone keeps an Agent that becomes live during its header check', async () => {
+  const chat = fakeSession('session-agent-live-during-tombstone-stat', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const h = harness({ stored: [chat.header] })
+  h.deps.sessionPersistence.list = async () => []
+  let agentLive = false
+  h.deps.agents = {
+    get: id => (id === chat.id && agentLive ? { status: 'running' } : undefined),
+  }
+  const stat = h.deps.sessionPersistence.stat
+  h.deps.sessionPersistence.stat = async id => {
+    const snapshot = await stat(id)
+    if (id === chat.id) agentLive = true
+    return snapshot
+  }
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('Session or Agent became live during its header check')))
+})
+
+test('a failed listing keeps a tombstone with a conflicting header', async () => {
+  const chat = fakeSession('session-failed-listing', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  const conflicting = { ...chat.header, cwd: '/tmp/conflicting-header' }
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const h = harness({ stored: [conflicting] })
+  h.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await h.temp.reap()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('stored header')))
+  assert.ok((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id))
+})
+
+test('a startup pass resumes cancellation for a journal-pending tree', async () => {
+  const chat = fakeSession('session-pending-resume', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [chat.id], reason: 'discard', at: 102 })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.reap()
+  assert.deepEqual(h.cancelled, [chat.id])
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, true)
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('unload keeps an idle Agent until whenIdle settles', async () => {
+  const chat = fakeSession('session-idle-unsettled', { createdAt: 1 })
+  const dir = await materializeSession(chat.id)
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [chat.id], preexisting: [chat.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: chat.id, kind: 'main', parentSessionId: null, dir, cwd: '/tmp/project', at: 101,
+  })
+  await appendJournalEvent(journalFile, { type: 'pending', sessionIds: [chat.id], reason: 'discard', at: 102 })
+  await appendJournalEvent(journalFile, { type: 'migrationComplete', at: 103 })
+  const agent = { status: 'idle', whenIdle: () => new Promise(() => {}) }
+  const h = harness({ stored: [chat.header] })
+  h.deps.agents = { get: () => agent }
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  agent.whenIdle = async () => {}
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('unload keeps an Agent that becomes active during the deleted append', async () => {
+  const chat = fakeSession('session-unload-append-active', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  await h.temp.discard({ sessionId: chat.id })
+  const agent = { status: 'idle' }
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  const append = h.temp.appendEvent.bind(h.temp)
+  h.temp.appendEvent = async event => {
+    const result = await append(event)
+    if (event.type === 'deleted') agent.status = 'running'
+    return result
+  }
+  await h.temp.cleanupPending()
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('not confirmed idle after the deleted append')))
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, true)
+  assert.ok((await journalLines()).some(event => event.type === 'deleted' && event.sessionId === chat.id))
+})
+
+test('unload keeps an Agent that wakes after whenIdle settles', async () => {
+  const chat = fakeSession('session-wake-after-idle', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  await h.temp.discard({ sessionId: chat.id })
+  let calls = 0
+  const agent = {
+    status: 'idle',
+    whenIdle: () => {
+      calls += 1
+      const settled = Promise.resolve()
+      if (calls > 1) settled.then(() => { agent.status = 'running' })
+      return settled
+    },
+  }
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  await h.temp.cleanupPending()
+  assert.equal(calls, 2)
+  assert.equal(agent.status, 'running')
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('not confirmed idle after the deleted append')))
+  assert.equal(warnings.some(message => message.includes('Agent changed before removal')), false)
+})
+
+test('unload keeps an Agent that wakes before the final removal guard', async () => {
+  const chat = fakeSession('session-wake-before-guard', { createdAt: 1 })
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.register({ sessionId: chat.id })
+  const dir = await materializeSession(chat.id)
+  await h.temp.discard({ sessionId: chat.id })
+  const agent = { status: 'idle' }
+  h.deps.agents = { get: id => (id === chat.id ? agent : undefined) }
+  const confirmIdle = h.temp.confirmIdle.bind(h.temp)
+  let calls = 0
+  h.temp.confirmIdle = async (candidate, sessionId) => {
+    const result = await confirmIdle(candidate, sessionId)
+    calls += 1
+    if (calls === 2 && result === true && candidate !== undefined) {
+      queueMicrotask(() => { candidate.status = 'running' })
+    }
+    return result
+  }
+  await h.temp.cleanupPending()
+  assert.equal(calls, 2)
+  assert.equal(agent.status, 'running')
+  assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('Agent changed before removal')))
+  assert.equal(warnings.some(message => message.includes('not confirmed idle after the deleted append')), false)
+})
+
+test('unknown or malformed journal events are rejected by replay', () => {
+  for (const text of [
+    '{"type":"unknown","at":1}\n',
+    '{"type":"owned","sessionId":"session-x","kind":"main","cwd":null,"at":1}\n',
+    '{"type":"owned","sessionId":"session-x","kind":"main","dir":"/tmp/x","cwd":null,"at":"later"}\n',
+  ]) {
+    assert.equal(replayJournal(text).degraded, true)
+  }
+})
+
 test('a child that becomes live during the deleted append keeps its transcript', async () => {
   const parent = fakeSession('session-race-parent', { createdAt: 1 })
   const child = fakeSession('session-race-child', { origin: 'subagent', parentSession: parent.id, createdAt: 2 })
@@ -1613,7 +2403,7 @@ test('a child that becomes live during the deleted append keeps its transcript',
     return checks >= 2 ? child : undefined
   }
   await h.temp.reap()
-  assert.equal(checks, 3)
+  assert.ok(checks >= 3)
   assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
   assert.deepEqual(
     (await journalLines()).filter(event => event.sessionId === child.id).map(event => event.type),

@@ -14,11 +14,12 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import {
   appendJournalEvent,
+  appendJournalEventSync,
   readJournalFile,
   readJournalMarker,
   replayJournal,
@@ -167,6 +168,8 @@ export class TemporarySessions {
     this.registryDegraded = false
     // The ownership journal is unreadable or invalid; delete nothing and write nothing.
     this.journalDegraded = false
+    // A signal or process exit has closed admission for new temporary writes.
+    this.admissionClosed = false
     this.queue = Promise.resolve()
     // Announced subagents whose queued registry write has not associated them yet.
     this.pending = []
@@ -195,6 +198,11 @@ export class TemporarySessions {
   /** Report a condition a human may need to read later. */
   warn(message) {
     this.deps.logger?.warn?.(message)
+  }
+
+  /** Close admission for new temporary writes before process cleanup. */
+  closeAdmission() {
+    this.admissionClosed = true
   }
 
   /**
@@ -1038,6 +1046,9 @@ export class TemporarySessions {
 
   /** Refuse a mutation that would need a journal or registry write. */
   assertWritable(action) {
+    if (this.admissionClosed) {
+      throw new Error(`temporary-session admission is closed; refusing to ${action}`)
+    }
     if (this.journalDegraded) {
       throw new Error(`the temporary-session ownership journal is degraded; refusing to ${action}`)
     }
@@ -1556,16 +1567,73 @@ export class TemporarySessions {
   }
 
   /**
+   * Whether a Session or Agent is live for an id. An ordinary reap removal
+   * requires both to be absent; unload uses its confirmed-idle exception.
+   * @param {string} sessionId - Session id.
+   * @returns {boolean} whether a live Session or Agent exists.
+   */
+  hasLiveOwner(sessionId) {
+    return this.deps.sessions.get(sessionId) !== undefined
+      || this.deps.agents?.get?.(sessionId) !== undefined
+  }
+
+  /**
    * Delete one record's storage directory when it is journal-authorised and no
-   * longer has a live Agent.
+   * longer has a live Agent. The `deleted` event is durable before the removal;
+   * a failed append leaves the folder untouched.
    * @param {object} record - registry record.
+   * @param {boolean} [liveConfirmed] - the caller already confirmed a live Session idle.
+   * @param {(() => Promise<boolean> | boolean) | undefined} [confirmAfterAppend] - recheck
+   *   the caller's deletion condition after the durable append.
+   * @param {(() => boolean) | undefined} [confirmBeforeRemove] - final synchronous
+   *   check immediately before removal.
    * @returns {Promise<boolean>} whether the record may be dropped.
    */
-  async removeStorage(record) {
+  async removeStorage(record, liveConfirmed = false, confirmAfterAppend = undefined, confirmBeforeRemove = undefined) {
     const target = this.deletionTarget(record)
     if (target === undefined) return false
+    const entry = this.journal.entries[record.sessionId]
+    if (entry?.deleted !== true) {
+      try {
+        await this.appendEvent({
+          type: 'deleted',
+          sessionId: record.sessionId,
+          kind: record.kind,
+          parentSessionId: record.parentSessionId,
+          dir: record.dir,
+          cwd: record.cwd,
+          at: Date.now(),
+        })
+      } catch (error) {
+        this.warn(`not deleting temporary session "${record.sessionId}": its deleted event could not be written (${String(error)})`)
+        return false
+      }
+    }
+    if (!liveConfirmed && this.hasLiveOwner(record.sessionId)) {
+      this.warn(`not deleting temporary session "${record.sessionId}": its Session or Agent became live during deletion`)
+      return false
+    }
+    if (typeof confirmAfterAppend === 'function') {
+      let confirmed
+      try {
+        confirmed = await confirmAfterAppend()
+      } catch (error) {
+        this.warn(`not deleting temporary session "${record.sessionId}": its post-append check failed (${String(error)})`)
+        return false
+      }
+      if (!confirmed) {
+        this.warn(`not deleting temporary session "${record.sessionId}": its Agent is not confirmed idle after the deleted append`)
+        return false
+      }
+    }
+    if (typeof confirmBeforeRemove === 'function' && !confirmBeforeRemove()) {
+      this.warn(`not deleting temporary session "${record.sessionId}": its Agent changed before removal`)
+      return false
+    }
     try {
-      await rm(target, { recursive: true, force: true })
+      // The final liveness check and the removal are one synchronous turn, so
+      // a same-process Session cannot become live between them.
+      rmSync(target, { recursive: true, force: true })
       return true
     } catch (error) {
       this.warn(`could not delete temporary session "${record.sessionId}": ${String(error)}`)
@@ -1605,6 +1673,84 @@ export class TemporarySessions {
   }
 
   /**
+   * Finish deletions whose `deleted` event survived a crash. The journal target
+   * is the only evidence when the stored header is gone; it must agree with the
+   * `owned` event and, when a header is present, with that header. A listing
+   * that omits an id is not proof of absence, so every absent id gets a direct
+   * stat; an unreadable stat retains the folder. Deletion is synchronous after
+   * the final liveness check.
+   * @param {Map<string, object>} storedHeaders - stored headers from this boot.
+   * @returns {Promise<number>} folders removed.
+   */
+  async finishJournalDeletes(storedHeaders) {
+    let removed = 0
+    for (const [sessionId, entry] of Object.entries(this.journal.entries)) {
+      if (entry.deleted !== true) continue
+      if (this.hasLiveOwner(sessionId)) {
+        this.warn(`not finishing deletion of "${sessionId}": its Session or Agent is still live`)
+        continue
+      }
+      if (entry.deletedDir !== entry.dir || entry.deletedCwd !== entry.cwd) {
+        this.warn(`not finishing deletion of "${sessionId}": its deleted event disagrees with its owned event`)
+        continue
+      }
+      if (!isSafeSessionDir(entry.deletedDir, sessionId)) {
+        this.warn(`not finishing deletion of "${sessionId}": its journal target is unsafe`)
+        continue
+      }
+      let header = storedHeaders.get(sessionId)
+      if (header === undefined) {
+        try {
+          header = await this.storedHeader(sessionId)
+        } catch (error) {
+          this.warn(`not finishing deletion of "${sessionId}": its stored header is uncertain (${String(error)})`)
+          continue
+        }
+      }
+      if (header !== undefined && !this.journalTargetAgreesWithHeader(entry, header)) {
+        this.warn(`not finishing deletion of "${sessionId}": its journal target disagrees with its stored header`)
+        continue
+      }
+      if (this.hasLiveOwner(sessionId)) {
+        this.warn(`not finishing deletion of "${sessionId}": its Session or Agent became live during its header check`)
+        continue
+      }
+      if (!existsSync(entry.deletedDir)) continue
+      try {
+        rmSync(entry.deletedDir, { recursive: true, force: true })
+      } catch (error) {
+        this.warn(`could not finish deletion of "${sessionId}": ${String(error)}`)
+        continue
+      }
+      if (existsSync(entry.deletedDir)) {
+        this.warn(`could not finish deletion of "${sessionId}": its folder is still present`)
+        continue
+      }
+      removed += 1
+      this.warn(`finished deletion of "${sessionId}" from its ownership journal`)
+    }
+    return removed
+  }
+
+  /**
+   * Whether a journal-owned target agrees with its stored header.
+   * @param {object} entry - replayed journal entry.
+   * @param {object} header - stored Session header.
+   * @returns {boolean} whether the identity and target agree.
+   */
+  journalTargetAgreesWithHeader(entry, header) {
+    if (header?.id !== entry.sessionId) return false
+    if ((header.cwd ?? null) !== entry.cwd) return false
+    if ((header.parentSession ?? null) !== entry.parentSessionId) return false
+    const headerKind = kindOfHeader(header)
+    const kindAgrees = entry.kind === headerKind
+      || (entry.kind === 'side' && header.isSeeded === true && typeof header.parentSession === 'string')
+    if (!kindAgrees) return false
+    const storage = this.resolveStorage(header)
+    return storage !== undefined && storage.dir === entry.dir
+  }
+
+  /**
    * Boot-time cleanup: restore the archive set and delete every recorded
    * Session that no longer has a live Agent. Live Sessions (for example during
    * a live profile reload) are kept for the next boot or process exit, and so
@@ -1618,18 +1764,36 @@ export class TemporarySessions {
         return
       }
       const storedHeaders = new Map()
+      let listingComplete = false
       try {
         const snapshots = await this.deps.sessionPersistence.list()
         for (const snapshot of snapshots) storedHeaders.set(snapshot.header.id, snapshot.header)
         this.storedHeaders = storedHeaders
+        listingComplete = true
       } catch (error) {
         this.warn(`could not list stored sessions during temporary-session cleanup: ${String(error)}`)
       }
+      // Finish tombstones first: a kill after the durable `deleted` event leaves
+      // the folder for this pass, even when its stored header is already gone.
+      await this.finishJournalDeletes(storedHeaders)
+      await this.resumePendingStops()
       // Collected before anything is deleted, so a removed parent cannot break the chain for its children.
       const kept = new Set()
       for (const [sessionId, record] of Object.entries(this.state.sessions)) {
         if (record?.kind === SUBAGENT_KIND || this.deps.sessions.get(sessionId) === undefined) continue
         for (const child of this.descendantRecords(sessionId)) kept.add(child.sessionId)
+      }
+      // An announcement can arrive before its queued recorder runs. Keep the
+      // observed session and its parent chain through the queue handoff.
+      for (const observation of this.pending) {
+        let cursor = observation?.header?.id
+        const seen = new Set()
+        while (typeof cursor === 'string' && !seen.has(cursor)) {
+          seen.add(cursor)
+          kept.add(cursor)
+          const header = storedHeaders.get(cursor) ?? this.deps.sessions.get(cursor)?.header
+          cursor = header?.parentSession
+        }
       }
       let changed = false
       for (const [sessionId, record] of Object.entries(this.state.sessions)) {
@@ -1639,6 +1803,12 @@ export class TemporarySessions {
           continue
         }
         if (this.deps.sessions.get(sessionId) !== undefined || kept.has(sessionId)) continue
+        const entry = this.journal.entries[sessionId]
+        if (entry?.deleted === true && entry.deletedDir === entry.dir && !existsSync(entry.dir)) {
+          delete this.state.sessions[sessionId]
+          changed = true
+          continue
+        }
         if (record.dir === undefined && storedHeaders.has(sessionId)) {
           record.dir = this.dirOf(storedHeaders.get(sessionId))
         }
@@ -1656,13 +1826,179 @@ export class TemporarySessions {
       }
       this.refreshSnapshot()
       if (changed) await this.save()
+      if (listingComplete) await this.pruneJournal(storedHeaders)
     })
   }
 
   /**
+   * Resume cancellation for pending records restored from the journal. The
+   * record and folder stay until a later pass observes the Agent absent or
+   * confirmed idle; this pass only re-issues the stop.
+   * @returns {Promise<void>}
+   */
+  async resumePendingStops() {
+    for (const record of Object.values(this.state.sessions)) {
+      if (record?.pendingDelete !== true) continue
+      if (this.deps.sessions.get(record.sessionId) === undefined) continue
+      const agent = this.deps.agents?.get?.(record.sessionId)
+      let issued = false
+      if (agent !== undefined && typeof agent.cancel === 'function') {
+        try {
+          agent.cancel({ kind: record.kind === SUBAGENT_KIND ? 'parent' : 'user' })
+          issued = true
+        } catch (error) {
+          this.warn(`could not resume the stop for "${record.sessionId}": ${String(error)}`)
+        }
+      }
+      if (!issued && typeof this.deps.sessionController?.cancel === 'function') {
+        try {
+          this.deps.sessionController.cancel({ sessionId: record.sessionId })
+          issued = true
+        } catch (error) {
+          this.warn(`could not resume the stop for "${record.sessionId}": ${String(error)}`)
+        }
+      }
+      if (!issued) this.warn(`pending "${record.sessionId}" has a live Session but no cancel path`)
+    }
+  }
+
+  /**
+   * Compact the ownership journal after replay, the observed-queue handoff and
+   * reap. An entry is retained while a registry record, a stored child, a
+   * queued observation, a pending/deleted state or its own folder needs it; a
+   * reservation is retained until promoted or dropped. A no-longer-needed
+   * entry gets the 30-day age bound, and the migration events are never pruned.
+   * @param {Map<string, object>} storedHeaders - stored headers from this boot.
+   * @returns {Promise<void>}
+   */
+  async pruneJournal(storedHeaders) {
+    if (this.journalDegraded) return
+    const keep = new Set()
+    const addAncestors = (id) => {
+      const seen = new Set()
+      let cursor = id
+      while (typeof cursor === 'string' && !seen.has(cursor)) {
+        seen.add(cursor)
+        keep.add(cursor)
+        const header = storedHeaders.get(cursor) ?? this.deps.sessions.get(cursor)?.header
+        cursor = header?.parentSession
+      }
+    }
+    for (const record of Object.values(this.state.sessions)) addAncestors(record.sessionId)
+    for (const observation of this.pending) addAncestors(observation?.header?.id)
+    for (const header of storedHeaders.values()) {
+      if (typeof header.parentSession === 'string' && this.journal.entries[header.parentSession] !== undefined) {
+        keep.add(header.parentSession)
+      }
+    }
+    for (const [sessionId, entry] of Object.entries(this.journal.entries)) {
+      if (typeof entry.dir === 'string' && existsSync(entry.dir)) keep.add(sessionId)
+      if (entry.pending === true && entry.deleted !== true) keep.add(sessionId)
+      if (entry.deleted === true) {
+        if (typeof entry.deletedDir === 'string' && existsSync(entry.deletedDir)) keep.add(sessionId)
+        if (Object.values(this.state.sessions).some(record => record.parentSessionId === sessionId)) keep.add(sessionId)
+      }
+    }
+    // A retained child keeps its journal parent as the orphan anchor.
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const [sessionId, entry] of Object.entries(this.journal.entries)) {
+        if (!keep.has(sessionId)) continue
+        const parentId = entry.parentSessionId
+        if (typeof parentId !== 'string' || this.journal.entries[parentId] === undefined) continue
+        if (!keep.has(parentId)) {
+          keep.add(parentId)
+          grew = true
+        }
+      }
+    }
+    const reservationIds = new Set()
+    for (const [sessionId, reservation] of Object.entries(this.journal.reservations)) {
+      if (reservation.dropped !== true && this.journal.entries[sessionId] === undefined) reservationIds.add(sessionId)
+    }
+    const now = Date.now()
+    const withinAge = (entry) => {
+      const latest = Math.max(entry.ownedAt ?? 0, entry.deletedAt ?? 0)
+      return latest > 0 && now - latest < 30 * 24 * 60 * 60 * 1000
+    }
+    const retained = (sessionId) => {
+      if (keep.has(sessionId)) return true
+      const entry = this.journal.entries[sessionId]
+      return entry !== undefined && withinAge(entry)
+    }
+    const events = []
+    for (const event of this.journal.events) {
+      switch (event.type) {
+        case 'migration':
+        case 'migrationComplete':
+          events.push(event)
+          break
+        case 'reserved':
+          if (reservationIds.has(event.sessionId)) events.push(event)
+          break
+        case 'reservationDropped':
+          break
+        case 'owned':
+        case 'deleted':
+          if (retained(event.sessionId)) events.push(event)
+          break
+        case 'pending': {
+          const sessionIds = event.sessionIds.filter(sessionId => this.journal.entries[sessionId]?.pending === true && retained(sessionId))
+          if (sessionIds.length > 0) events.push({ ...event, sessionIds })
+          break
+        }
+        default:
+          break
+      }
+    }
+    const text = events.map(event => `${JSON.stringify(event)}\n`).join('')
+    if (text === this.journalSource) return
+    try {
+      rewriteJournal(this.paths.journal, text)
+      this.journalSource = text
+      this.journal = replayJournal(text)
+    } catch (error) {
+      this.warn(`could not compact the ownership journal: ${String(error)}`)
+    }
+  }
+
+  /**
+   * Whether an Agent is confirmed idle: absent, or idle with a bounded
+   * `whenIdle()` settlement. The current Agent is re-read after settlement so
+   * a wake cannot be mistaken for the idle state observed before the wait.
+   * @param {object | undefined} agent - live Agent, when one exists.
+   * @param {string | undefined} [sessionId] - id used to re-read the Agent.
+   * @returns {Promise<boolean>} whether deletion may proceed.
+   */
+  async confirmIdle(agent, sessionId = undefined) {
+    if (agent === undefined) return true
+    if (agent.status !== 'idle') return false
+    if (typeof agent.whenIdle === 'function') {
+      let timer
+      let settled
+      try {
+        settled = await Promise.race([
+          Promise.resolve().then(() => agent.whenIdle()).then(() => true, () => false),
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve(false), 100)
+          }),
+        ])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+      if (!settled) return false
+    }
+    const current = sessionId === undefined ? agent : this.deps.agents?.get?.(sessionId)
+    if (current === undefined) return true
+    return current === agent && current.status === 'idle'
+  }
+
+  /**
    * On plugin unload, publish the registry synchronously, then delete the storage of Sessions
-   * already ended by the user. The published and in-memory snapshots stay bound: the exit
-   * handler installed for this process must still delete them after the plugin is gone.
+   * already ended by the user. A pending member with a running Agent stays recorded for the next
+   * boot; a live but idle Session has no work left and may be removed only after `whenIdle()`
+   * settles within the bounded check.
    */
   cleanupPending() {
     this.flushRegistrySync()
@@ -1674,7 +2010,20 @@ export class TemporarySessions {
       }
       for (const record of Object.values(this.state.sessions)) {
         if (record?.pendingDelete !== true) continue
-        await this.removeStorage(record)
+        const agent = this.deps.agents?.get?.(record.sessionId)
+        if (!(await this.confirmIdle(agent, record.sessionId))) {
+          this.warn(`keeping "${record.sessionId}" on unload: its Agent is not confirmed idle`)
+          continue
+        }
+        await this.removeStorage(
+          record,
+          true,
+          () => this.confirmIdle(this.deps.agents?.get?.(record.sessionId), record.sessionId),
+          () => {
+            const current = this.deps.agents?.get?.(record.sessionId)
+            return current === undefined || (current === agent && current.status === 'idle')
+          },
+        )
       }
     })
   }
@@ -1682,20 +2031,45 @@ export class TemporarySessions {
 
 /**
  * Synchronously delete every Session in a validated immutable snapshot. This is
- * the only exit deletion path: it never reads the registry file, and a degraded
- * snapshot deletes nothing.
+ * the only exit deletion path: it never reads the registry or journal for its
+ * delete set, and a degraded snapshot deletes nothing. When a journal path is
+ * supplied, every `deleted` event is appended and fsynced before any folder is
+ * removed; one failed append removes nothing.
  * @param {{ degraded?: boolean, sessions?: readonly object[] }} snapshot - validated snapshot.
  * @param {{ warn?: (message: string) => void }} [logger] - optional logger.
+ * @param {string} [journal] - ownership journal to tombstone before removal.
  * @returns {number} directories removed.
  */
-export function cleanupSnapshotSync(snapshot, logger) {
+export function cleanupSnapshotSync(snapshot, logger, journal) {
   if (snapshot === null || typeof snapshot !== 'object' || snapshot.degraded === true) return 0
   const seen = new Set()
-  let removed = 0
+  const records = []
   for (const record of snapshot.sessions ?? []) {
     if (record === null || typeof record !== 'object') continue
     if (!isSafeSessionDir(record.dir, record.sessionId) || seen.has(record.sessionId)) continue
     seen.add(record.sessionId)
+    records.push(record)
+  }
+  if (typeof journal === 'string' && journal !== '') {
+    try {
+      for (const record of records) {
+        appendJournalEventSync(journal, {
+          type: 'deleted',
+          sessionId: record.sessionId,
+          kind: record.kind,
+          parentSessionId: record.parentSessionId ?? null,
+          dir: record.dir,
+          cwd: record.cwd ?? null,
+          at: Date.now(),
+        })
+      }
+    } catch (error) {
+      logger?.warn?.(`temporary-session exit cleanup could not write its deleted events; deleting nothing: ${String(error)}`)
+      return 0
+    }
+  }
+  let removed = 0
+  for (const record of records) {
     if (deleteRecordSync(record, logger)) removed += 1
   }
   return removed
@@ -1722,12 +2096,14 @@ function ensureExitHandlers() {
     const bound = globalThis[EXIT_SNAPSHOT]
     if (bound === undefined) return
     try {
-      cleanupSnapshotSync(bound.snapshot(), bound.logger)
+      bound.closeAdmission?.()
+      cleanupSnapshotSync(bound.snapshot(), bound.logger, bound.journal)
     } catch (error) {
       bound.logger?.warn?.(`temporary-session exit cleanup failed: ${String(error)}`)
     }
   }
   const onSignal = (signal) => {
+    globalThis[EXIT_SNAPSHOT]?.closeAdmission?.()
     cleanup()
     process.off(signal, onSignal)
     try {
@@ -1746,13 +2122,16 @@ function ensureExitHandlers() {
 
 /**
  * Install the validated-snapshot exit cleanup. The handler reads the newest
- * immutable snapshot and never parses the registry file; the binding survives
- * an unload, so an unloaded plugin still deletes what it validated.
+ * immutable snapshot and never parses the registry or journal for its delete
+ * set; it appends a durable `deleted` event before each removal. The binding
+ * survives an unload, so an unloaded plugin still deletes what it validated.
  * @param {() => { degraded?: boolean, sessions?: readonly object[] }} snapshotProvider - current snapshot.
  * @param {{ warn?: (message: string) => void }} [logger] - Host logger.
+ * @param {string} [journal] - ownership journal for tombstone events.
+ * @param {() => void} [closeAdmission] - closes new temporary writes before cleanup.
  * @returns {void}
  */
-export function installExitCleanup(snapshotProvider, logger) {
-  globalThis[EXIT_SNAPSHOT] = { snapshot: snapshotProvider, logger }
+export function installExitCleanup(snapshotProvider, logger, journal, closeAdmission) {
+  globalThis[EXIT_SNAPSHOT] = { snapshot: snapshotProvider, logger, journal, closeAdmission }
   ensureExitHandlers()
 }
