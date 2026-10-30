@@ -41,8 +41,9 @@ export async function apply(ctx) {
     paths,
   })
 
-  // Every announced Session passes here. A subagent under a recorded chat is recorded so exit,
-  // discard, and promote handle it with its chat. The listener never throws synchronously: a
+  // Every announced Session passes here. A descendant of a recorded chat, at
+  // any kind and depth, is queued, journaled before its registry write, and
+  // reconciled to a fixed point. The listener never throws synchronously: a
   // throw would roll back the Host attach, and a rejected promise is only logged.
   ctx.on('session/created', (session) => {
     temp.recordDescendant(session).catch((error) => {
@@ -50,10 +51,11 @@ export async function apply(ctx) {
     })
   })
 
-  // Reap before the browser can list Sessions: every recorded Session that
-  // does not belong to a live Agent is a leftover from a previous run.
+  // Complete boot reconciliation and reap before the browser can list Sessions.
+  // The ready promise also covers announcements queued while the stored listing
+  // was being taken.
   try {
-    await temp.reap()
+    await temp.start()
   } catch (error) {
     log.warn(`temporary-session boot cleanup failed: ${String(error)}`)
   }

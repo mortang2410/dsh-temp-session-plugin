@@ -38,6 +38,12 @@ export const STATE_VERSION = 1
  */
 export const SUBAGENT_KIND = 'subagent'
 
+/** First delay before retrying a protected observed append. */
+const RETRY_DELAY_MS = 25
+
+/** Longest delay between automatic retries of a protected observation. */
+const RETRY_MAX_DELAY_MS = 30000
+
 /** Boundary note added to a forked, temporary side conversation. */
 const SIDE_INSTRUCTIONS = `This is a temporary side conversation forked from the main conversation.
 Treat the inherited history as reference only. Do not continue the main task, its goals, plans, approvals, or tool calls. Answer the new side question independently. Do not use subagents. Change files or workspace state only when the user explicitly asks for that change in this side conversation.`
@@ -164,6 +170,9 @@ export class TemporarySessions {
     this.paths = deps.paths
     this.state = emptyState()
     this.loaded = false
+    this.loadPromise = undefined
+    this.loadFailed = false
+    this.loadError = undefined
     // The registry file exists but could not be read, parsed or versioned; never overwrite it.
     this.registryDegraded = false
     // The ownership journal is unreadable or invalid; delete nothing and write nothing.
@@ -171,14 +180,32 @@ export class TemporarySessions {
     // A signal or process exit has closed admission for new temporary writes.
     this.admissionClosed = false
     this.queue = Promise.resolve()
-    // Announced subagents whose queued registry write has not associated them yet.
+    // Announcements observed before their journal and registry work finished.
+    // Kept in order so a failed journal append can be retried without a restart.
     this.pending = []
+    // Ids already logged during this boot, so a quarantine or unresolved child
+    // is reported once rather than on every fixed-point pass.
+    this.logged = new Set()
+    // Observed children whose journal append failed; their identity and parent
+    // anchor stay here until a later pass writes the event.
+    this.retryQueue = new Set()
+    this.retryTimer = undefined
+    this.retryDelayMs = RETRY_DELAY_MS
+    // Injected seam for a degraded reconciliation pass. Real detection is
+    // owned by the degraded-mode ticket; this flag only suppresses registry
+    // writes and deletion while journal observations still proceed.
+    this.reconciliationDegraded = deps.degraded === true
+    // Startup has completed the full boot sequence.
+    this.ready = false
+    this.startPromise = undefined
     this.journal = replayJournal('')
     // The valid journal bytes this instance has replayed; appends extend it.
     this.journalSource = ''
     this.marker = undefined
     // Stored headers from the last load, for record/header agreement checks.
     this.storedHeaders = undefined
+    this.bootStoredHeaders = undefined
+    this.storedListingComplete = false
     // The first migration has not completed; no durable ownership write is safe.
     this.migrationIncomplete = true
     // Migration corrected a legacy field in memory and needs a registry publish.
@@ -195,6 +222,45 @@ export class TemporarySessions {
     return run
   }
 
+  /** Stop a pending automatic retry. */
+  clearRetryTimer() {
+    if (this.retryTimer === undefined) return
+    clearTimeout(this.retryTimer)
+    this.retryTimer = undefined
+  }
+
+  /**
+   * Schedule one bounded automatic retry while protected observations remain.
+   * The delay grows after each failed attempt and one timer is live at a time.
+   * @returns {void}
+   */
+  scheduleRetry() {
+    if (this.retryTimer !== undefined
+      || this.retryQueue.size === 0
+      || this.admissionClosed
+      || this.journalDegraded
+      || this.loadFailed) return
+    const delay = this.retryDelayMs
+    const timer = setTimeout(() => {
+      if (this.retryTimer !== timer) return
+      this.retryTimer = undefined
+      if (this.retryQueue.size === 0
+        || this.admissionClosed
+        || this.loadFailed
+        || this.journalDegraded) {
+        this.retryDelayMs = RETRY_DELAY_MS
+        return
+      }
+      this.retryDelayMs = Math.min(this.retryDelayMs * 2, RETRY_MAX_DELAY_MS)
+      this.retryObserved().catch((error) => {
+        this.warn(`could not retry the protected observed queue: ${String(error)}`)
+        this.scheduleRetry()
+      })
+    }, delay)
+    this.retryTimer = timer
+    timer.unref?.()
+  }
+
   /** Report a condition a human may need to read later. */
   warn(message) {
     this.deps.logger?.warn?.(message)
@@ -203,22 +269,49 @@ export class TemporarySessions {
   /** Close admission for new temporary writes before process cleanup. */
   closeAdmission() {
     this.admissionClosed = true
+    this.clearRetryTimer()
   }
 
   /**
    * Read the registry once and reconcile it with the ownership journal.
    *
    * The order is the one the exit snapshot depends on: read the registry and
-   * the stored headers, validate and replay the journal, run or resume the
-   * first migration, resolve the reservations replay exposes, rebuild every
-   * journal-owned record the index lost, then publish the in-memory snapshot.
+   * the stored headers, validate and replay the journal, resolve the
+   * reservations replay exposes, run or resume the first migration, rebuild
+   * every journal-owned record the index lost, reconcile stored and observed
+   * children to a fixed point, then publish the in-memory snapshot.
    */
-  async load() {
-    if (this.loaded) return this.state
-    this.loaded = true
+  load() {
+    if (this.loaded) return Promise.resolve(this.state)
+    if (this.loadFailed) return Promise.resolve(this.state)
+    if (this.loadPromise !== undefined) return this.loadPromise
+    this.loadPromise = this.loadOnce().catch((error) => {
+      // The partially read state is not writable; `migrationIncomplete` and the
+      // degraded flags gate every mutation. Do not retry a failed boot inside
+      // the same instance, where a half-applied pass could be observed.
+      this.loadFailed = true
+      this.loadError = error
+      this.loadPromise = undefined
+      // The partial boot is not deletion evidence. Keep exit cleanup empty
+      // until a fresh instance completes the read.
+      this.snapshot = Object.freeze({ degraded: true, sessions: Object.freeze([]) })
+      throw error
+    })
+    return this.loadPromise
+  }
+
+  /**
+   * Run the one boot read and reconciliation. Concurrent callers share
+   * `loadPromise`, so an announcement that arrives during the stored listing is
+   * drained after replay rather than being told the boot is already complete.
+   * @returns {Promise<object>} the loaded registry state.
+   */
+  async loadOnce() {
     const now = Date.now()
     const stored = await this.listStored()
     this.storedHeaders = stored
+    this.bootStoredHeaders = stored
+    this.storedListingComplete = stored !== undefined
     const registry = await this.readRegistry(stored, now)
     this.state = registry.state
     this.registryDegraded = registry.damaged
@@ -249,12 +342,17 @@ export class TemporarySessions {
     let healed = false
     if (!this.journalDegraded) {
       try {
+        // The spec order is replay, reservations, heal/import, reconcile, then
+        // drain announcements that arrived while the listing was being taken.
+        await this.resolveReservations(stored)
         await this.migrate(registry, stored)
         this.migrationIncomplete = this.marker === undefined && this.journal.migrationComplete === undefined
-        await this.adoptStoredChildren(stored)
-        await this.resolveReservations(stored)
         healed = this.healFromJournal(stored)
-        if ((healed || this.registryChanged) && !this.registryDegraded) await this.save()
+        const reconciled = await this.reconcileFixedPoint(stored)
+        healed = this.healFromJournal(stored) || healed
+        if ((healed || this.registryChanged || reconciled.adopted || reconciled.observed)
+          && !this.registryDegraded
+          && !this.reconciliationDegraded) await this.save()
       } catch (error) {
         // A load that failed after replay leaves ownership uncertain; keep every
         // durable write refused until a fresh load completes the migration.
@@ -262,8 +360,29 @@ export class TemporarySessions {
         throw error
       }
     }
+    this.loaded = true
     this.refreshSnapshot()
     return this.state
+  }
+
+  /**
+   * Complete the boot sequence and publish readiness. The session-created
+   * listener is installed by the Host before this runs; any announcement it
+   * receives is in the observed queue and is drained before the ready promise
+   * settles. Re-running start returns the same promise.
+   * @returns {Promise<object>} the loaded registry state.
+   */
+  start() {
+    if (this.ready) return Promise.resolve(this.state)
+    if (this.startPromise !== undefined) return this.startPromise
+    this.startPromise = this.reap().then(() => {
+      this.ready = true
+      return this.state
+    }, (error) => {
+      this.startPromise = undefined
+      throw error
+    })
+    return this.startPromise
   }
 
   /**
@@ -550,65 +669,234 @@ export class TemporarySessions {
   }
 
   /**
-   * Adopt stored subagent children of a journal-owned parent. This recovers an
-   * announcement that was observed while the first migration was incomplete,
-   * and it is the boot pass ticket 03 extends to a fixed point.
+   * Adopt every stored child whose direct parent is already journal-owned.
+   * The pass is a fixed point, so a child listed before its parent is adopted
+   * after the parent in the next pass. All descendant kinds are covered; a
+   * seeded descendant that predates the migration cutoff is quarantined, and a
+   * journal-deleted parent only authorises deletion of a subagent orphan.
    * @param {Map<string, object> | undefined} stored - stored headers.
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} whether this pass appended a journal event.
    */
   async adoptStoredChildren(stored) {
-    if (stored === undefined || this.migrationIncomplete) return
+    if (stored === undefined || this.journalDegraded) return false
+    if (this.migrationIncomplete) {
+      // The cutoff is not available yet, so no seeded child is adopted or
+      // deleted. Report each candidate once for the boot log.
+      for (const [sessionId, header] of stored) {
+        if (header?.isSeeded !== true || this.journal.entries[sessionId] !== undefined) continue
+        if (typeof header.parentSession !== 'string' || header.parentSession === '') continue
+        this.logCutoff(sessionId, 'migration-incomplete')
+      }
+      return false
+    }
+    let adopted = false
     let changed = true
     while (changed) {
       changed = false
       for (const [sessionId, header] of stored) {
-        if (header?.origin !== 'subagent') continue
-        const parentId = header.parentSession
-        const parent = this.journal.entries[parentId]
-        if (parent === undefined) continue
-        const storage = this.resolveStorage(header)
-        if (storage === undefined || !isSafeSessionDir(storage.dir, sessionId)) continue
-        const existing = this.journal.entries[sessionId]
-        if (parent.deleted === true) {
-          if (await this.deleteOrphanedChild(sessionId, parentId, header, storage, existing)) changed = true
-          continue
+        if (await this.reconcileStoredChild(sessionId, header)) {
+          adopted = true
+          changed = true
         }
-        if (existing !== undefined) {
-          // A crash between the adopted `owned` event and its inherited `pending`
-          // event must not leave an ended parent's child running. A later pass
-          // revisits this child when its parent becomes pending.
-          if (existing.deleted !== true && parent.pending === true && existing.pending !== true) {
-            await this.appendEvent({
-              type: 'pending',
-              sessionIds: [sessionId],
-              reason: parent.pendingReason ?? 'discard',
-              at: Date.now(),
-            })
-            changed = true
-          }
-          continue
+      }
+    }
+    // An unrecorded child whose direct parent has no journal anchor is left
+    // alone. Log it once, after the fixed point, so an earlier pass that adopts
+    // the parent does not produce a false orphan message.
+    for (const [sessionId, header] of stored) {
+      if (header === null || typeof header !== 'object') continue
+      if (typeof header.parentSession !== 'string' || header.parentSession === '') continue
+      if (this.journal.entries[sessionId] !== undefined) continue
+      if (this.journal.entries[header.parentSession] !== undefined) continue
+      this.logOnce(`unproven:${sessionId}`, `left "${sessionId}" unrecorded: its parent has no journal anchor`)
+    }
+    return adopted
+  }
+
+  /**
+   * Run stored and observed reconciliation as one fixed point. An observed
+   * parent may make a stored child adoptable, and a stored parent may make an
+   * observed child adoptable, so alternating one pass of each is required.
+   * @param {Map<string, object> | undefined} stored - stored headers.
+   * @returns {Promise<{ adopted: boolean, observed: boolean }>} changes seen.
+   */
+  async reconcileFixedPoint(stored) {
+    let adopted = false
+    let observed = false
+    let changed = true
+    while (changed) {
+      changed = false
+      const storedChanged = this.reconciliationDegraded
+        ? false
+        : await this.adoptStoredChildren(stored)
+      const observedChanged = await this.drainObserved({ persist: false })
+      if (storedChanged) {
+        adopted = true
+        changed = true
+      }
+      if (observedChanged) {
+        observed = true
+        changed = true
+      }
+    }
+    await this.dropUnprovenObservations(stored)
+    return { adopted, observed }
+  }
+  /**
+   * Reconcile one stored header. Returns true only when this pass wrote an
+   * event or removed a proven orphan, so the caller can repeat to a fixed point.
+   * @param {string} sessionId - stored child id.
+   * @param {object} header - stored header.
+   * @returns {Promise<boolean>} whether the pass changed the journal.
+   */
+  async reconcileStoredChild(sessionId, header) {
+    if (header === null || typeof header !== 'object' || typeof sessionId !== 'string') return false
+    if (typeof header.parentSession !== 'string' || header.parentSession === '') return false
+    const parentId = header.parentSession
+    const parent = this.journal.entries[parentId]
+    if (parent === undefined) return false
+    const storage = this.resolveStorage(header)
+    if (storage === undefined || !isSafeSessionDir(storage.dir, sessionId)) return false
+    const existing = this.journal.entries[sessionId]
+    if (parent.deleted === true) {
+      const childKind = kindOfHeader(header)
+      if (childKind === 'subagent') {
+        if (existing !== undefined && existing.kind !== 'subagent') {
+          this.logOnce(`deleted-parent:${sessionId}`, `left "${sessionId}" under its journal-deleted parent: its journal identity is not a subagent orphan`)
+          return false
         }
-        await this.appendEvent({
-          type: 'owned',
-          sessionId,
-          kind: 'subagent',
-          parentSessionId: parentId,
-          dir: storage.dir,
-          cwd: header.cwd ?? null,
-          at: Date.now(),
-        })
-        if (parent.pending === true) {
+        return this.deleteOrphanedChild(sessionId, parentId, header, storage, existing)
+      }
+      if (existing !== undefined) {
+        if (existing.deleted === true) return false
+        const kindAgrees = existing.kind === childKind
+          || (existing.kind === 'side' && header.isSeeded === true && typeof header.parentSession === 'string')
+        if (!kindAgrees
+          || existing.parentSessionId !== parentId
+          || existing.dir !== storage.dir
+          || existing.cwd !== (header.cwd ?? null)) {
+          this.logOnce(`deleted-parent:${sessionId}`, `left "${sessionId}" under its journal-deleted parent: its journal identity disagrees with its stored header`)
+          return false
+        }
+        if (parent.pending === true && existing.pending !== true) {
           await this.appendEvent({
             type: 'pending',
             sessionIds: [sessionId],
             reason: parent.pendingReason ?? 'discard',
             at: Date.now(),
           })
+          return true
         }
-        this.warn(`adopted stored subagent "${sessionId}" under its journal-owned parent`)
-        changed = true
+        return false
       }
+      const cutoff = this.quarantineReason(header, sessionId)
+      if (cutoff !== undefined) {
+        this.logCutoff(sessionId, cutoff)
+        return false
+      }
+      await this.appendOwnedChild({ sessionId, kind: childKind, parentId, header, storage, parent })
+      this.warn(`adopted stored ${childKind} "${sessionId}" under its journal-deleted parent`)
+      return true
     }
+    if (existing !== undefined) {
+      // A crash between the adopted `owned` event and its inherited `pending`
+      // event must not leave an ended parent's child running.
+      if (existing.deleted !== true && parent.pending === true && existing.pending !== true) {
+        await this.appendEvent({
+          type: 'pending',
+          sessionIds: [sessionId],
+          reason: parent.pendingReason ?? 'discard',
+          at: Date.now(),
+        })
+        return true
+      }
+      return false
+    }
+    const cutoff = this.quarantineReason(header, sessionId)
+    if (cutoff !== undefined) {
+      this.logCutoff(sessionId, cutoff)
+      return false
+    }
+    await this.appendOwnedChild({ sessionId, kind: kindOfHeader(header), parentId, header, storage, parent })
+    this.warn(`adopted stored descendant "${sessionId}" under its journal-owned parent`)
+    return true
+  }
+
+  /**
+   * Append the durable identity of a stored child and the pending state it
+   * inherits from its journal-owned parent.
+   * @param {{ sessionId: string, kind: string, parentId: string, header: object, storage: { dir: string }, parent: object }} child - owned child facts.
+   * @returns {Promise<void>}
+   */
+  async appendOwnedChild({ sessionId, kind, parentId, header, storage, parent }) {
+    await this.appendEvent({
+      type: 'owned',
+      sessionId,
+      kind,
+      parentSessionId: parentId,
+      dir: storage.dir,
+      cwd: header.cwd ?? null,
+      at: Date.now(),
+    })
+    if (parent.pending === true) {
+      await this.appendEvent({
+        type: 'pending',
+        sessionIds: [sessionId],
+        reason: parent.pendingReason ?? 'discard',
+        at: Date.now(),
+      })
+    }
+  }
+
+  /**
+   * Log one migration-cutoff decision with its reason.
+   * @param {string} sessionId - candidate id.
+   * @param {string} cutoff - reason from {@link quarantineReason}.
+   * @returns {void}
+   */
+  logCutoff(sessionId, cutoff) {
+    if (cutoff === 'migration-incomplete') {
+      this.logOnce(`migration-incomplete:${sessionId}`, `not adopting "${sessionId}": the first ownership migration is incomplete`)
+    } else {
+      this.logOnce(`quarantine:${sessionId}`, `quarantined "${sessionId}": ${cutoff}`)
+    }
+  }
+
+  /**
+   * The migration cutoff reason an unrecorded child must be quarantined, or
+   * undefined when it may be adopted. Only seeded descendants are subject to
+   * the pre-ban ambiguity; a subagent is proven temporary by its origin.
+   * @param {object} header - stored or live Session header.
+   * @param {string} sessionId - child id.
+   * @returns {string | undefined} quarantine reason.
+   */
+  quarantineReason(header, sessionId) {
+    if (header?.isSeeded !== true) return undefined
+    if (this.migrationIncomplete) return 'migration-incomplete'
+    // A valid marker proves completion when the final journal line was torn
+    // away; the journal's migration event still supplies the snapshot.
+    if (this.journal.migrationComplete === undefined && this.marker?.completedAt === undefined) {
+      return 'migration-incomplete'
+    }
+    const migration = this.journal.migration
+    const at = migration?.at ?? this.marker?.migrationAt
+    if (!Number.isSafeInteger(at)) return 'the migration time is unavailable'
+    if (migration?.preexisting?.includes(sessionId) === true) return 'it is in the pre-existing snapshot'
+    if (!Number.isSafeInteger(header.createdAt)) return 'its creation time is invalid'
+    if (header.createdAt <= at) return 'it was created at or before the migration cutoff'
+    return undefined
+  }
+
+  /**
+   * Log one reconciliation decision at most once in this boot.
+   * @param {string} key - stable decision key.
+   * @param {string} message - warning text.
+   * @returns {void}
+   */
+  logOnce(key, message) {
+    if (this.logged.has(key)) return
+    this.logged.add(key)
+    this.warn(message)
   }
 
   /**
@@ -623,6 +911,10 @@ export class TemporarySessions {
    * @returns {Promise<boolean>} whether this pass recorded or removed the child.
    */
   async deleteOrphanedChild(sessionId, parentId, header, storage, existing) {
+    if (kindOfHeader(header) !== 'subagent') {
+      this.warn(`not deleting "${sessionId}": its stored header is not a subagent`)
+      return false
+    }
     if (existing !== undefined) {
       const agrees = existing.kind === 'subagent'
         && existing.parentSessionId === parentId
@@ -633,16 +925,21 @@ export class TemporarySessions {
         return false
       }
       if (existing.deleted === true) {
-        if (this.deps.sessions.get(sessionId) !== undefined) {
-          this.warn(`not deleting stored subagent "${sessionId}": its Session is still live`)
+        if (this.hasLiveOwner(sessionId)) {
+          this.warn(`not deleting stored subagent "${sessionId}": its Session or Agent is still live`)
           return false
         }
-        if (!existsSync(storage.dir)) return false
+        if (!existsSync(storage.dir)) {
+          const hadRecord = this.state.sessions[sessionId] !== undefined
+          delete this.state.sessions[sessionId]
+          return hadRecord
+        }
         this.removeOrphanDir(storage.dir, sessionId)
+        if (!existsSync(storage.dir)) delete this.state.sessions[sessionId]
         return !existsSync(storage.dir)
       }
-      if (this.deps.sessions.get(sessionId) !== undefined) {
-        this.warn(`deferring deletion of stored subagent "${sessionId}": its Session is still live`)
+      if (this.hasLiveOwner(sessionId)) {
+        this.warn(`deferring deletion of stored subagent "${sessionId}": its Session or Agent is still live`)
         return false
       }
     } else {
@@ -655,10 +952,10 @@ export class TemporarySessions {
         cwd: header.cwd ?? null,
         at: Date.now(),
       })
-      if (this.deps.sessions.get(sessionId) !== undefined) {
+      if (this.hasLiveOwner(sessionId)) {
         // The owned identity above is durable, so a later pass can finish the
-        // deletion once this Session is no longer live.
-        this.warn(`deferring deletion of stored subagent "${sessionId}": its Session is still live`)
+        // deletion once this Session or Agent is no longer live.
+        this.warn(`deferring deletion of stored subagent "${sessionId}": its Session or Agent is still live`)
         return true
       }
     }
@@ -671,15 +968,19 @@ export class TemporarySessions {
       cwd: header.cwd ?? null,
       at: Date.now(),
     })
-    if (this.deps.sessions.get(sessionId) !== undefined) {
-      // The Session became live while the `deleted` append was awaiting. Keep
-      // the transcript; the already-deleted path retries after it is absent.
-      this.warn(`not removing stored subagent "${sessionId}": its Session became live during deletion`)
+    if (this.hasLiveOwner(sessionId)) {
+      // The Session or Agent became live while the `deleted` append was
+      // awaiting. Keep the transcript; the already-deleted path retries later.
+      this.warn(`not removing stored subagent "${sessionId}": its Session or Agent became live during deletion`)
       return true
     }
     this.removeOrphanDir(storage.dir, sessionId)
-    this.warn(`deleted stored subagent "${sessionId}" whose journal parent is deleted`)
-    return true
+    if (!existsSync(storage.dir)) {
+      delete this.state.sessions[sessionId]
+      this.warn(`deleted stored subagent "${sessionId}" whose journal parent is deleted`)
+      return true
+    }
+    return false
   }
 
   /**
@@ -915,7 +1216,7 @@ export class TemporarySessions {
    * @throws the filesystem failure itself.
    */
   async save() {
-    if (this.journalDegraded || this.registryDegraded) return false
+    if (this.loadFailed || this.journalDegraded || this.registryDegraded || this.reconciliationDegraded) return false
     const ticket = this.publisher.begin()
     if (ticket === undefined) return false
     const text = encodeState(this.state)
@@ -939,12 +1240,24 @@ export class TemporarySessions {
    * Publish the in-memory registry without awaiting. The unload path calls this
    * before its queued work: a queued write can be blocked behind a save that
    * never finishes, and a record that exists only in memory would otherwise be
-   * lost with this instance. It never overwrites a damaged registry file.
+   * lost with this instance. It refuses while the boot is incomplete or any
+   * ownership evidence is degraded, and associates only pending observations
+   * whose journal entry already exists. It never overwrites a damaged registry.
    * @returns {boolean} whether this write became the published registry.
    */
   flushRegistrySync() {
-    if (!this.loaded || this.registryDegraded || this.journalDegraded) return false
-    for (const session of this.pending) this.associateDescendant(session)
+    if (!this.loaded
+      || this.loadFailed
+      || this.migrationIncomplete
+      || this.registryDegraded
+      || this.journalDegraded
+      || this.reconciliationDegraded) return false
+    for (const session of this.pending) {
+      const sessionId = session?.header?.id
+      const entry = typeof sessionId === 'string' ? this.journal.entries[sessionId] : undefined
+      if (entry === undefined || entry.deleted === true) continue
+      this.associateDescendant(session)
+    }
     if (!this.registryWritableSync()) return false
     try {
       return this.publisher.publish(encodeState(this.state))
@@ -995,6 +1308,9 @@ export class TemporarySessions {
    * nothing.
    */
   refreshSnapshot() {
+    // The injected degraded seam keeps the last validated snapshot. Journal
+    // observations may still be written; the next healthy pass heals them.
+    if (this.reconciliationDegraded) return
     const sessions = []
     if (!this.journalDegraded) {
       for (const record of Object.values(this.state.sessions)) {
@@ -1054,6 +1370,9 @@ export class TemporarySessions {
     }
     if (this.registryDegraded) {
       throw new Error(`the temporary-session registry is damaged; refusing to ${action}`)
+    }
+    if (this.reconciliationDegraded) {
+      throw new Error(`temporary-session reconciliation is degraded; refusing to ${action}`)
     }
     if (this.migrationIncomplete) {
       throw new Error(`the first ownership migration is incomplete; refusing to ${action}`)
@@ -1280,78 +1599,478 @@ export class TemporarySessions {
   }
 
   /**
-   * Record a subagent child of a recorded temporary Session. The Host announces
-   * every new Session, so this runs for all of them and records only a subagent
-   * whose live ancestor chain reaches a recorded id. The record carries the
-   * child's true direct parent, and the `owned` event lands before the registry
-   * write.
+   * Observe one announced Session. The Session is queued before any await, so
+   * an announcement that arrives while the stored listing is being taken is
+   * still visible to the boot pass. When its parent is already journal-owned,
+   * `drainObserved` appends the `owned` (and inherited `pending`) events before
+   * the registry write. A failed append stays queued for the next pass.
    * @param {object} session - the Session the Host just announced.
-   * @returns {Promise<void>} settles after the registry write.
+   * @returns {Promise<void>} settles after the queue pass.
    */
   recordDescendant(session) {
-    // Pending before the queue wait, so exit cleanup sees the child while its write is queued.
-    this.pending.push(session)
+    if (typeof session?.header?.id !== 'string' || session.header.id === '') return Promise.resolve()
+    if (!this.pending.includes(session)) this.pending.push(session)
     return this.enqueue(async () => {
       await this.load()
-      if (this.migrationIncomplete) {
-        this.pending.splice(this.pending.indexOf(session), 1)
-        this.warn(`not recording "${session?.header?.id ?? 'a child'}": the first ownership migration is incomplete`)
-        return
-      }
-      const recorded = this.associateDescendant(session)
-      this.pending.splice(this.pending.indexOf(session), 1)
-      // A failed save keeps the record in memory: exit cleanup deletes it, unload publishes it, and the next save persists it.
-      // A damaged registry still admits the journal observation; only the registry publish is refused.
-      if (recorded && !this.journalDegraded) {
-        const record = this.state.sessions[session.header.id]
-        await this.appendEvent({
-          type: 'owned',
-          sessionId: record.sessionId,
-          kind: record.kind,
-          parentSessionId: record.parentSessionId,
-          dir: record.dir,
-          cwd: record.cwd,
-          at: Date.now(),
-        })
-        if (record.pendingDelete === true) {
-          await this.appendEvent({
-            type: 'pending',
-            sessionIds: [record.sessionId],
-            reason: 'discard',
-            at: Date.now(),
-          })
-        }
-        await this.save()
-      }
-      this.refreshSnapshot()
+      if (this.loadFailed) return
+      await this.drainObserved()
     })
   }
 
   /**
-   * Add the in-memory record for one announced subagent when its live ancestor chain
-   * reaches a recorded id. Synchronous; the caller decides whether to save.
+   * Drain the observed-announcement queue to a fixed point. The journal is the
+   * first durable write: a child is never added to the registry before its
+   * ownership event exists. A journal-append failure keeps the observation and
+   * removes nothing; a later `reap`, `load`, or explicit retry can finish it.
+   * @param {{ persist?: boolean }} [options] - persist the registry after additions.
+   * @returns {Promise<boolean>} whether a record or journal event was produced.
+   */
+  async drainObserved(options = {}) {
+    const persist = options.persist !== false
+    if (this.loadFailed || this.journalDegraded) return false
+    let changed = false
+    let grew = true
+    while (grew) {
+      grew = false
+      for (const session of [...this.pending]) {
+        if (await this.consumeObservation(session) === 'changed') {
+          changed = true
+          grew = true
+        }
+      }
+    }
+    if (changed) {
+      this.refreshSnapshot()
+      if (persist && !this.registryDegraded && !this.reconciliationDegraded && !this.journalDegraded) await this.save()
+    }
+    return changed
+  }
+
+  /**
+   * Drop observations that remain unproven after stored and observed
+   * reconciliation reached a fixed point. This runs outside `drainObserved`
+   * because a stored parent may become journal-owned only in the next
+   * alternating pass; dropping its observed child earlier loses the tree.
+   * The protected retry queue and an incomplete migration are never dropped.
+   * A failed or unavailable listing also keeps them: a stored parent may be
+   * present but invisible to this pass. When a successful listing omits the
+   * parent, a direct stat must confirm absence before its child is dropped.
+   * @param {Map<string, object> | undefined} stored - stored headers, if readable.
+   * @returns {Promise<void>}
+   */
+  async dropUnprovenObservations(stored) {
+    if (stored === undefined || this.journalDegraded || this.migrationIncomplete || this.reconciliationDegraded) return
+    for (const session of [...this.pending]) {
+      const sessionId = session?.header?.id
+      if (typeof sessionId !== 'string' || this.retryQueue.has(sessionId)) continue
+      if (this.hasRetryingAncestor(session)) continue
+      const parentId = session.header.parentSession
+      if (typeof parentId === 'string'
+        && parentId !== ''
+        && !stored.has(parentId)
+        && this.deps.sessions.get(parentId) === undefined) {
+        let parentHeader
+        try {
+          parentHeader = await this.storedHeader(parentId)
+        } catch (error) {
+          this.logOnce(`unproven-parent:${sessionId}`, `kept announced Session "${sessionId}" for retry: its parent header could not be read (${String(error)})`)
+          continue
+        }
+        if (parentHeader !== undefined) {
+          this.logOnce(`unproven-parent:${sessionId}`, `kept announced Session "${sessionId}" for reconciliation: its parent is absent from the listing but present in the store`)
+          continue
+        }
+      }
+      this.logOnce(`unproven:${sessionId}`, `left announced Session "${sessionId}" unrecorded: its parent has no journal anchor`)
+      this.removeObservation(session)
+    }
+  }
+
+  /**
+   * Whether an observation has an ancestor whose journal append is waiting in
+   * the protected retry queue. Its own parent may become journal-owned only
+   * after that retry, so dropping it now would lose an adoptable child.
+   * @param {object} session - announced Session.
+   * @returns {boolean} whether an ancestor observation is retrying.
+   */
+  hasRetryingAncestor(session) {
+    const seen = new Set()
+    let parentId = session?.header?.parentSession
+    while (typeof parentId === 'string' && !seen.has(parentId)) {
+      seen.add(parentId)
+      if (this.retryQueue.has(parentId)) return true
+      const parent = this.pending.find(item => item?.header?.id === parentId)
+      if (parent === undefined) return false
+      parentId = parent.header?.parentSession
+    }
+    return false
+  }
+
+  /**
+   * Process one observed announcement. Returns 'changed' when a durable event
+   * was written, 'kept' when the fixed point or retry queue must retain it, and
+   * 'removed' when it is terminal.
+   * @param {object} session - announced Session.
+   * @returns {Promise<'changed' | 'kept' | 'removed'>} outcome.
+   */
+  async consumeObservation(session) {
+    const header = session?.header
+    const sessionId = header?.id
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      this.removeObservation(session)
+      return 'removed'
+    }
+    const existing = this.journal.entries[sessionId]
+    if (existing !== undefined) return this.repairObserved(session, existing, sessionId)
+    const parentId = header.parentSession
+    if (typeof parentId !== 'string' || parentId === '') {
+      // A root Session is not a descendant; only a malformed subagent is worth
+      // reporting. Roots are registered through the browser's reserve path.
+      if (kindOfHeader(header) === 'subagent') {
+        this.logOnce(`unparented:${sessionId}`, `left announced Session "${sessionId}" unrecorded: it has no direct parent`)
+      }
+      this.removeObservation(session)
+      return 'removed'
+    }
+    const parent = this.observedParent(header)
+    if (parent === undefined) return 'kept'
+    if (parent.deleted === true) {
+      if (kindOfHeader(header) === 'subagent') {
+        return this.deleteObservedOrphan(session, header, parentId)
+      }
+      if (this.migrationIncomplete) {
+        this.logCutoff(sessionId, 'migration-incomplete')
+        return 'kept'
+      }
+      const cutoff = this.quarantineReason(header, sessionId)
+      if (cutoff !== undefined) {
+        this.logCutoff(sessionId, cutoff)
+        this.removeObservation(session)
+        return 'removed'
+      }
+      return this.adoptObservedUnderDeletedParent(session, header, parentId, parent)
+    }
+    if (this.migrationIncomplete) {
+      this.logCutoff(sessionId, 'migration-incomplete')
+      return 'kept'
+    }
+    const cutoff = this.quarantineReason(header, sessionId)
+    if (cutoff !== undefined) {
+      this.logCutoff(sessionId, cutoff)
+      this.removeObservation(session)
+      return 'removed'
+    }
+    const storage = this.resolveStorage(header)
+    if (storage === undefined || !isSafeSessionDir(storage.dir, sessionId)) {
+      this.logOnce(`storage:${sessionId}`, `left announced Session "${sessionId}" unrecorded: its JSONL storage location is unavailable`)
+      this.removeObservation(session)
+      return 'removed'
+    }
+    if (!await this.appendObserved(header, sessionId, parentId, parent, storage)) return 'kept'
+    this.associateDescendant(session)
+    this.removeObservation(session)
+    return 'changed'
+  }
+
+  /**
+   * Repair an observation whose `owned` event already exists: a missing
+   * inherited `pending` event is appended before the registry association.
+   * @param {object} session - announced Session.
+   * @param {object} existing - folded journal entry.
+   * @param {string} sessionId - child id.
+   * @returns {Promise<'changed' | 'kept' | 'removed'>} outcome.
+   */
+  async repairObserved(session, existing, sessionId) {
+    if (existing.deleted === true) {
+      this.removeObservation(session)
+      return 'removed'
+    }
+    const parent = this.observedParent(session.header)
+    if (parent?.deleted === true) {
+      if (kindOfHeader(session.header) === 'subagent') {
+        return this.deleteObservedOrphan(session, session.header, session.header.parentSession, existing)
+      }
+      if (this.migrationIncomplete) {
+        this.logCutoff(sessionId, 'migration-incomplete')
+        return 'kept'
+      }
+      let changed = false
+      let pendingNow = existing.pending === true
+      if (parent.pending === true && !pendingNow) {
+        try {
+          await this.appendEvent({
+            type: 'pending',
+            sessionIds: [sessionId],
+            reason: parent.pendingReason ?? 'discard',
+            at: Date.now(),
+          })
+          pendingNow = true
+          changed = true
+        } catch (error) {
+          this.keepForRetry(sessionId, 'pending', error)
+          return 'kept'
+        }
+      }
+      if (this.state.sessions[sessionId] === undefined) {
+        if (this.associateDescendant(session)) changed = true
+      } else if (pendingNow && this.state.sessions[sessionId].pendingDelete !== true) {
+        this.state.sessions[sessionId].pendingDelete = true
+        changed = true
+      }
+      this.removeObservation(session)
+      return changed ? 'changed' : 'removed'
+    }
+    let changed = false
+    let pendingNow = existing.pending === true
+    if (parent?.pending === true && !pendingNow) {
+      try {
+        await this.appendEvent({
+          type: 'pending',
+          sessionIds: [sessionId],
+          reason: parent.pendingReason ?? 'discard',
+          at: Date.now(),
+        })
+        pendingNow = true
+        changed = true
+      } catch (error) {
+        this.keepForRetry(sessionId, 'pending', error)
+        return 'kept'
+      }
+    }
+    if (this.state.sessions[sessionId] === undefined) {
+      if (this.associateDescendant(session)) changed = true
+    } else if (pendingNow && this.state.sessions[sessionId].pendingDelete !== true) {
+      this.state.sessions[sessionId].pendingDelete = true
+      changed = true
+    }
+    this.removeObservation(session)
+    return changed ? 'changed' : 'removed'
+  }
+
+  /**
+   * Delete a subagent observed under a journal-deleted parent. A non-subagent
+   * is left in place; a live owner keeps the observation for a later pass.
+   * @param {object} session - announced Session.
+   * @param {object} header - announced header.
+   * @param {string} parentId - true direct parent.
+   * @param {object | undefined} existing - folded journal entry, when already owned.
+   * @returns {Promise<'changed' | 'kept' | 'removed'>} outcome.
+   */
+  async deleteObservedOrphan(session, header, parentId, existing = undefined) {
+    const sessionId = header.id
+    if (kindOfHeader(header) !== 'subagent') {
+      this.logOnce(`deleted-parent:${sessionId}`, `left "${sessionId}" under its journal-deleted parent: only a subagent orphan is deleted`)
+      this.removeObservation(session)
+      return 'removed'
+    }
+    const storage = this.resolveStorage(header)
+    if (storage === undefined || !isSafeSessionDir(storage.dir, sessionId)) {
+      this.logOnce(`storage:${sessionId}`, `left announced Session "${sessionId}" unrecorded: its JSONL storage location is unavailable`)
+      this.removeObservation(session)
+      return 'removed'
+    }
+    let removed = false
+    try {
+      removed = await this.deleteOrphanedChild(sessionId, parentId, header, storage, existing)
+    } catch (error) {
+      this.keepForRetry(sessionId, 'deletion', error)
+      return 'kept'
+    }
+    const entry = this.journal.entries[sessionId]
+    if (entry?.deleted === true && !existsSync(storage.dir)) {
+      this.retryQueue.delete(sessionId)
+      this.removeObservation(session)
+      return 'changed'
+    }
+    // An owned record whose delete was deferred by a live owner is not a
+    // finished orphan. Keep the observation and its anchor for a later sweep.
+    if (!removed || entry?.deleted !== true) {
+      this.retryQueue.add(sessionId)
+      this.scheduleRetry()
+      return 'kept'
+    }
+    this.retryQueue.delete(sessionId)
+    this.removeObservation(session)
+    return 'changed'
+  }
+
+  /**
+   * Adopt an announced non-subagent under a journal-deleted direct parent. The
+   * child is journaled with its true parent and inherited pending state; the
+   * deleted parent only authorises deleting a subagent orphan.
+   * @param {object} session - announced Session.
+   * @param {object} header - announced header.
+   * @param {string} parentId - true direct parent.
+   * @param {object} parent - journal entry proving the anchor.
+   * @returns {Promise<'changed' | 'kept' | 'removed'>} outcome.
+   */
+  async adoptObservedUnderDeletedParent(session, header, parentId, parent) {
+    const sessionId = header.id
+    const storage = this.resolveStorage(header)
+    if (storage === undefined || !isSafeSessionDir(storage.dir, sessionId)) {
+      this.logOnce(`storage:${sessionId}`, `left announced Session "${sessionId}" unrecorded: its JSONL storage location is unavailable`)
+      this.removeObservation(session)
+      return 'removed'
+    }
+    if (!await this.appendObserved(header, sessionId, parentId, parent, storage)) return 'kept'
+    this.associateDescendant(session)
+    this.removeObservation(session)
+    return 'changed'
+  }
+
+  /**
+   * Append one observed child's ownership, with inherited pending state.
+   * @param {object} header - announced header.
+   * @param {string} sessionId - child id.
+   * @param {string} parentId - true direct parent.
+   * @param {object} parent - journal entry proving the anchor.
+   * @param {{ dir: string }} storage - validated locator result.
+   * @returns {Promise<boolean>} whether both required events were written.
+   */
+  async appendObserved(header, sessionId, parentId, parent, storage) {
+    try {
+      await this.appendEvent({
+        type: 'owned',
+        sessionId,
+        kind: kindOfHeader(header),
+        parentSessionId: parentId,
+        dir: storage.dir,
+        cwd: header.cwd ?? null,
+        at: Date.now(),
+      })
+      if (parent.pending === true) {
+        await this.appendEvent({
+          type: 'pending',
+          sessionIds: [sessionId],
+          reason: parent.pendingReason ?? 'discard',
+          at: Date.now(),
+        })
+      }
+      this.retryQueue.delete(sessionId)
+      return true
+    } catch (error) {
+      this.keepForRetry(sessionId, 'ownership', error)
+      return false
+    }
+  }
+
+  /**
+   * Keep one observation in the protected retry queue and log it once.
+   * @param {string} sessionId - child id.
+   * @param {string} event - event purpose.
+   * @param {unknown} error - append failure.
+   * @returns {void}
+   */
+  keepForRetry(sessionId, event, error) {
+    this.retryQueue.add(sessionId)
+    this.logOnce(`append:${sessionId}`, `keeping observed child "${sessionId}" for retry: its ${event} event could not be written (${String(error)})`)
+    this.scheduleRetry()
+  }
+
+  /**
+   * The journal entry that anchors an observed child. The direct parent is
+   * preferred; an unannounced subagent parent may be crossed when the live
+   * chain reaches a recorded ancestor. The event still names the true parent.
+   * @param {object} header - announced header.
+   * @returns {object | undefined} anchor entry.
+   */
+  observedParent(header) {
+    const direct = this.journal.entries[header.parentSession]
+    if (direct !== undefined) return direct
+    const ancestorId = this.recordedAncestor(header)
+    return ancestorId === undefined ? undefined : this.journal.entries[ancestorId]
+  }
+
+  /**
+   * Retry the protected observed queue now. `keepForRetry` also schedules this
+   * automatically with a bounded backoff; an explicit call remains safe for
+   * recovery code and tests.
+   * @returns {Promise<boolean>} whether anything was adopted.
+   */
+  retryObserved() {
+    this.clearRetryTimer()
+    return this.enqueue(async () => {
+      if (this.admissionClosed) return false
+      await this.load()
+      if (this.loadFailed || this.journalDegraded) return false
+      try {
+        const stored = this.storedListingComplete
+          ? new Map(this.bootStoredHeaders ?? [])
+          : undefined
+        if (stored !== undefined) {
+          for (const [sessionId, header] of this.storedHeaders ?? []) stored.set(sessionId, header)
+        }
+        const reconciled = await this.reconcileFixedPoint(stored)
+        const healed = this.healFromJournal(stored)
+        if (healed || reconciled.adopted || reconciled.observed) this.refreshSnapshot()
+        if ((healed || reconciled.adopted || reconciled.observed)
+          && !this.registryDegraded
+          && !this.reconciliationDegraded) await this.save()
+        if (reconciled.adopted || reconciled.observed) await this.resumePendingStops()
+        return reconciled.adopted || reconciled.observed || healed
+      } finally {
+        if (this.retryQueue.size === 0) {
+          this.retryDelayMs = RETRY_DELAY_MS
+        } else if (!this.loadFailed && !this.journalDegraded && !this.admissionClosed) {
+          this.scheduleRetry()
+        }
+      }
+    })
+  }
+
+  /**
+   * Remove one observation from the queue by identity, not by index, and clear
+   * any protected retry marker for it.
+   * @param {object} session - announced Session.
+   * @returns {void}
+   */
+  removeObservation(session) {
+    const index = this.pending.indexOf(session)
+    if (index >= 0) this.pending.splice(index, 1)
+    const sessionId = session?.header?.id
+    if (typeof sessionId === 'string') this.retryQueue.delete(sessionId)
+  }
+
+  /**
+   * Add the in-memory record for one announced descendant when its live
+   * ancestor chain reaches a recorded id. Synchronous; the caller decides
+   * whether to save. The record carries the true direct parent and every
+   * descendant kind, including a fork or side chat.
    * @param {object} session - the Session the Host announced.
    * @returns {boolean} whether a record was added.
    */
   associateDescendant(session) {
     const header = session?.header
-    if (header?.origin !== 'subagent' || typeof header.id !== 'string') return false
+    if (typeof header?.id !== 'string' || typeof header.parentSession !== 'string') return false
     if (this.state.sessions[header.id] !== undefined) return false
-    const ancestorId = this.recordedAncestor(header)
+    const existing = this.journal.entries[header.id]
+    if (existing === undefined && this.quarantineReason(header, header.id) !== undefined) return false
+    let ancestorId = this.recordedAncestor(header)
+    if (ancestorId === undefined
+      && existing !== undefined
+      && existing.deleted !== true
+      && existing.kind !== SUBAGENT_KIND
+      && existing.parentSessionId === header.parentSession
+      && this.journal.entries[header.parentSession]?.deleted === true) {
+      // The child was already journaled under a parent that has since been
+      // deleted. Its own owned identity is sufficient; do not skip the record
+      // merely because the deleted parent is not a live or recorded anchor.
+      ancestorId = header.parentSession
+    }
     if (ancestorId === undefined) return false
     const storage = this.resolveStorage(header)
     if (storage === undefined) {
-      this.warn(`could not record subagent "${header.id}": the JSONL session store is unavailable`)
+      this.warn(`could not record descendant "${header.id}": the JSONL session store is unavailable`)
       return false
     }
     const now = Date.now()
-    const parentSessionId = typeof header.parentSession === 'string' ? header.parentSession : ancestorId
+    const parentSessionId = header.parentSession
     const pendingDelete = this.journal.entries[parentSessionId]?.pending === true
       || this.journal.entries[ancestorId]?.pending === true
     try {
       this.state.sessions[header.id] = recordFields({
         sessionId: header.id,
-        kind: SUBAGENT_KIND,
+        kind: kindOfHeader(header),
         parentSessionId,
         dir: storage.dir,
         cwd: header.cwd ?? null,
@@ -1361,7 +2080,7 @@ export class TemporarySessions {
         pendingDelete,
       }, now)
     } catch (error) {
-      this.warn(`could not record subagent "${header.id}": ${String(error)}`)
+      this.warn(`could not record descendant "${header.id}": ${String(error)}`)
       return false
     }
     this.refreshSnapshot()
@@ -1371,9 +2090,10 @@ export class TemporarySessions {
   /**
    * The nearest recorded ancestor of a Session. Parent links are read from live
    * Sessions; an ancestor that is neither recorded nor live ends the walk with
-   * no answer. So does a live ancestor that is not a subagent: an ordinary fork
-   * is a boundary, and its subagents belong to the fork, not to the chat above it.
-   * The record still stores the announced Session's true direct parent.
+   * no answer. A live, unrecorded non-subagent is a boundary: its own children
+   * belong to it, not to the chat above it. A recorded parent, including a
+   * recorded fork, is returned directly. The record still stores the announced
+   * Session's true direct parent.
    * @param {object} header - the Session header whose ancestors are walked.
    * @returns {string | undefined} recorded ancestor id.
    */
@@ -1430,7 +2150,14 @@ export class TemporarySessions {
    * sequence, the degraded flag and the stopping entries.
    * @returns {Promise<object>} the browser-facing listing.
    */
-  list() {
+  async list() {
+    // A list call before startup finishes waits for the same ready promise the
+    // Host publishes; it never exposes a half-reconciled registry. A test or
+    // caller that already loaded the registry directly does not force a second
+    // destructive boot pass.
+    if (this.startPromise !== undefined) await this.startPromise
+    else if (!this.loaded) await this.start()
+    else await this.load()
     return this.enqueue(async () => {
       await this.load()
       this.sequence += 1
@@ -1441,7 +2168,7 @@ export class TemporarySessions {
         // derives its active count from pendingDelete.
         epoch: this.publisher.epoch,
         sequence: this.sequence,
-        degraded: this.journalDegraded || this.registryDegraded,
+        degraded: this.journalDegraded || this.registryDegraded || this.reconciliationDegraded,
         stopping: records
           .filter(record => record.pendingDelete === true && record.kind !== SUBAGENT_KIND)
           .map(record => ({ sessionId: record.sessionId, kind: record.kind })),
@@ -1634,6 +2361,10 @@ export class TemporarySessions {
       // The final liveness check and the removal are one synchronous turn, so
       // a same-process Session cannot become live between them.
       rmSync(target, { recursive: true, force: true })
+      if (existsSync(target)) {
+        this.warn(`could not delete temporary session "${record.sessionId}": its folder is still present`)
+        return false
+      }
       return true
     } catch (error) {
       this.warn(`could not delete temporary session "${record.sessionId}": ${String(error)}`)
@@ -1758,76 +2489,181 @@ export class TemporarySessions {
    */
   reap() {
     return this.enqueue(async () => {
+      // Capture the queue before load's own drain can adopt and remove it, so
+      // the cleanup pass still keeps the anchor that brought the child in.
+      const observedAtBoot = [...this.pending]
       await this.load()
-      if (this.journalDegraded) {
-        this.warn('skipping boot cleanup: the ownership journal is degraded')
-        return
-      }
-      const storedHeaders = new Map()
-      let listingComplete = false
-      try {
-        const snapshots = await this.deps.sessionPersistence.list()
-        for (const snapshot of snapshots) storedHeaders.set(snapshot.header.id, snapshot.header)
-        this.storedHeaders = storedHeaders
-        listingComplete = true
-      } catch (error) {
-        this.warn(`could not list stored sessions during temporary-session cleanup: ${String(error)}`)
-      }
-      // Finish tombstones first: a kill after the durable `deleted` event leaves
-      // the folder for this pass, even when its stored header is already gone.
-      await this.finishJournalDeletes(storedHeaders)
-      await this.resumePendingStops()
-      // Collected before anything is deleted, so a removed parent cannot break the chain for its children.
-      const kept = new Set()
-      for (const [sessionId, record] of Object.entries(this.state.sessions)) {
-        if (record?.kind === SUBAGENT_KIND || this.deps.sessions.get(sessionId) === undefined) continue
-        for (const child of this.descendantRecords(sessionId)) kept.add(child.sessionId)
-      }
-      // An announcement can arrive before its queued recorder runs. Keep the
-      // observed session and its parent chain through the queue handoff.
-      for (const observation of this.pending) {
-        let cursor = observation?.header?.id
-        const seen = new Set()
-        while (typeof cursor === 'string' && !seen.has(cursor)) {
-          seen.add(cursor)
-          kept.add(cursor)
-          const header = storedHeaders.get(cursor) ?? this.deps.sessions.get(cursor)?.header
-          cursor = header?.parentSession
-        }
-      }
-      let changed = false
-      for (const [sessionId, record] of Object.entries(this.state.sessions)) {
-        if (record === null || typeof record !== 'object') {
-          delete this.state.sessions[sessionId]
-          changed = true
-          continue
-        }
-        if (this.deps.sessions.get(sessionId) !== undefined || kept.has(sessionId)) continue
-        const entry = this.journal.entries[sessionId]
-        if (entry?.deleted === true && entry.deletedDir === entry.dir && !existsSync(entry.dir)) {
-          delete this.state.sessions[sessionId]
-          changed = true
-          continue
-        }
-        if (record.dir === undefined && storedHeaders.has(sessionId)) {
-          record.dir = this.dirOf(storedHeaders.get(sessionId))
-        }
-        // Authorise before clearing archive state: an unauthorised record must
-        // stay recorded and untouched.
-        if (this.deletionTarget(record) === undefined) continue
-        try {
-          await this.deps.workspaceRegistry?.unarchiveSession?.(sessionId)
-        } catch (error) {
-          this.warn(`could not clear archived state for "${sessionId}": ${String(error)}`)
-        }
-        if (!(await this.removeStorage(record))) continue
+      // A later load returns the partial state instead of throwing again. Do
+      // not publish readiness or delete from a boot that never completed.
+      if (this.loadFailed) throw this.loadError ?? new Error('temporary-session boot failed')
+      await this.reapNow(observedAtBoot)
+      this.ready = true
+    })
+  }
+
+  /**
+   * The boot cleanup body, already serialized by {@link reap}. Reconciliation
+   * and the observed queue are drained before any record is dropped. A degraded
+   * pass keeps the validated snapshot, writes no registry and deletes nothing;
+   * the next healthy pass heals the journal observations.
+   * @param {object[]} [observedAtBoot] - observations present before load drained them.
+   * @returns {Promise<void>}
+   */
+  async reapNow(observedAtBoot = []) {
+    if (this.loadFailed) {
+      this.warn('skipping boot cleanup: the registry load did not complete')
+      return
+    }
+    if (this.journalDegraded) {
+      this.warn('skipping boot cleanup: the ownership journal is degraded')
+      return
+    }
+    // Keep the boot listing separate: the fresh listing can omit an id that
+    // the boot listing saw, and omission is not absence.
+    const bootHeaders = this.storedHeaders
+    const storedHeaders = new Map()
+    let listingComplete = false
+    try {
+      const snapshots = await this.deps.sessionPersistence.list()
+      for (const snapshot of snapshots) storedHeaders.set(snapshot.header.id, snapshot.header)
+      this.storedHeaders = storedHeaders
+      this.storedListingComplete = true
+      listingComplete = true
+    } catch (error) {
+      this.storedListingComplete = false
+      this.warn(`could not list stored sessions during temporary-session cleanup: ${String(error)}`)
+    }
+    // A Session announced while the listing was being taken is in the observed
+    // queue but not in that listing. Drain it before the cleanup decision.
+    // A healthy later pass retries stored reconciliation too, so clearing a
+    // degraded seam adopts a child that was present only in the stored list.
+    // Reconcile against both listings: an omission is not absence.
+    const reconcileHeaders = listingComplete ? new Map(bootHeaders ?? []) : undefined
+    if (reconcileHeaders !== undefined) {
+      for (const [sessionId, header] of storedHeaders) reconcileHeaders.set(sessionId, header)
+    }
+    const reconciled = await this.reconcileFixedPoint(reconcileHeaders)
+    const healed = this.healFromJournal(reconcileHeaders)
+    let changed = reconciled.adopted || reconciled.observed || healed
+    // Degraded reconciliation is a write-free, delete-free pass. The journal may
+    // already hold observed descendants; the next healthy pass adopts them.
+    if (this.reconciliationDegraded) {
+      this.warn('degraded reconciliation: keeping the snapshot, writing no registry and deleting nothing')
+      return
+    }
+    if (this.registryDegraded) {
+      this.refreshSnapshot()
+      this.warn('registry degraded: keeping every folder and skipping boot cleanup')
+      return
+    }
+    // Finish tombstones first: a kill after the durable `deleted` event leaves
+    // the folder for this pass, even when its stored header is already gone.
+    await this.finishJournalDeletes(storedHeaders)
+    await this.resumePendingStops()
+    const kept = this.collectKeptSessions(storedHeaders, observedAtBoot, bootHeaders)
+    changed = await this.deleteReapedSessions(storedHeaders, kept) || changed
+    this.refreshSnapshot()
+    if (changed) await this.save()
+    if (listingComplete) await this.pruneJournal(storedHeaders, bootHeaders)
+  }
+
+  /**
+   * Collect every record that must survive this reap. A live chat keeps its
+   * descendants, a queued announcement keeps its parent chain, and an
+   * unrecorded stored or observed child keeps every recorded ancestor.
+   * @param {Map<string, object>} storedHeaders - stored headers from this reap.
+   * @param {object[]} observedAtBoot - announcements present before load drained them.
+   * @param {Map<string, object>} [bootHeaders] - stored headers read at load.
+   * @returns {Set<string>} ids that must not be deleted in this pass.
+   */
+  collectKeptSessions(storedHeaders, observedAtBoot, bootHeaders = this.storedHeaders) {
+    // Collected before anything is deleted, so a removed parent cannot break the chain for its children.
+    const kept = new Set()
+    for (const [sessionId, record] of Object.entries(this.state.sessions)) {
+      if (record === null || typeof record !== 'object' || !this.hasLiveOwner(sessionId)) continue
+      for (const child of this.descendantRecords(sessionId)) kept.add(child.sessionId)
+    }
+    // An announcement can arrive before its queued recorder runs. Keep the
+    // observed session and its parent chain through the queue handoff.
+    for (const observation of [...observedAtBoot, ...this.pending]) {
+      this.addAncestorChain(kept, observation?.header?.id, storedHeaders, bootHeaders)
+    }
+    // A recorded parent is never dropped while an unrecorded stored or observed
+    // child still names it as parent. The next start can finish the tree. When
+    // this pass's listing failed, the boot listing is still evidence, not absence.
+    // A successful listing can still omit an id that this boot's listing saw;
+    // omission is not absence. Keep anchors from both listings.
+    const anchorHeaders = new Map(bootHeaders ?? [])
+    for (const [sessionId, header] of storedHeaders) anchorHeaders.set(sessionId, header)
+    for (const header of anchorHeaders.values()) {
+      if (typeof header?.parentSession !== 'string') continue
+      if (this.journal.entries[header.id] !== undefined) continue
+      this.addAncestorChain(kept, header.parentSession, storedHeaders, bootHeaders)
+    }
+    return kept
+  }
+
+  /**
+   * Add an id and every resolvable ancestor to the kept set. The current
+   * listing wins over the boot listing; a live Session closes the chain.
+   * @param {Set<string>} kept - ids that must survive.
+   * @param {string | undefined} startId - first id to keep.
+   * @param {Map<string, object>} storedHeaders - current stored headers.
+   * @param {Map<string, object> | undefined} bootHeaders - stored headers at load.
+   * @returns {void}
+   */
+  addAncestorChain(kept, startId, storedHeaders, bootHeaders) {
+    const seen = new Set()
+    let cursor = startId
+    while (typeof cursor === 'string' && !seen.has(cursor)) {
+      seen.add(cursor)
+      kept.add(cursor)
+      const header = storedHeaders.get(cursor)
+        ?? bootHeaders?.get(cursor)
+        ?? this.deps.sessions.get(cursor)?.header
+      cursor = header?.parentSession
+    }
+  }
+
+  /**
+   * Delete every recorded Session this reap did not keep. A malformed row is
+   * dropped; a tombstone whose folder is already absent is cleared; every real
+   * removal still goes through {@link deletionTarget} and {@link removeStorage}.
+   * @param {Map<string, object>} storedHeaders - stored headers from this reap.
+   * @param {Set<string>} kept - ids that must survive.
+   * @returns {Promise<boolean>} whether the registry changed.
+   */
+  async deleteReapedSessions(storedHeaders, kept) {
+    let changed = false
+    for (const [sessionId, record] of Object.entries(this.state.sessions)) {
+      if (record === null || typeof record !== 'object') {
         delete this.state.sessions[sessionId]
         changed = true
+        continue
       }
-      this.refreshSnapshot()
-      if (changed) await this.save()
-      if (listingComplete) await this.pruneJournal(storedHeaders)
-    })
+      if (this.deps.sessions.get(sessionId) !== undefined || kept.has(sessionId)) continue
+      const entry = this.journal.entries[sessionId]
+      if (entry?.deleted === true && entry.deletedDir === entry.dir && !existsSync(entry.dir)) {
+        delete this.state.sessions[sessionId]
+        changed = true
+        continue
+      }
+      if (record.dir === undefined && storedHeaders.has(sessionId)) {
+        record.dir = this.dirOf(storedHeaders.get(sessionId))
+      }
+      // Authorise before clearing archive state: an unauthorised record must
+      // stay recorded and untouched.
+      if (this.deletionTarget(record) === undefined) continue
+      try {
+        await this.deps.workspaceRegistry?.unarchiveSession?.(sessionId)
+      } catch (error) {
+        this.warn(`could not clear archived state for "${sessionId}": ${String(error)}`)
+      }
+      if (!(await this.removeStorage(record))) continue
+      delete this.state.sessions[sessionId]
+      changed = true
+    }
+    return changed
   }
 
   /**
@@ -1868,11 +2704,16 @@ export class TemporarySessions {
    * queued observation, a pending/deleted state or its own folder needs it; a
    * reservation is retained until promoted or dropped. A no-longer-needed
    * entry gets the 30-day age bound, and the migration events are never pruned.
-   * @param {Map<string, object>} storedHeaders - stored headers from this boot.
+   * @param {Map<string, object>} storedHeaders - stored headers from this reap.
+   * @param {Map<string, object>} [bootHeaders] - stored headers read at load.
    * @returns {Promise<void>}
    */
-  async pruneJournal(storedHeaders) {
+  async pruneJournal(storedHeaders, bootHeaders = this.storedHeaders) {
     if (this.journalDegraded) return
+    // A healthy listing can omit an id the boot listing saw. Retain anchors
+    // from both so a later boot can still reconcile that child.
+    const knownHeaders = new Map(bootHeaders ?? [])
+    for (const [sessionId, header] of storedHeaders) knownHeaders.set(sessionId, header)
     const keep = new Set()
     const addAncestors = (id) => {
       const seen = new Set()
@@ -1880,13 +2721,13 @@ export class TemporarySessions {
       while (typeof cursor === 'string' && !seen.has(cursor)) {
         seen.add(cursor)
         keep.add(cursor)
-        const header = storedHeaders.get(cursor) ?? this.deps.sessions.get(cursor)?.header
+        const header = knownHeaders.get(cursor) ?? this.deps.sessions.get(cursor)?.header
         cursor = header?.parentSession
       }
     }
     for (const record of Object.values(this.state.sessions)) addAncestors(record.sessionId)
     for (const observation of this.pending) addAncestors(observation?.header?.id)
-    for (const header of storedHeaders.values()) {
+    for (const header of knownHeaders.values()) {
       if (typeof header.parentSession === 'string' && this.journal.entries[header.parentSession] !== undefined) {
         keep.add(header.parentSession)
       }
@@ -2004,8 +2845,8 @@ export class TemporarySessions {
     this.flushRegistrySync()
     return this.enqueue(async () => {
       await this.load()
-      if (this.journalDegraded) {
-        this.warn('skipping unload cleanup: the ownership journal is degraded')
+      if (this.loadFailed || this.journalDegraded || this.registryDegraded || this.reconciliationDegraded || this.migrationIncomplete) {
+        this.warn('skipping unload cleanup: the ownership evidence is degraded')
         return
       }
       for (const record of Object.values(this.state.sessions)) {

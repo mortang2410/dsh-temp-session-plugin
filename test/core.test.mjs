@@ -82,6 +82,30 @@ function legacyRecord(session, kind = 'main', parentSessionId = null) {
   }
 }
 
+/**
+ * Seed the ownership journal for one journal-owned parent. Tests that need a
+ * known migration cutoff use `at`; the parent is owned just before it.
+ */
+async function seedOwnedParent(parent, {
+  at = 100,
+  ids = [parent.id],
+  preexisting = [parent.id],
+  pending = false,
+  complete = true,
+} = {}) {
+  await appendJournalEvent(journalFile, { type: 'migration', ids, preexisting, at })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: parent.header.cwd ?? null, at: at + 1,
+  })
+  if (pending) {
+    await appendJournalEvent(journalFile, {
+      type: 'pending', sessionIds: [parent.id], reason: 'discard', at: at + 2,
+    })
+  }
+  if (complete) await appendJournalEvent(journalFile, { type: 'migrationComplete', at: at + 3 })
+}
+
 /** Write a version-1 registry index directly, as a previous run would have. */
 async function writeRegistry(sessions) {
   await mkdir(stateDir, { recursive: true })
@@ -133,6 +157,16 @@ async function materializeSession(id) {
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'log')
   return dir
+}
+
+/** Poll a synchronous or asynchronous predicate for a bounded time. */
+async function waitFor(predicate, message, timeout = 2000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  assert.fail(message)
 }
 
 before(async () => {
@@ -388,6 +422,40 @@ test('cleanupPending removes only ended Sessions', async () => {
   assert.equal(await readFile(join(liveDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
 })
 
+test('unload does not publish an unjournaled observed child', async () => {
+  const parent = fakeSession('session-unload-parent', { createdAt: 1 })
+  const child = fakeSession('session-unload-child', {
+    origin: 'subagent', parentSession: parent.id, createdAt: 101,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [parent.header] })
+  await h.temp.load()
+  const append = h.temp.appendEvent
+  h.temp.appendEvent = async function failChild(event) {
+    if (event.sessionId === child.id) throw new Error('injected child append failure')
+    return append.call(this, event)
+  }
+  await h.temp.recordDescendant(child)
+  assert.ok(h.temp.pending.includes(child))
+  assert.equal(h.temp.journal.entries[child.id], undefined)
+  assert.equal(h.temp.state.sessions[child.id], undefined)
+  h.temp.clearRetryTimer()
+  h.temp.appendEvent = append
+  await h.temp.cleanupPending()
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[child.id], undefined)
+})
+
+test('unload writes no registry while the first migration is incomplete', async () => {
+  const h = harness()
+  h.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await h.temp.load()
+  assert.equal(h.temp.loaded, true)
+  assert.equal(h.temp.migrationIncomplete, true)
+  await h.temp.cleanupPending()
+  await assert.rejects(readFile(stateFile, 'utf8'), /ENOENT/)
+})
+
 test('a corrupt registry never throws and never deletes blindly', async () => {
   await mkdir(join(root, 'temp-session'), { recursive: true })
   await writeFile(stateFile, '{not json')
@@ -424,11 +492,13 @@ async function chatWithChild() {
   return { h, chat, child }
 }
 
-test('a subagent under a recorded chat is recorded at creation; other Sessions are not', async () => {
+test('a recorded chat records its announced subagent and post-migration fork', async () => {
   const chat = fakeSession('session-chat')
   const child = fakeSession('session-child', { origin: 'subagent', parentSession: chat.id })
-  // A plain fork of a chat is not a subagent, so it is left to the browser path.
-  const fork = fakeSession('session-plain-fork', { parentSession: chat.id, isSeeded: true })
+  // A fork announced after the first migration is temporary too, at any kind.
+  const fork = fakeSession('session-plain-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
   // A subagent whose parent is neither recorded nor live is a guess, so it is refused.
   const stranger = fakeSession('session-stranger', { origin: 'subagent', parentSession: 'session-nowhere' })
   const h = harness({
@@ -439,7 +509,9 @@ test('a subagent under a recorded chat is recorded at creation; other Sessions a
   await h.temp.recordDescendant(fork)
   await h.temp.recordDescendant(stranger)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
-  assert.deepEqual(Object.keys(saved.sessions).sort(), ['session-chat', 'session-child'])
+  assert.deepEqual(Object.keys(saved.sessions).sort(), ['session-chat', 'session-child', 'session-plain-fork'])
+  assert.equal(saved.sessions[fork.id].kind, 'fork')
+  assert.equal(saved.sessions[fork.id].parentSessionId, chat.id)
   const { createdAt, lastActivityAt, activitySince, ...record } = saved.sessions[child.id]
   for (const clock of [createdAt, lastActivityAt, activitySince]) {
     assert.ok(Number.isSafeInteger(clock) && clock > 0)
@@ -553,21 +625,31 @@ test('boot reap deletes a child whose parent record is gone, and drops a child w
   assert.deepEqual(JSON.parse(await readFile(stateFile, 'utf8')).sessions, {})
 })
 
-test('a subagent of an ordinary fork is not recorded under the chat the fork came from', async () => {
+test('a recorded fork owns its subagent, and the whole tree is temporary', async () => {
   const chat = fakeSession('session-chat')
-  // An ordinary fork of the chat is live and unrecorded. Its subagent belongs to the fork.
-  const fork = fakeSession('session-plain-fork', { parentSession: chat.id, isSeeded: true })
-  const child = fakeSession('session-plain-child', { origin: 'subagent', parentSession: fork.id })
+  // The fork is a live descendant of the chat and is announced before its child.
+  const fork = fakeSession('session-plain-fork', {
+    parentSession: chat.id, isSeeded: true, createdAt: Date.now() + 1000,
+  })
+  const child = fakeSession('session-plain-child', {
+    origin: 'subagent', parentSession: fork.id, createdAt: Date.now() + 2000,
+  })
   const h = harness({ sessions: new Map([[chat.id, chat], [fork.id, fork], [child.id, child]]) })
   await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(fork)
   await h.temp.recordDescendant(child)
   const saved = JSON.parse(await readFile(stateFile, 'utf8'))
-  assert.deepEqual(Object.keys(saved.sessions), [chat.id])
-  // Ending the chat must leave the fork's subagent log alone.
+  assert.deepEqual(Object.keys(saved.sessions).sort(), [chat.id, child.id, fork.id].sort())
+  assert.equal(saved.sessions[child.id].parentSessionId, fork.id)
+  // Ending the chat ends its recorded fork and that fork's subagent too.
+  const chatDir = await materializeSession(chat.id)
+  const forkDir = await materializeSession(fork.id)
   const childDir = await materializeSession(child.id)
   await h.temp.discard({ sessionId: chat.id })
   await h.temp.cleanupPending()
-  assert.equal(await readFile(join(childDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+  for (const dir of [chatDir, forkDir, childDir]) {
+    assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), false)
+  }
 })
 
 test('reap keeps a settled child while its live chat stays, through every depth, and promotion keeps its log', async () => {
@@ -589,6 +671,27 @@ test('reap keeps a settled child while its live chat stays, through every depth,
   await h.temp.promote({ sessionId: chat.id })
   assert.equal(cleanupSnapshotSync(h.temp.exitSnapshot()), 0)
   assert.equal(await readFile(join(leafDir, 'session.v4.jsonl.zstd'), 'utf8'), 'log')
+})
+
+test('a live subagent keeps its descendants at reap', async () => {
+  const chat = fakeSession('session-live-subagent-chat')
+  const middle = fakeSession('session-live-subagent-middle', {
+    origin: 'subagent', parentSession: chat.id,
+  })
+  const leaf = fakeSession('session-live-subagent-leaf', {
+    origin: 'subagent', parentSession: middle.id,
+  })
+  const h = harness({ sessions: new Map([[chat.id, chat], [middle.id, middle], [leaf.id, leaf]]) })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(middle)
+  await h.temp.recordDescendant(leaf)
+  const leafDir = await materializeSession(leaf.id)
+  h.deps.sessionPersistence.list = async () => [chat, middle, leaf].map(session => ({ header: session.header }))
+  h.live.delete(chat.id)
+  h.live.delete(leaf.id)
+  await h.temp.reap()
+  assert.equal(existsSync(join(leafDir, 'session.v4.jsonl.zstd')), true)
+  assert.notEqual(h.temp.state.sessions[leaf.id], undefined)
 })
 
 test('exit cleanup also deletes a child whose registry save has not finished', async () => {
@@ -766,14 +869,14 @@ test('a failed child save keeps the record for exit cleanup and for the next suc
 })
 
 /**
- * After an unload that left records only in memory: each child's record is on disk, a fresh
- * instance's boot reap keeps the children while the chat is live, and that instance's exit
- * cleanup deletes the journal-owned children with the chat. A child whose announcement never
- * reached the journal is published, then adopted on boot under its journal-owned parent.
+ * After an unload that left records only in memory: each journaled child's
+ * record is on disk, a fresh instance's boot reap adopts any stored child whose
+ * announcement never reached the journal, and that instance's exit cleanup
+ * deletes the journal-owned children with the chat.
  */
-async function assertUnloadPublishes(h, addedExitListeners, { chatDir, children }) {
+async function assertUnloadPublishes(h, addedExitListeners, { chatDir, children, published = children }) {
   const onDisk = JSON.parse(await readFile(stateFile, 'utf8'))
-  for (const child of children) assert.notEqual(onDisk.sessions[child.id], undefined)
+  for (const child of published) assert.notEqual(onDisk.sessions[child.id], undefined)
   for (const child of children) h.live.delete(child.id)
   const successor = new TemporarySessions(h.temp.deps)
   await successor.reap()
@@ -791,7 +894,7 @@ async function assertUnloadPublishes(h, addedExitListeners, { chatDir, children 
   await assert.rejects(readFile(join(chatDir, 'session.v4.jsonl.zstd')), /ENOENT/)
 }
 
-test('unload publishes a child queued behind a held save, so a fresh boot and exit still see it', () => withFreshProcessCleanup(async addedExitListeners => {
+test('unload publishes only the journaled child and boot adopts the queued one', () => withFreshProcessCleanup(async addedExitListeners => {
   const chat = fakeSession('session-chat')
   const first = fakeSession('session-first', { origin: 'subagent', parentSession: chat.id })
   const second = fakeSession('session-second', { origin: 'subagent', parentSession: chat.id })
@@ -811,13 +914,17 @@ test('unload publishes a child queued behind a held save, so a fresh boot and ex
   void h.temp.recordDescendant(second)
   assert.notEqual(h.temp.state.sessions[first.id], undefined)
   assert.equal(h.temp.state.sessions[second.id], undefined)
-  // Unload runs while the queue is blocked. It publishes both records without waiting;
-  // the boot after exit adopts the unjournaled child under its journal-owned chat.
+  // Unload runs while the queue is blocked. It publishes the journaled first
+  // child; the queued second child waits for the boot stored pass.
   void h.temp.cleanupPending()
+  const published = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.notEqual(published.sessions[first.id], undefined)
+  assert.equal(published.sessions[second.id], undefined)
   h.deps.sessionPersistence.list = async () => [chat, first, second].map(session => ({ header: session.header }))
   await assertUnloadPublishes(h, addedExitListeners, {
     chatDir,
     children: [{ id: first.id, dir: firstDir }, { id: second.id, dir: secondDir }],
+    published: [{ id: first.id, dir: firstDir }],
   })
 }))
 
@@ -2507,6 +2614,704 @@ test('stored descendants reconcile to a fixed point when the child is listed fir
   }
 })
 
+test('a reversed fork chain reaches a fixed point', async () => {
+  const parent = fakeSession('session-fork-parent', { createdAt: 1 })
+  const child = fakeSession('session-fork-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const grand = fakeSession('session-fork-grand', {
+    isSeeded: true, parentSession: child.id, createdAt: 102,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [grand.header, child.header, parent.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[grand.id].parentSessionId, child.id)
+  assert.equal(h.temp.state.sessions[child.id].kind, 'fork')
+  assert.equal(h.temp.state.sessions[grand.id].kind, 'fork')
+})
+
+test('an alternating chain reaches a fixed point', async () => {
+  const parent = fakeSession('session-alternating-parent', { createdAt: 1 })
+  const fork = fakeSession('session-alternating-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const subagent = fakeSession('session-alternating-subagent', {
+    origin: 'subagent', parentSession: fork.id, createdAt: 102,
+  })
+  const leaf = fakeSession('session-alternating-leaf', {
+    isSeeded: true, parentSession: subagent.id, createdAt: 103,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [leaf.header, subagent.header, fork.header, parent.header] })
+  await h.temp.load()
+  for (const session of [fork, subagent, leaf]) {
+    assert.notEqual(h.temp.journal.entries[session.id], undefined)
+  }
+  assert.equal(h.temp.journal.entries[leaf.id].parentSessionId, subagent.id)
+  assert.equal(h.temp.state.sessions[leaf.id].kind, 'fork')
+})
+
+test('adoption inherits pending', async () => {
+  const parent = fakeSession('session-adopting-parent', { createdAt: 1 })
+  const child = fakeSession('session-adopting-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id], pending: true })
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id].pending, true)
+  assert.equal(h.temp.state.sessions[child.id].pendingDelete, true)
+  assert.ok((await journalLines()).some(event => event.type === 'pending' && event.sessionIds.includes(child.id)))
+})
+
+test('the migration cutoff separates old and new forks', async () => {
+  const parent = fakeSession('session-cutoff-parent', { createdAt: 1 })
+  const old = fakeSession('session-cutoff-old', {
+    isSeeded: true, parentSession: parent.id, createdAt: 100,
+  })
+  const fresh = fakeSession('session-cutoff-new', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const oldDir = await materializeSession(old.id)
+  const freshDir = await materializeSession(fresh.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id, old.id] })
+  const h = harness({ stored: [fresh.header, old.header, parent.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[old.id], undefined)
+  assert.equal(h.temp.journal.entries[fresh.id].parentSessionId, parent.id)
+  assert.equal(existsSync(join(oldDir, 'session.v4.jsonl.zstd')), true)
+
+  // While the first migration is incomplete, the fresh fork is neither
+  // adopted nor deleted. The next start with the listing available retries.
+  await rm(stateDir, { recursive: true, force: true })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 101,
+  })
+  const deferred = harness({ stored: [fresh.header, parent.header] })
+  deferred.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await deferred.temp.load()
+  assert.equal(deferred.temp.migrationIncomplete, true)
+  assert.equal(deferred.temp.journal.entries[fresh.id], undefined)
+  assert.equal(existsSync(join(freshDir, 'session.v4.jsonl.zstd')), true)
+  const retried = harness({ stored: [fresh.header, parent.header] })
+  await retried.temp.load()
+  assert.equal(retried.temp.journal.entries[fresh.id].parentSessionId, parent.id)
+})
+
+test('a valid marker proves completion after its final journal line is lost', async () => {
+  const parent = fakeSession('session-marker-parent', { createdAt: 1 })
+  const child = fakeSession('session-marker-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'migration', ids: [parent.id], preexisting: [parent.id], at: 100,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 101,
+  })
+  await writeFile(markerFile, JSON.stringify({ version: 1, migrationAt: 100, completedAt: 103 }))
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  assert.equal(h.temp.migrationIncomplete, false)
+  assert.equal(h.temp.journal.entries[child.id].parentSessionId, parent.id)
+})
+
+test('a seeded child with an invalid creation time is quarantined', async () => {
+  const parent = fakeSession('session-invalid-parent', { createdAt: 1 })
+  const child = fakeSession('session-invalid-child', {
+    isSeeded: true, parentSession: parent.id,
+  })
+  const childDir = await materializeSession(child.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id], undefined)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('creation time is invalid')))
+})
+
+test('an equal or rolled-back clock is not adopted', async () => {
+  const parent = fakeSession('session-clock-parent', { createdAt: 1 })
+  const equal = fakeSession('session-clock-equal', {
+    isSeeded: true, parentSession: parent.id, createdAt: 100,
+  })
+  const rolled = fakeSession('session-clock-rolled', {
+    isSeeded: true, parentSession: parent.id, createdAt: 99,
+  })
+  const equalDir = await materializeSession(equal.id)
+  const rolledDir = await materializeSession(rolled.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [rolled.header, equal.header, parent.header] })
+  await h.temp.load()
+  await h.temp.reap()
+  assert.equal(h.temp.journal.entries[equal.id], undefined)
+  assert.equal(h.temp.journal.entries[rolled.id], undefined)
+  assert.equal(existsSync(join(equalDir, 'session.v4.jsonl.zstd')), true)
+  assert.equal(existsSync(join(rolledDir, 'session.v4.jsonl.zstd')), true)
+})
+
+test('an attach-failed reservation is promoted at startup', async () => {
+  const h = harness()
+  await h.temp.load()
+  const reserved = await h.temp.reserve({ cwd: '/tmp/project' })
+  const header = {
+    id: reserved.sessionId, cwd: '/tmp/project', createdAt: reserved.at + 1,
+  }
+  h.deps.sessionPersistence.stat = async id => (id === reserved.sessionId ? { header, revision: 'r' } : undefined)
+  h.deps.sessionPersistence.list = async () => [{ header }]
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.load()
+  const owned = (await journalLines()).find(event => event.type === 'owned' && event.sessionId === reserved.sessionId)
+  assert.equal(owned.kind, 'main')
+  assert.deepEqual(restarted.exitSnapshot().sessions.map(item => item.sessionId), [reserved.sessionId])
+})
+
+test('reservations resolve only on definite evidence', async () => {
+  const h = harness()
+  await h.temp.load()
+  const retained = await h.temp.reserve({ cwd: '/tmp/project' })
+  const dropped = await h.temp.reserve({ cwd: '/tmp/project' })
+  h.deps.sessionPersistence.stat = async id => {
+    if (id === retained.sessionId) throw new Error('header unreadable')
+    return undefined
+  }
+  let listings = 0
+  h.deps.sessionPersistence.list = async () => {
+    listings += 1
+    return []
+  }
+  await h.temp.resolveReservations(undefined)
+  let lines = await journalLines()
+  assert.equal(lines.some(event => event.type === 'reservationDropped' && event.sessionId === retained.sessionId), false)
+  assert.equal(lines.some(event => event.type === 'reservationDropped' && event.sessionId === dropped.sessionId), false)
+  await h.temp.resolveReservations(new Map())
+  lines = await journalLines()
+  assert.equal(lines.some(event => event.type === 'reservationDropped' && event.sessionId === retained.sessionId), false)
+  assert.ok(lines.some(event => event.type === 'reservationDropped' && event.sessionId === dropped.sessionId))
+  assert.equal(listings, 0)
+})
+
+test('an unreadable journal retains its reservation and writes nothing', async () => {
+  const h = harness()
+  await h.temp.load()
+  const reserved = await h.temp.reserve({ cwd: '/tmp/project' })
+  await writeFile(journalFile, `${await readFile(journalFile, 'utf8')}not an ownership event\n`)
+  const before = await readFile(journalFile, 'utf8')
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.load()
+  assert.equal(restarted.journalDegraded, true)
+  assert.equal(await readFile(journalFile, 'utf8'), before)
+  assert.equal(before.includes('reservationDropped'), false)
+  assert.equal(before.includes('reserved'), true)
+})
+
+test('a deleted-parent orphan is deleted', async () => {
+  const parent = fakeSession('session-deleted-parent', { createdAt: 1 })
+  const child = fakeSession('session-deleted-child', {
+    origin: 'subagent', parentSession: parent.id, createdAt: 101,
+  })
+  const childDir = await materializeSession(child.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id, child.id] })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 105,
+  })
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+  assert.equal(h.temp.journal.entries[child.id].deleted, true)
+  assert.ok(warnings.some(message => message.includes('deleted stored subagent')))
+})
+
+test('an already-owned observed subagent is deleted under its deleted parent', async () => {
+  const parent = fakeSession('session-observed-deleted-parent', { createdAt: 1 })
+  const child = fakeSession('session-observed-deleted-child', {
+    origin: 'subagent', parentSession: parent.id, createdAt: 101,
+  })
+  const childDir = await materializeSession(child.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  await appendJournalEvent(journalFile, {
+    type: 'owned', sessionId: child.id, kind: 'subagent', parentSessionId: parent.id,
+    dir: sessionDirOf(child.id), cwd: '/tmp/project', at: 102,
+  })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 105,
+  })
+  const h = harness()
+  await h.temp.recordDescendant(child)
+  assert.equal(h.temp.journal.entries[child.id].deleted, true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a live observed orphan stays queued until its owner is gone', async () => {
+  const parent = fakeSession('session-live-orphan-parent', { createdAt: 1 })
+  const child = fakeSession('session-live-orphan-child', {
+    origin: 'subagent', parentSession: parent.id, createdAt: 101,
+  })
+  const childDir = await materializeSession(child.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 105,
+  })
+  const h = harness({ sessions: new Map([[child.id, child]]) })
+  await h.temp.recordDescendant(child)
+  assert.ok(h.temp.pending.includes(child))
+  assert.notEqual(h.temp.journal.entries[child.id].deleted, true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  h.live.delete(child.id)
+  await h.temp.retryObserved()
+  assert.equal(h.temp.journal.entries[child.id].deleted, true)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), false)
+})
+
+test('a deleted parent adopts its stored fork without deleting its transcript', async () => {
+  const parent = fakeSession('session-deleted-fork-parent', { createdAt: 1 })
+  const fork = fakeSession('session-deleted-fork-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const forkDir = await materializeSession(fork.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id], pending: true })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 105,
+  })
+  const h = harness({ stored: [fork.header, parent.header] })
+  await h.temp.load()
+  assert.notEqual(h.temp.journal.entries[fork.id], undefined)
+  assert.equal(h.temp.journal.entries[fork.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[fork.id].kind, 'fork')
+  assert.equal(h.temp.journal.entries[fork.id].pending, true)
+  assert.notEqual(h.temp.state.sessions[fork.id], undefined)
+  assert.equal(h.temp.state.sessions[fork.id].kind, 'fork')
+  assert.equal(h.temp.state.sessions[fork.id].parentSessionId, parent.id)
+  assert.equal(h.temp.state.sessions[fork.id].pendingDelete, true)
+  assert.ok(h.temp.exitSnapshot().sessions.some(record => record.sessionId === fork.id))
+  assert.equal(existsSync(join(forkDir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('adopted stored fork') && message.includes('journal-deleted parent')))
+})
+
+test('a post-migration observed fork under a deleted parent is adopted, not deleted', async () => {
+  const parent = fakeSession('session-observed-deleted-fork-parent', { createdAt: 1 })
+  const fork = fakeSession('session-observed-deleted-fork-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const forkDir = await materializeSession(fork.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id], pending: true })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 105,
+  })
+  const h = harness()
+  await h.temp.recordDescendant(fork)
+  assert.equal(h.temp.journal.entries[fork.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[fork.id].pending, true)
+  assert.notEqual(h.temp.state.sessions[fork.id], undefined)
+  assert.equal(h.temp.state.sessions[fork.id].kind, 'fork')
+  assert.equal(h.temp.state.sessions[fork.id].pendingDelete, true)
+  assert.equal(existsSync(join(forkDir, 'session.v4.jsonl.zstd')), true)
+  assert.equal(h.temp.pending.includes(fork), false)
+})
+
+/** Announce a seeded child under a deleted parent and assert it was quarantined. */
+async function assertObservedCutoff(id, { preexisting = [], createdAt } = {}) {
+  const parent = fakeSession(`${id}-parent`, { createdAt: 1 })
+  const child = fakeSession(id, {
+    isSeeded: true, parentSession: parent.id, createdAt,
+  })
+  const childDir = await materializeSession(child.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id, ...preexisting] })
+  await appendJournalEvent(journalFile, {
+    type: 'deleted', sessionId: parent.id, kind: 'main', parentSessionId: null,
+    dir: sessionDirOf(parent.id), cwd: '/tmp/project', at: 105,
+  })
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  await h.temp.recordDescendant(child)
+  assert.equal(h.temp.journal.entries[child.id], undefined)
+  assert.equal(h.temp.state.sessions[child.id], undefined)
+  assert.equal(h.temp.exitSnapshot().sessions.some(record => record.sessionId === child.id), false)
+  assert.equal(h.temp.pending.includes(child), false)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  return warnings
+}
+
+test('a pre-existing observed child under a deleted parent is quarantined', async () => {
+  const messages = await assertObservedCutoff('session-observed-cutoff-preexisting', {
+    preexisting: ['session-observed-cutoff-preexisting'], createdAt: 101,
+  })
+  assert.ok(messages.some(message => message.includes('quarantined "session-observed-cutoff-preexisting": it is in the pre-existing snapshot')))
+})
+
+test('an observed child under a deleted parent with an invalid creation time is quarantined', async () => {
+  const messages = await assertObservedCutoff('session-observed-cutoff-invalid', {
+    createdAt: Number.NaN,
+  })
+  assert.ok(messages.some(message => message.includes('quarantined "session-observed-cutoff-invalid": its creation time is invalid')))
+})
+
+test('an observed child under a deleted parent at the migration cutoff is quarantined', async () => {
+  const messages = await assertObservedCutoff('session-observed-cutoff-equal', {
+    createdAt: 100,
+  })
+  assert.ok(messages.some(message => message.includes('quarantined "session-observed-cutoff-equal": it was created at or before the migration cutoff')))
+})
+
+test('an unproven orphan is left alone', async () => {
+  const child = fakeSession('session-permanent-child', {
+    origin: 'subagent', parentSession: 'session-permanent-parent', createdAt: 101,
+  })
+  const childDir = await materializeSession(child.id)
+  const h = harness({ stored: [child.header] })
+  await h.temp.load()
+  assert.equal(h.temp.journal.entries[child.id], undefined)
+  assert.equal(existsSync(join(childDir, 'session.v4.jsonl.zstd')), true)
+  assert.ok(warnings.some(message => message.includes('no journal anchor')))
+})
+
+test('an anchor record survives reap', async () => {
+  const parent = fakeSession('session-anchor-parent', { createdAt: 1 })
+  const child = fakeSession('session-anchor-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 50,
+  })
+  const parentDir = await materializeSession(parent.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id, child.id] })
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  await h.temp.reap()
+  assert.equal(h.temp.journal.entries[child.id], undefined)
+  assert.equal(existsSync(join(parentDir, 'session.v4.jsonl.zstd')), true)
+  assert.notEqual(h.temp.state.sessions[parent.id], undefined)
+})
+
+test('an omitted stored child still anchors its parent at reap', async () => {
+  const parent = fakeSession('session-omitted-parent', { createdAt: 1 })
+  const child = fakeSession('session-omitted-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 50,
+  })
+  const parentDir = await materializeSession(parent.id)
+  await materializeSession(child.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id, child.id] })
+  const h = harness({ stored: [child.header, parent.header] })
+  await h.temp.load()
+  // A later successful listing omits the unrecorded child. Its earlier
+  // presence is still anchor evidence, so the parent must not be reaped.
+  h.deps.sessionPersistence.list = async () => [{ header: parent.header }]
+  await h.temp.reap()
+  assert.equal(existsSync(join(parentDir, 'session.v4.jsonl.zstd')), true)
+  assert.notEqual(h.temp.state.sessions[parent.id], undefined)
+})
+
+test('the observed queue closes the listing gap', async () => {
+  const parent = fakeSession('session-gap-parent', { createdAt: 1 })
+  const fork = fakeSession('session-gap-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const leaf = fakeSession('session-gap-leaf', {
+    isSeeded: true, parentSession: fork.id, createdAt: 102,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  // The leaf is in the stored listing; its parent is only in the observed queue.
+  const h = harness({ stored: [parent.header, leaf.header] })
+  const originalList = h.deps.sessionPersistence.list
+  h.deps.sessionPersistence.list = async () => {
+    await gate
+    return originalList()
+  }
+  const loading = h.temp.load()
+  await Promise.resolve()
+  const observed = h.temp.recordDescendant(fork)
+  release()
+  await loading
+  await observed
+  assert.equal(h.temp.journal.entries[fork.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[leaf.id].parentSessionId, fork.id)
+  assert.equal(h.temp.state.sessions[fork.id].kind, 'fork')
+  assert.equal(h.temp.state.sessions[leaf.id].kind, 'fork')
+})
+
+test('an unavailable listing keeps an observed child for retry', async () => {
+  const parent = fakeSession('session-listing-fail-parent', { createdAt: 1 })
+  const stored = fakeSession('session-listing-fail-stored', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const observed = fakeSession('session-listing-fail-observed', {
+    isSeeded: true, parentSession: stored.id, createdAt: 102,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [stored.header, parent.header] })
+  h.deps.sessionPersistence.list = async () => { throw new Error('listing unavailable') }
+  await h.temp.recordDescendant(observed)
+  assert.equal(h.temp.journal.entries[observed.id], undefined)
+  assert.ok(h.temp.pending.includes(observed))
+})
+
+test('an omitted temporary parent keeps its announced child queued', async () => {
+  const rootSession = fakeSession('session-omitted-temp-root', { createdAt: 1 })
+  const parent = fakeSession('session-omitted-temp-parent', {
+    isSeeded: true, parentSession: rootSession.id, createdAt: 101,
+  })
+  const child = fakeSession('session-omitted-temp-child', {
+    isSeeded: true, parentSession: parent.id, createdAt: 102,
+  })
+  await seedOwnedParent(rootSession, { at: 100, preexisting: [rootSession.id] })
+  const h = harness({ stored: [rootSession.header, child.header] })
+  h.deps.sessionPersistence.stat = async id => {
+    if (id === parent.id) return { header: parent.header, revision: 'revision' }
+    const header = [rootSession.header, child.header].find(candidate => candidate.id === id)
+    return header === undefined ? undefined : { header, revision: 'revision' }
+  }
+  await h.temp.recordDescendant(child)
+  assert.ok(h.temp.pending.includes(child))
+  await h.temp.reap()
+  assert.ok(h.temp.pending.includes(child))
+  assert.equal(h.temp.journal.entries[child.id], undefined)
+  assert.ok(warnings.some(message => message.includes('absent from the listing but present in the store')))
+})
+
+test('an observed child waits for its stored parent', async () => {
+  const parent = fakeSession('session-observed-parent', { createdAt: 1 })
+  const observedFork = fakeSession('session-observed-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const storedFork = fakeSession('session-observed-stored-fork', {
+    isSeeded: true, parentSession: observedFork.id, createdAt: 102,
+  })
+  const observedLeaf = fakeSession('session-observed-leaf', {
+    isSeeded: true, parentSession: storedFork.id, createdAt: 103,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [storedFork.header, parent.header] })
+  await Promise.all([
+    h.temp.recordDescendant(observedFork),
+    h.temp.recordDescendant(observedLeaf),
+  ])
+  assert.equal(h.temp.journal.entries[observedFork.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[storedFork.id].parentSessionId, observedFork.id)
+  assert.equal(h.temp.journal.entries[observedLeaf.id].parentSessionId, storedFork.id)
+  assert.equal(h.temp.state.sessions[observedLeaf.id].kind, 'fork')
+})
+
+test('degraded reconciliation touches no registry and retries', async () => {
+  const parent = fakeSession('session-degraded-parent', { createdAt: 1 })
+  const fork = fakeSession('session-degraded-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const parentDir = await materializeSession(parent.id)
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [parent.header] })
+  h.temp.reconciliationDegraded = true
+  await h.temp.load()
+  await h.temp.recordDescendant(fork)
+  assert.equal(h.temp.journal.entries[fork.id].parentSessionId, parent.id)
+  assert.deepEqual(h.temp.exitSnapshot().sessions, [])
+  await assert.rejects(readFile(stateFile, 'utf8'), /ENOENT/)
+  await h.temp.reap()
+  assert.equal(existsSync(join(parentDir, 'session.v4.jsonl.zstd')), true)
+  await assert.rejects(readFile(stateFile, 'utf8'), /ENOENT/)
+  h.temp.reconciliationDegraded = false
+  await h.temp.reap()
+  const saved = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(saved.sessions[fork.id].parentSessionId, parent.id)
+})
+
+test('degraded reconciliation keeps an unproven observation for retry', async () => {
+  const parent = fakeSession('session-degraded-observed-parent', { createdAt: 1 })
+  const stored = fakeSession('session-degraded-observed-stored', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const observed = fakeSession('session-degraded-observed-child', {
+    isSeeded: true, parentSession: stored.id, createdAt: 102,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness({ stored: [stored.header, parent.header] })
+  h.temp.reconciliationDegraded = true
+  await h.temp.load()
+  await h.temp.recordDescendant(observed)
+  assert.equal(h.temp.journal.entries[observed.id], undefined)
+  assert.ok(h.temp.pending.includes(observed))
+  h.temp.reconciliationDegraded = false
+  await h.temp.reap()
+  assert.equal(h.temp.journal.entries[stored.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[observed.id].parentSessionId, stored.id)
+})
+
+test('a degraded manual fork is journaled', async () => {
+  const parent = fakeSession('session-degraded-manual-parent', { createdAt: 1 })
+  const fork = fakeSession('session-degraded-manual-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  await writeRegistry({})
+  await writeFile(stateFile, '{damaged')
+  const h = harness({ stored: [parent.header] })
+  await h.temp.load()
+  assert.equal(h.temp.registryDegraded, true)
+  await h.temp.recordDescendant(fork)
+  assert.ok((await journalLines()).some(event => event.type === 'owned' && event.sessionId === fork.id))
+  assert.equal(h.temp.state.sessions[fork.id].kind, 'fork')
+  await writeRegistry({})
+  h.deps.sessionPersistence.list = async () => [{ header: parent.header }, { header: fork.header }]
+  const recovered = new TemporarySessions(h.deps)
+  await recovered.load()
+  assert.notEqual(recovered.state.sessions[fork.id], undefined)
+})
+
+test('a failed append retries without a restart', async () => {
+  const parent = fakeSession('session-retry-parent', { createdAt: 1 })
+  const fork = fakeSession('session-retry-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id], pending: true })
+  const h = harness({
+    stored: [parent.header],
+    sessions: new Map([[fork.id, fork]]),
+    registry: { running: [fork.id] },
+  })
+  await h.temp.load()
+  const append = h.temp.appendEvent
+  let failures = 1
+  h.temp.appendEvent = async function failOnce(event) {
+    if (failures > 0) {
+      failures -= 1
+      throw new Error('injected journal append failure')
+    }
+    return append.call(this, event)
+  }
+  await h.temp.recordDescendant(fork)
+  assert.ok(h.temp.pending.includes(fork))
+  assert.equal(h.temp.journal.entries[fork.id], undefined)
+  assert.equal(h.temp.state.sessions[fork.id], undefined)
+  h.temp.appendEvent = append
+  await waitFor(
+    () => h.temp.journal.entries[fork.id] !== undefined && !h.temp.pending.includes(fork),
+    'the protected observation did not retry without another event',
+  )
+  assert.equal(h.temp.journal.entries[fork.id].pending, true)
+  assert.equal(h.temp.state.sessions[fork.id].pendingDelete, true)
+  assert.equal(h.temp.pending.includes(fork), false)
+  assert.equal(h.temp.retryQueue.has(fork.id), false)
+  assert.deepEqual(h.cancelled, [fork.id])
+})
+
+test('a failed inherited-pending append repairs without a restart', async () => {
+  const parent = fakeSession('session-repair-parent', { createdAt: 1 })
+  const fork = fakeSession('session-repair-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id], pending: true })
+  const h = harness({
+    stored: [parent.header],
+    sessions: new Map([[fork.id, fork]]),
+    registry: { running: [fork.id] },
+  })
+  await h.temp.load()
+  const append = h.temp.appendEvent
+  let failed = false
+  h.temp.appendEvent = async function failPending(event) {
+    if (!failed && event.type === 'pending' && event.sessionIds.includes(fork.id)) {
+      failed = true
+      throw new Error('injected inherited-pending failure')
+    }
+    return append.call(this, event)
+  }
+  await h.temp.recordDescendant(fork)
+  assert.equal(h.temp.journal.entries[fork.id].pending, false)
+  assert.ok(h.temp.retryQueue.has(fork.id))
+  assert.ok(h.temp.pending.includes(fork))
+  h.temp.appendEvent = append
+  await waitFor(
+    () => h.temp.journal.entries[fork.id]?.pending === true && !h.temp.pending.includes(fork),
+    'the inherited-pending observation did not repair without another event',
+  )
+  assert.equal(h.temp.state.sessions[fork.id].pendingDelete, true)
+  assert.equal(h.temp.retryQueue.has(fork.id), false)
+  assert.deepEqual(h.cancelled, [fork.id])
+})
+
+test('a retrying ancestor protects its observed descendant', async () => {
+  const parent = fakeSession('session-retry-ancestor-parent', { createdAt: 1 })
+  const fork = fakeSession('session-retry-ancestor-fork', {
+    isSeeded: true, parentSession: parent.id, createdAt: 101,
+  })
+  const leaf = fakeSession('session-retry-ancestor-leaf', {
+    isSeeded: true, parentSession: fork.id, createdAt: 102,
+  })
+  await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
+  const h = harness()
+  await h.temp.load()
+  const append = h.temp.appendEvent
+  let failing = true
+  h.temp.appendEvent = async function failWhileDegraded(event) {
+    if (failing) throw new Error('injected ancestor append failure')
+    return append.call(this, event)
+  }
+  await h.temp.recordDescendant(fork)
+  await h.temp.recordDescendant(leaf)
+  await h.temp.dropUnprovenObservations(new Map())
+  assert.ok(h.temp.pending.includes(leaf))
+  failing = false
+  h.temp.appendEvent = append
+  await h.temp.retryObserved()
+  assert.equal(h.temp.journal.entries[fork.id].parentSessionId, parent.id)
+  assert.equal(h.temp.journal.entries[leaf.id].parentSessionId, fork.id)
+  assert.equal(h.temp.pending.includes(leaf), false)
+})
+
+test('a list call before ready waits', async () => {
+  const h = harness()
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let first = true
+  h.deps.sessionPersistence.list = async () => {
+    if (first) {
+      first = false
+      await gate
+    }
+    return []
+  }
+  let settled = false
+  const listing = h.temp.list().then(result => {
+    settled = true
+    return result
+  })
+  await Promise.resolve()
+  assert.equal(settled, false)
+  release()
+  await listing
+  assert.equal(settled, true)
+})
+
+test('a list call waits for reap readiness, not only load', async () => {
+  const h = harness()
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const original = h.temp.reapNow
+  h.temp.reapNow = async function delayedReap(...args) {
+    await gate
+    return original.apply(this, args)
+  }
+  let settled = false
+  const listing = h.temp.list().then(result => {
+    settled = true
+    return result
+  })
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(settled, false)
+  release()
+  await listing
+  assert.equal(settled, true)
+})
+
 test('an owned id survives a corrupt registry', async () => {
   const chat = fakeSession('session-owned', { createdAt: 50 })
   const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
@@ -2993,6 +3798,10 @@ test('a journal-directory fsync failure leaves the migration gate closed', async
   try {
     await assert.rejects(h.temp.load(), /ownership-journal directory/)
     assert.equal(h.temp.migrationIncomplete, true)
+    await assert.rejects(h.temp.start(), /ownership-journal directory/)
+    assert.equal(h.temp.ready, false)
+    assert.equal(h.temp.exitSnapshot().degraded, true)
+    assert.deepEqual(h.temp.exitSnapshot().sessions, [])
     await assert.rejects(h.temp.register({ sessionId: chat.id }), /migration is incomplete/)
     const lines = await journalLines()
     assert.equal(lines.some(event => event.type === 'migration'), true)
