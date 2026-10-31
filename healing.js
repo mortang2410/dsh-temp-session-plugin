@@ -44,6 +44,14 @@ export const RECOVERY_LOG_BYTES = 1_000_000
 /** Number of old recovery logs kept beside the current one. */
 export const RECOVERY_LOG_BACKUPS = 5
 
+/** Record field names the private recovery log may carry. */
+export const RECOVERY_FIELD_NAMES = Object.freeze([
+  'sessionId', 'dir', 'cwd', 'kind', 'parentSessionId', 'title',
+  'createdAt', 'lastActivityAt', 'activitySince', 'pendingDelete',
+])
+
+const RECOVERY_FIELDS = new Set(RECOVERY_FIELD_NAMES)
+
 /** Maximum nesting accepted from a registry value. */
 const MAX_JSON_DEPTH = 64
 
@@ -437,6 +445,39 @@ function scanSessions(buffer, start) {
 }
 
 /**
+ * Scan the raw bytes of one unresolved member fragment. This is the only
+ * parser a model proposal is allowed to feed: it reports the exact map key and
+ * the complete fields before the first truncation, without interpreting the
+ * model's text.
+ * @param {Buffer} buffer - fragment bytes, normally beginning with a JSON key.
+ * @returns {{ ok: boolean, reason?: string, key?: string, keyStart?: number, entries?: Array<{ key: string, value: object }>, incompleteKey?: string }} fragment.
+ */
+export function inspectFragment(buffer) {
+  let cursor = skipWhitespace(buffer, 0)
+  let key
+  let keyStart
+  if (buffer[cursor] === 0x22) {
+    keyStart = cursor
+    const token = scanString(buffer, cursor)
+    if (!token.ok) return { ok: false, reason: 'malformed-key' }
+    key = token.value
+    cursor = skipWhitespace(buffer, token.end)
+    if (buffer[cursor] !== 0x3a) return { ok: false, reason: 'malformed-member' }
+    cursor = skipWhitespace(buffer, cursor + 1)
+  }
+  if (buffer[cursor] !== 0x7b) return { ok: false, reason: 'not-an-object' }
+  const prefix = scanMemberPrefix(buffer, cursor)
+  if (prefix.broken) return { ok: false, reason: 'malformed-member' }
+  return {
+    ok: true,
+    key,
+    keyStart,
+    entries: prefix.entries.map(entry => ({ key: entry.key, value: nodeValue(entry.value) })),
+    incompleteKey: prefix.incompleteKey,
+  }
+}
+
+/**
  * Inspect registry bytes as spans.
  *
  * Only a complete member object directly inside the top-level `sessions`
@@ -675,7 +716,9 @@ export class RecoveryStore {
     for (const key of ['id', 'offset', 'reason', 'field', 'count', 'version', 'state']) {
       const value = details[key]
       if (key === 'id' && (typeof value !== 'string' || value.length === 0 || value.length > 200)) continue
-      if (key === 'reason' || key === 'field' || key === 'state') {
+      if (key === 'field') {
+        if (typeof value !== 'string' || !RECOVERY_FIELDS.has(value)) continue
+      } else if (key === 'reason' || key === 'state') {
         if (typeof value !== 'string' || !/^[a-z0-9-]{1,64}$/.test(value)) continue
       }
       if (key === 'offset' || key === 'count' || key === 'version') {

@@ -16,6 +16,7 @@ import {
   statePaths,
 } from './core.js'
 import { tempSessionContribution } from './remote.js'
+import { createModelSanity } from './model-sanity.js'
 
 /** Loader diagnostics name. */
 export const name = 'temp-session'
@@ -41,6 +42,11 @@ export async function apply(ctx) {
     logger: log,
     paths,
   })
+
+  // The model pass is advisory and only reads the unresolved backlog. It is
+  // deliberately started by `temp.start()` after the deterministic boot, not
+  // awaited there, so a missing or slow gateway cannot delay readiness.
+  temp.modelSanity = createModelSanity(temp, paths)
 
   // Every announced Session passes here. A descendant of a recorded chat, at
   // any kind and depth, is queued, journaled before its registry write, and

@@ -22,6 +22,17 @@ All notable changes to this project are documented here. The format follows
   fork of a fork and a fork of a recorded subagent. Its true direct parent is
   recorded, and a late descendant of a pending tree inherits pending/stopping
   and is enqueued for a stop.
+- Unresolved registry fragments can now receive an optional, non-authoritative
+  model sanity pass after deterministic healing. It uses the local Bifrost
+  gateway at `http://127.0.0.1:8090/v1/chat/completions` with model alias
+  `strata/qwen-strata`, sends one fragment at a time, caps a fragment at 4 KB,
+  allows two attempts, aborts at a 10 second deadline and never delays startup.
+  A proposed reading is re-parsed from the exact bytes and must pass the same
+  key, membership, header and journal-ownership checks; the model cannot add an
+  id, create an association or authorise deletion. Only allowlisted decision
+  codes and field names reach the private recovery log, and unresolved
+  fragments stay in the backlog for the next start. The path is exercised by
+  `test/probes/model-recovery.mjs`.
 - A damaged registry is rebuilt deterministically from the ownership journal
   and stored DSH headers. The byte-span scan validates the member key,
   `sessionId`, `sessions` membership, folder, kind, direct parent, `createdAt`

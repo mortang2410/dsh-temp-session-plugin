@@ -22,6 +22,11 @@ import {
 import { appendJournalEvent, replayJournal, writeJournalMarker } from '../journal.js'
 import { Publisher } from '../publisher.js'
 import { readRecord, recordFields } from '../records.js'
+import {
+  MODEL_ALIAS, MODEL_ENDPOINT, MODEL_FRAGMENT_BYTES, MODEL_MAX_ATTEMPTS, MODEL_TIMEOUT_MS,
+  ModelSanity, createModelSanity, parseModelAnswer, validateModelProposal,
+} from '../model-sanity.js'
+import { RecoveryStore } from '../healing.js'
 import { tempSessionDescriptors } from '../remote.js'
 import { cleanupAllSync as oldCleanupAllSync } from './fixtures/old-reader-c9e1f51.mjs'
 
@@ -5251,4 +5256,576 @@ test('unload clears the expiry timer', async () => {
   assert.notEqual(ah.temp.activityTimer, undefined)
   ah.temp.closeAdmission()
   assert.equal(ah.temp.activityTimer, undefined)
+})
+
+/** One backlog line with an exact member fragment. */
+function modelFragment(key = 'session-model-a', suffix = '') {
+  return `"${key}":{"sessionId":"${key}","dir":"/tmp/project","kind":"main","parentSessionId":null${suffix}`
+}
+
+async function writeModelBacklog(records) {
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(join(stateDir, 'records.unresolved.jsonl'), records.map(record => `${JSON.stringify(record)}\n`).join(''))
+}
+
+function modelEntry(key = 'session-model-a', bytes = modelFragment(key)) {
+  return {
+    v: 1,
+    source: 'model-review',
+    offset: 0,
+    reason: 'truncated-member',
+    bytes: Buffer.from(bytes).toString('base64'),
+  }
+}
+
+function modelAnswer(value) {
+  return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(value) } }] }) }
+}
+
+function modelContext(key = 'session-model-a') {
+  return {
+    members: new Set([key]),
+    journalEntry: { dir: '/tmp/project', kind: 'main', parentSessionId: null, cwd: null },
+    header: { id: key, createdAt: 1 },
+    storageDir: '/tmp/project',
+  }
+}
+
+test('the model flags an inconsistent fragment', async () => {
+  const key = 'session-model-inconsistent'
+  await writeModelBacklog([modelEntry(key)])
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async () => modelAnswer({
+      looksLikeRecord: true,
+      inconsistentFields: ['dir', 'SENSITIVE ECHO', 'title'],
+      proposal: null,
+    }),
+    timeoutMs: 100,
+  })
+  const parsed = parseModelAnswer(JSON.stringify({
+    looksLikeRecord: true,
+    inconsistentFields: ['SENSITIVE ECHO', 'dir'],
+    proposal: null,
+  }))
+  assert.deepEqual(parsed.inconsistentFields, ['dir'])
+  const result = await worker.start()
+  assert.equal(result.processed, 1)
+  assert.equal(result.rejected, 0)
+  assert.deepEqual(log, [
+    { event: 'model-sanity', reason: 'inconsistent', offset: 0, field: 'dir' },
+    { event: 'model-sanity', reason: 'inconsistent', offset: 0, field: 'title' },
+  ])
+  // The model only annotates; the deterministic scan still owns the bytes.
+  assert.doesNotMatch(JSON.stringify(log), /SENSITIVE ECHO/)
+})
+
+test('an invented association is rejected', async () => {
+  const key = 'session-model-invented'
+  const bytes = Buffer.from(`"${key}":{"sessionId":"${key}","dir":"/tmp/project","kind":"main"`)
+  const answer = parseModelAnswer(JSON.stringify({
+    looksLikeRecord: true,
+    inconsistentFields: [],
+    proposal: { sessionId: key, parentSessionId: 'session-invented-parent' },
+  }))
+  assert.deepEqual(validateModelProposal(bytes, answer, modelContext(key)), {
+    accepted: false,
+    reason: 'invented-field',
+  })
+  const otherId = parseModelAnswer(JSON.stringify({ looksLikeRecord: true, inconsistentFields: [], proposal: { sessionId: 'session-other' } }))
+  assert.deepEqual(validateModelProposal(bytes, otherId, modelContext(key)), {
+    accepted: false,
+    reason: 'invented-id',
+  })
+
+  await writeModelBacklog([modelEntry(key)])
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async () => modelAnswer({
+      looksLikeRecord: true,
+      inconsistentFields: [],
+      proposal: { sessionId: 'session-other' },
+    }),
+    timeoutMs: 100,
+    validate: (entry, answer) => validateModelProposal(entry.bytes, answer, modelContext(key)),
+  })
+  await worker.start()
+  assert.ok(log.some(entry => entry.reason === 'invented-id'))
+})
+
+test('a model reading is re-validated', async () => {
+  const key = 'session-model-valid'
+  const bytes = Buffer.from(modelFragment(key))
+  const answer = parseModelAnswer(JSON.stringify({
+    looksLikeRecord: true,
+    inconsistentFields: [],
+    proposal: { sessionId: key, dir: '/tmp/project', kind: 'main', parentSessionId: null },
+  }))
+  assert.deepEqual(validateModelProposal(bytes, answer, { members: new Set([key]) }), {
+    accepted: false,
+    reason: 'not-owned',
+  })
+  assert.deepEqual(validateModelProposal(bytes, answer, {
+    ...modelContext(key),
+    journalEntry: { dir: '/tmp/other', kind: 'main', parentSessionId: null, cwd: null },
+  }), { accepted: false, reason: 'dir-mismatch' })
+
+  const tampered = parseModelAnswer(JSON.stringify({
+    looksLikeRecord: true,
+    inconsistentFields: [],
+    proposal: { sessionId: key, dir: '/tmp/other', kind: 'main', parentSessionId: null },
+  }))
+  assert.deepEqual(validateModelProposal(bytes, tampered, {
+    ...modelContext(key),
+    journalEntry: { dir: '/tmp/other', kind: 'main', parentSessionId: null, cwd: null },
+    storageDir: '/tmp/other',
+  }), { accepted: false, reason: 'value-mismatch' })
+  assert.deepEqual(validateModelProposal(bytes, answer, modelContext(key)), {
+    accepted: true,
+    reason: 'candidate',
+  })
+
+  await writeModelBacklog([modelEntry(key)])
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async () => modelAnswer({
+      looksLikeRecord: true,
+      inconsistentFields: [],
+      proposal: { sessionId: key, dir: '/tmp/project', kind: 'main', parentSessionId: null },
+    }),
+    timeoutMs: 100,
+    validate: (entry, candidate) => validateModelProposal(entry.bytes, candidate, modelContext(key)),
+  })
+  await worker.start()
+  assert.ok(log.some(entry => entry.reason === 'candidate'))
+})
+
+test('a model echo is redacted', async () => {
+  const key = 'session-model-echo'
+  await writeModelBacklog([modelEntry(key)])
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async () => modelAnswer({
+      looksLikeRecord: true,
+      inconsistentFields: ['title'],
+      proposal: { sessionId: key, title: 'SENSITIVE TITLE', dir: '/SENSITIVE/PATH' },
+      notes: 'SENSITIVE TITLE /SENSITIVE/PATH',
+    }),
+    timeoutMs: 100,
+    validate: () => ({ accepted: false, reason: 'invented-field' }),
+  })
+  await worker.start()
+  const text = JSON.stringify(log)
+  assert.doesNotMatch(text, /SENSITIVE/)
+  assert.match(text, /"field":"title"/)
+})
+
+test('the deadline aborts the request', async () => {
+  const key = 'session-model-deadline'
+  await writeModelBacklog([modelEntry(key)])
+  let aborted = false
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async (body, init) => new Promise((resolve, reject) => {
+      // Hold the transport open until the worker's deadline aborts it.
+      init.signal.addEventListener('abort', () => {
+        aborted = true
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      })
+    }),
+    timeoutMs: 40,
+  })
+  const started = Date.now()
+  const result = await worker.start()
+  assert.equal(aborted, true)
+  assert.ok(Date.now() - started < 500, 'the deadline did not stop the pass')
+  assert.equal(result.skipped, 1)
+  assert.deepEqual(log, [{ event: 'model-sanity', reason: 'deadline', offset: 0 }])
+})
+
+test('two attempts at most', async () => {
+  const key = 'session-model-attempts'
+  await writeModelBacklog([modelEntry(key)])
+  let calls = 0
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    transport: async () => {
+      calls += 1
+      if (calls === 1) throw new Error('transient gateway failure')
+      return modelAnswer({ looksLikeRecord: true, inconsistentFields: [], proposal: { sessionId: key } })
+    },
+    timeoutMs: 100,
+    validate: (entry, answer) => validateModelProposal(entry.bytes, answer, modelContext(key)),
+  })
+  const result = await worker.start()
+  assert.equal(calls, 2)
+  assert.equal(result.candidates, 1)
+
+  let failures = 0
+  const failing = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    transport: async () => { failures += 1; throw new Error('gateway unavailable') },
+    timeoutMs: 100,
+  })
+  const failed = await failing.start()
+  assert.equal(failures, 2)
+  assert.equal(failed.skipped, 1)
+})
+
+test('single flight and the size cap', async () => {
+  const key = 'session-model-single'
+  const large = modelEntry('session-model-too-large', `${'x'.repeat(5000)}`)
+  await writeModelBacklog([large, modelEntry(key)])
+  let calls = 0
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  let body
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    transport: async (requestBody) => {
+      calls += 1
+      body = requestBody
+      await gate
+      return modelAnswer({ looksLikeRecord: true, inconsistentFields: [], proposal: { sessionId: key } })
+    },
+    timeoutMs: 1000,
+    validate: (entry, answer) => validateModelProposal(entry.bytes, answer, modelContext(key)),
+  })
+  const first = worker.start()
+  const second = worker.start()
+  assert.equal(first, second)
+  assert.equal(calls, 1)
+  release()
+  const result = await first
+  assert.equal(calls, 1)
+  assert.equal(result.skipped, 1)
+  assert.equal(body.messages[1].content, modelFragment(key))
+  assert.ok(body.messages[1].content.length < 4096)
+})
+
+test('an unavailable gateway keeps the backlog', async () => {
+  const key = 'session-model-backlog'
+  await writeModelBacklog([modelEntry(key)])
+  const backlog = join(stateDir, 'records.unresolved.jsonl')
+  const before = await readFile(backlog, 'utf8')
+  const log = []
+  const worker = new ModelSanity({
+    backlog,
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async () => { throw new Error('gateway unavailable') },
+    timeoutMs: 100,
+    validate: (entry, answer) => validateModelProposal(entry.bytes, answer, modelContext(key)),
+  })
+  const failed = await worker.start()
+  assert.equal(failed.skipped, 1)
+  assert.equal(await readFile(backlog, 'utf8'), before)
+  assert.ok(log.some(entry => entry.reason === 'gateway-unavailable'))
+
+  worker.transport = async () => modelAnswer({ looksLikeRecord: true, inconsistentFields: [], proposal: { sessionId: key } })
+  const retried = await worker.start()
+  assert.equal(retried.candidates, 1)
+  assert.equal(await readFile(backlog, 'utf8'), before)
+})
+
+test('the model is not asked to authorise', async () => {
+  const key = 'session-model-authority'
+  await writeModelBacklog([modelEntry(key)])
+  let request
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async body => {
+      request = body
+      return modelAnswer({
+        looksLikeRecord: true,
+        inconsistentFields: [],
+        proposal: { sessionId: key },
+        authorizeDelete: true,
+        action: 'delete',
+      })
+    },
+    timeoutMs: 100,
+    validate: (entry, answer) => validateModelProposal(entry.bytes, answer, modelContext(key)),
+  })
+  const result = await worker.start()
+  assert.equal(result.candidates, 1)
+  assert.doesNotMatch(JSON.stringify(request), /authorize|delete/i)
+  assert.doesNotMatch(JSON.stringify(log), /authorize|delete/i)
+
+  // A complete registry with no unresolved backlog never reaches the model.
+  let emptyCalls = 0
+  const noBacklog = new ModelSanity({
+    backlog: join(root, 'empty-model-backlog.jsonl'),
+    transport: async () => { emptyCalls += 1; return modelAnswer({ looksLikeRecord: true, inconsistentFields: [] }) },
+    timeoutMs: 100,
+  })
+  assert.deepEqual(await noBacklog.start(), { processed: 0, candidates: 0, rejected: 0, skipped: 0 })
+  assert.equal(emptyCalls, 0)
+})
+
+test('the model pass starts after the deterministic boot', async () => {
+  const chat = fakeSession('session-model-boot')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  let release
+  let started = false
+  let aborted = 0
+  const gate = new Promise(resolve => { release = resolve })
+  h.temp.modelSanity = {
+    start: async () => {
+      started = true
+      assert.equal(h.temp.loaded, true)
+      assert.equal(h.temp.ready, true)
+      return gate
+    },
+    abort: () => { aborted += 1 },
+  }
+  const began = Date.now()
+  await h.temp.start()
+  await waitFor(() => started, 'the model pass did not start')
+  assert.ok(Date.now() - began < 1000, 'the model pass delayed startup')
+  h.temp.closeAdmission()
+  assert.equal(aborted, 1)
+  release()
+  await h.temp.modelPass
+})
+
+test('the model validation uses the boot context', async () => {
+  const chat = fakeSession('session-model-context', { createdAt: 10 })
+  const dir = await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  h.temp.registrySources = [chat.id]
+  h.temp.storedHeaders = new Map([[chat.id, chat.header]])
+  const bytes = Buffer.from(`"${chat.id}":{"sessionId":"${chat.id}","dir":"${dir}","kind":"main","parentSessionId":null`)
+  const answer = parseModelAnswer(JSON.stringify({
+    looksLikeRecord: true,
+    inconsistentFields: [],
+    proposal: { sessionId: chat.id, dir, kind: 'main', parentSessionId: null },
+  }))
+  assert.deepEqual(h.temp.validateModelFragment({ bytes }, answer), {
+    accepted: true,
+    reason: 'candidate',
+  })
+
+  h.temp.registrySources = []
+  assert.deepEqual(h.temp.validateModelFragment({ bytes }, answer), {
+    accepted: false,
+    reason: 'not-member',
+  })
+  h.temp.registrySources = [chat.id]
+
+  const journalEntry = h.temp.journal.entries[chat.id]
+  delete h.temp.journal.entries[chat.id]
+  assert.deepEqual(h.temp.validateModelFragment({ bytes }, answer), {
+    accepted: false,
+    reason: 'not-owned',
+  })
+  h.temp.journal.entries[chat.id] = journalEntry
+
+  const headers = h.temp.storedHeaders
+  h.temp.storedHeaders = new Map()
+  h.live.clear()
+  assert.deepEqual(h.temp.validateModelFragment({ bytes }, answer), {
+    accepted: false,
+    reason: 'no-header',
+  })
+  h.temp.storedHeaders = headers
+  h.live.set(chat.id, chat)
+
+  const resolve = h.temp.resolveStorage
+  h.temp.resolveStorage = () => undefined
+  assert.deepEqual(h.temp.validateModelFragment({ bytes }, answer), {
+    accepted: false,
+    reason: 'no-locator',
+  })
+  h.temp.resolveStorage = resolve
+})
+
+test('the model pass is skipped for degraded boots', async () => {
+  const h = harness()
+  let calls = 0
+  h.temp.modelSanity = { start: async () => { calls += 1; return { processed: 0 } } }
+  h.temp.journalDegraded = true
+  await h.temp.startModelSanity()
+  assert.equal(calls, 0)
+  h.temp.journalDegraded = false
+
+  h.temp.registryUnsupported = true
+  await h.temp.startModelSanity()
+  assert.equal(calls, 0)
+  h.temp.registryUnsupported = false
+
+  h.temp.registryAmbiguous = true
+  await h.temp.startModelSanity()
+  assert.equal(calls, 0)
+  h.temp.registryAmbiguous = false
+
+  h.temp.registryUnreadable = true
+  await h.temp.startModelSanity()
+  assert.equal(calls, 0)
+  h.temp.registryUnreadable = false
+
+  h.temp.admissionClosed = true
+  await h.temp.startModelSanity()
+  assert.equal(calls, 0)
+  h.temp.admissionClosed = false
+
+  await h.temp.startModelSanity()
+  assert.equal(calls, 1)
+})
+
+test('a shutdown abort stops a late model answer', async () => {
+  const key = 'session-model-abort'
+  await writeModelBacklog([modelEntry(key)])
+  let started = false
+  let aborted = false
+  let calls = 0
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const log = []
+  const worker = new ModelSanity({
+    backlog: join(stateDir, 'records.unresolved.jsonl'),
+    log: (event, details) => log.push({ event, ...details }),
+    transport: async (_body, init) => {
+      calls += 1
+      started = true
+      init.signal.addEventListener('abort', () => { aborted = true }, { once: true })
+      await gate
+      return modelAnswer({ looksLikeRecord: true, inconsistentFields: [], proposal: { sessionId: key } })
+    },
+    timeoutMs: 1000,
+    validate: (entry, answer) => validateModelProposal(entry.bytes, answer, modelContext(key)),
+  })
+  const pass = worker.start()
+  await waitFor(() => started, 'the model transport did not start')
+  worker.abort()
+  assert.equal(aborted, true)
+  release()
+  await pass
+  assert.deepEqual(log, [])
+  assert.equal(calls, 1)
+  let reads = 0
+  worker.entries = () => {
+    reads += 1
+    return []
+  }
+  assert.deepEqual(await worker.start(), { processed: 0, candidates: 0, rejected: 0, skipped: 0 })
+  assert.equal(calls, 1)
+  assert.equal(reads, 0)
+})
+
+test('the recovery log keeps model field names', async () => {
+  const paths = statePaths({ DSH_HOME: root })
+  const store = new RecoveryStore({ paths })
+  store.log('model-sanity', { reason: 'inconsistent', offset: 0, field: 'parentSessionId' })
+  store.log('model-sanity', { reason: 'inconsistent', offset: 0, field: 'pendingDelete' })
+  store.log('model-sanity', { reason: 'inconsistent', offset: 0, field: 'SENSITIVE' })
+  store.log('model-sanity', { reason: 'inconsistent', offset: 0, field: 'SENSITIVE FIELD' })
+  const text = await readFile(paths.recoveryLog, 'utf8')
+  assert.match(text, /"field":"parentSessionId"/)
+  assert.match(text, /"field":"pendingDelete"/)
+  assert.doesNotMatch(text, /SENSITIVE/)
+})
+
+test('the core validates a real unresolved fragment', async () => {
+  const chat = fakeSession('session-model-core-chat', { createdAt: 10 })
+  const frag = fakeSession('session-model-core-frag', { createdAt: 20 })
+  await materializeSession(chat.id)
+  await materializeSession(frag.id)
+  await seedOwnedSessions([{ session: chat }, { session: frag }])
+  const fragBytes = `"${frag.id}":{"sessionId":"${frag.id}","dir":"${sessionDirOf(frag.id)}","kind":"main","parentSessionId":null`
+  await writeRawRegistry(`{"version":1,"sessions":{"${chat.id}":${JSON.stringify(recordOf(chat))},${fragBytes}`)
+  const h = harness({
+    sessions: new Map([[chat.id, chat], [frag.id, frag]]),
+    stored: [chat.header, frag.header],
+  })
+  await h.temp.load()
+  const answer = parseModelAnswer(JSON.stringify({
+    looksLikeRecord: true,
+    inconsistentFields: [],
+    proposal: {
+      sessionId: frag.id,
+      dir: sessionDirOf(frag.id),
+      kind: 'main',
+      parentSessionId: null,
+    },
+  }))
+  assert.deepEqual(h.temp.validateModelFragment({ bytes: Buffer.from(fragBytes) }, answer), {
+    accepted: true,
+    reason: 'candidate',
+  })
+})
+
+test('the model gateway defaults are fixed', async () => {
+  assert.equal(MODEL_ENDPOINT, 'http://127.0.0.1:8090/v1/chat/completions')
+  assert.equal(MODEL_ALIAS, 'strata/qwen-strata')
+  assert.equal(MODEL_TIMEOUT_MS, 10_000)
+  assert.equal(MODEL_MAX_ATTEMPTS, 2)
+  assert.equal(MODEL_FRAGMENT_BYTES, 4 * 1024)
+
+  const defaultsWorker = new ModelSanity({ backlog: join(stateDir, 'records.unresolved.jsonl') })
+  assert.equal(defaultsWorker.endpoint, MODEL_ENDPOINT)
+  assert.equal(defaultsWorker.model, MODEL_ALIAS)
+  assert.equal(defaultsWorker.timeoutMs, MODEL_TIMEOUT_MS)
+  assert.equal(defaultsWorker.maxAttempts, MODEL_MAX_ATTEMPTS)
+  assert.equal(defaultsWorker.maxFragmentBytes, MODEL_FRAGMENT_BYTES)
+
+  const key = 'session-model-defaults'
+  await writeModelBacklog([modelEntry(key)])
+  let url
+  let body
+  const original = globalThis.fetch
+  globalThis.fetch = async (requestedUrl, init) => {
+    url = requestedUrl
+    body = JSON.parse(init.body)
+    return modelAnswer({ looksLikeRecord: true, inconsistentFields: [], proposal: null })
+  }
+  try {
+    const worker = new ModelSanity({
+      backlog: join(stateDir, 'records.unresolved.jsonl'),
+      timeoutMs: 100,
+    })
+    await worker.start()
+  } finally {
+    globalThis.fetch = original
+  }
+  assert.equal(url, MODEL_ENDPOINT)
+  assert.equal(body.model, MODEL_ALIAS)
+})
+
+test('the production model worker is wired to the core', async () => {
+  const key = 'session-model-production'
+  await writeModelBacklog([modelEntry(key)])
+  const log = []
+  let validated = 0
+  const temp = {
+    recovery: { log: (event, details) => log.push({ event, ...details }) },
+    validateModelFragment: () => {
+      validated += 1
+      return { accepted: true, reason: 'candidate' }
+    },
+  }
+  const worker = createModelSanity(temp, { unresolved: join(stateDir, 'records.unresolved.jsonl') })
+  worker.transport = async () => modelAnswer({
+    looksLikeRecord: true,
+    inconsistentFields: [],
+    proposal: { sessionId: key },
+  })
+  worker.timeoutMs = 100
+  const result = await worker.start()
+  assert.equal(result.candidates, 1)
+  assert.equal(validated, 1)
+  assert.ok(log.some(entry => entry.reason === 'candidate'))
 })

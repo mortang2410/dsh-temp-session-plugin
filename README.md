@@ -198,6 +198,15 @@ Safety boundaries:
   degraded the plugin writes and deletes nothing; while only the registry is
   degraded it keeps journaling trusted observations and retries the healing
   transaction.
+- After the deterministic pass, an optional model sanity pass reads each
+  unresolved fragment one at a time from the backlog through the local Bifrost
+  gateway at `http://127.0.0.1:8090/v1/chat/completions` with model alias
+  `strata/qwen-strata`. It is single-flight, caps a fragment at 4 KB, allows two
+  attempts, aborts at a 10 second deadline and never gates readiness. A model
+  proposal is re-parsed from the exact bytes and must match the same key,
+  membership, header and journal ownership before it is logged as a candidate;
+  the model never authorises deletion. Only allowlisted decision codes and field
+  names enter the private recovery log, never prompts, titles or paths.
 - The plugin never deletes attachments or other sessions' data.
 
 ## Privacy
@@ -251,7 +260,7 @@ written:
 
 ## Verification
 
-- `npm run check`: 284 Host/client tests with no dependencies.
+- `npm run check`: 301 Host/client tests with no dependencies.
 - Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
   (both choices), no sidebar-foot temporary entry, selection action, fork,
   native right-sidebar conversation, quoted draft prefill, hidden sidebar row,

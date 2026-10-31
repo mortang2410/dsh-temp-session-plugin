@@ -29,7 +29,8 @@ import {
 } from './journal.js'
 import { Publisher } from './publisher.js'
 import { RECORD_KINDS, kindOfHeader, readRecord, recordFields, recordView } from './records.js'
-import { RecoveryStore, inspectRegistry } from './healing.js'
+import { RecoveryStore, inspectFragment, inspectRegistry } from './healing.js'
+import { validateModelProposal } from './model-sanity.js'
 
 /** Registry schema version. A different version is refused, never overwritten. */
 export const STATE_VERSION = 1
@@ -263,6 +264,10 @@ export class TemporarySessions {
     this.sideTitled = new Map()
     this.retryTimer = undefined
     this.retryDelayMs = RETRY_DELAY_MS
+    // Optional advisory model pass over the unresolved backlog. It never gates
+    // startup and never changes the registry or a deletion decision.
+    this.modelSanity = deps.modelSanity
+    this.modelPass = undefined
     this.expiryTimer = undefined
     this.activityTimer = undefined
     this.activitySaveAt = 0
@@ -407,6 +412,7 @@ export class TemporarySessions {
     this.admissionClosed = true
     this.clearRetryTimer()
     this.clearExpiryTimers()
+    this.modelSanity?.abort?.()
   }
 
   /** Stop the expiry and activity timers when the plugin instance unloads. */
@@ -888,6 +894,7 @@ export class TemporarySessions {
     this.startPromise = this.reap().then(() => {
       this.ready = true
       this.startExpiryTimer()
+      this.startModelSanity()
       this.sweepExpiry().catch(error => {
         this.warn(`temporary-session startup expiry sweep failed: ${String(error)}`)
       })
@@ -897,6 +904,56 @@ export class TemporarySessions {
       throw error
     })
     return this.startPromise
+  }
+
+  /**
+   * Validate one model proposal against this boot's trusted context. The
+   * worker passes the exact backlog bytes and sanitized answer; the model
+   * never supplies the map key, membership, header, journal ownership or
+   * storage path.
+   * @param {{ bytes: Buffer }} entry - one backlog entry.
+   * @param {object} answer - sanitized model answer.
+   * @returns {{ accepted: boolean, reason: string }} verdict.
+   */
+  validateModelFragment(entry, answer) {
+    const bytes = Buffer.from(entry.bytes ?? [])
+    const fragment = inspectFragment(bytes)
+    const sessionId = fragment.key
+    const entryState = typeof sessionId === 'string' ? this.journal?.entries?.[sessionId] : undefined
+    const header = typeof sessionId === 'string'
+      ? (this.storedHeaders?.get(sessionId) ?? this.deps.sessions?.get?.(sessionId)?.header)
+      : undefined
+    const storage = header === undefined ? undefined : this.resolveStorage(header)
+    return validateModelProposal(bytes, answer, {
+      members: new Set(this.registrySources),
+      journalEntry: entryState,
+      header,
+      storageDir: storage?.dir,
+    })
+  }
+
+  /**
+   * Start the advisory model pass after the deterministic boot sequence. The
+   * pass is deliberately not awaited: a slow or unavailable gateway cannot
+   * delay readiness, and its findings only reach the private recovery log.
+   * @returns {Promise<object | undefined>} the pass result when a worker exists.
+   */
+  startModelSanity() {
+    if (this.modelSanity === undefined
+      || this.admissionClosed
+      || this.journalDegraded
+      || this.registryUnsupported
+      || this.registryAmbiguous
+      || this.registryUnreadable) return Promise.resolve(undefined)
+    if (this.modelPass !== undefined) return this.modelPass
+    this.modelPass = Promise.resolve()
+      .then(() => this.modelSanity.start())
+      .catch(error => {
+        this.warn(`temporary-session model sanity pass failed: ${String(error)}`)
+        return undefined
+      })
+      .finally(() => { this.modelPass = undefined })
+    return this.modelPass
   }
 
   /**
