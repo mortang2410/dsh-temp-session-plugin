@@ -410,6 +410,44 @@ test('a side chat keeps its treatment', async () => {
   assert.equal(texts(element).some(text => text.includes('promote')), false)
 })
 
+test('a recovered side chat keeps its treatment', async () => {
+  const { registration } = await loadBundle()
+  const plugin = registration.factory(() => React)
+  const captured = []
+  const { ctx, calls } = makeContext()
+  ctx.slots.register = (options, component) => { captured.push({ ...options, component }); return () => {} }
+  await plugin.apply(ctx)
+  const injected = captured.find(options => options.id === 'temp-session-selection').inject()
+  const listed = tempSessionDescriptors.find(descriptor => descriptor.method === 'list')
+  // Parse the exact wire shape a recovered side record reaches the browser in.
+  const recovered = listed.result.create().parse({
+    epoch: 2,
+    sequence: 1,
+    degraded: false,
+    stopping: [],
+    sessions: [
+      { sessionId: 'session-main', createdAt: 10, kind: 'main', pendingDelete: false },
+      { sessionId: 'session-recovered-side', createdAt: 20, kind: 'side', pendingDelete: true },
+    ],
+  })
+  const transition = injected.store.applyList(recovered)
+  assert.equal(transition.accepted, true)
+  const snapshot = injected.store.getSnapshot()
+  assert.deepEqual([...snapshot.ids], ['session-main'])
+  assert.deepEqual([...snapshot.side], ['session-recovered-side'])
+  assert.equal(snapshot.pending.has('session-recovered-side'), true)
+  // A terminal pending record stays hidden without a stopping badge once the
+  // Host no longer reports the stop as in flight.
+  assert.equal(snapshot.stopping.has('session-recovered-side'), false)
+  ctx.sessions.list.getSnapshot().byId['session-recovered-side'] = {
+    projectionValues: { title: 'Recovered side title' },
+  }
+  assert.equal(
+    calls.tabDefinition.title('dsh-resource://tempchat/session/session-recovered-side'),
+    'Recovered side title',
+  )
+})
+
 test('a mounted client follows host epochs', async () => {  const { registration } = await loadBundle()
   const plugin = registration.factory(() => React)
   const captured = []

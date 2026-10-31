@@ -28,7 +28,8 @@ import {
   writeJournalMarker,
 } from './journal.js'
 import { Publisher } from './publisher.js'
-import { kindOfHeader, readRecord, recordFields, recordView } from './records.js'
+import { RECORD_KINDS, kindOfHeader, readRecord, recordFields, recordView } from './records.js'
+import { RecoveryStore, inspectRegistry } from './healing.js'
 
 /** Registry schema version. A different version is refused, never overwritten. */
 export const STATE_VERSION = 1
@@ -60,8 +61,8 @@ Treat the inherited history as reference only. Do not continue the main task, it
  * @param {NodeJS.ProcessEnv} [env] - process environment (DSH_HOME is set by dsh).
  * @param {(path: string) => string} [dshHomePath] - the Host's home-path
  *   service, when mounted; it knows the home the launcher actually used.
- * @returns {{ dir: string, file: string, journal: string, marker: string, lock: string }}
- *   registry directory, registry file, ownership journal, migration marker and writer lock.
+ * @returns {object} registry directory, registry file, ownership journal,
+ *   migration marker, writer lock, unresolved backlog, preserved originals and recovery log.
  */
 export function statePaths(env = process.env, dshHomePath) {
   const dir = typeof dshHomePath === 'function'
@@ -76,6 +77,9 @@ export function statePaths(env = process.env, dshHomePath) {
     journal: join(dir, 'ownership.jsonl'),
     marker: join(dir, 'journal.meta.json'),
     lock: join(dir, 'records.lock'),
+    unresolved: join(dir, 'records.unresolved.jsonl'),
+    preserved: join(dir, 'preserved'),
+    recoveryLog: join(dir, 'recovery.log'),
   }
 }
 
@@ -184,6 +188,35 @@ export class TemporarySessions {
     this.loadError = undefined
     // The registry file exists but could not be read, parsed or versioned; never overwrite it.
     this.registryDegraded = false
+    // The exact bytes and span scan that produced the current registry state.
+    this.registryContext = undefined
+    // The full registry read result, including its context. Later settlement
+    // passes must see the member scan and blocked identities, not just bytes.
+    this.registryRead = undefined
+    // Bytes last read or published for this registry. A sweep compares current
+    // bytes with this authority before trusting a fresh read.
+    this.registryAuthority = undefined
+    // The application could not read the registry file at all. This is not
+    // evidence that it is absent; no destructive pass may run.
+    this.registryUnreadable = false
+    // Fresh bytes required settlement but the stored listing was unavailable.
+    // Keep the evidence gated until a later complete listing settles it.
+    this.settlementPending = false
+    // A foreign version is never interpreted and never healed.
+    this.registryUnsupported = false
+    // Top-level framing is ambiguous (for example duplicate `sessions` maps).
+    // The original is never interpreted, healed, published over or deleted from.
+    this.registryAmbiguous = false
+    // Recovery evidence that has not yet been published.
+    this.registryUnresolved = []
+    this.registrySources = []
+    this.registryRecovered = false
+    // Journal-owned ids whose registry row disagrees with the journal or header.
+    // They stay out of the state and the exit snapshot, and healing defers.
+    this.registryDisputed = new Set()
+    // Recovery-log lines produced before the journal is validated. They are
+    // dropped when the journal is degraded, so a degraded boot writes nothing.
+    this.pendingRecoveryLog = []
     // The ownership journal is unreadable or invalid; delete nothing and write nothing.
     this.journalDegraded = false
     // A signal or process exit has closed admission for new temporary writes.
@@ -222,12 +255,19 @@ export class TemporarySessions {
     this.storedHeaders = undefined
     this.bootStoredHeaders = undefined
     this.storedListingComplete = false
+    // A failed listing leaves complete registry rows unvalidated; defer writes
+    // and deletion until a later listing succeeds.
+    this.listingUncertain = false
     // The first migration has not completed; no durable ownership write is safe.
     this.migrationIncomplete = true
+    // A boot whose registry was unreadable skipped startup stages. A later
+    // readable reap resumes reservations and migration before reconciliation.
+    this.startupStagesPending = false
     // Migration corrected a legacy field in memory and needs a registry publish.
     this.registryChanged = false
     this.sequence = 0
     this.publisher = new Publisher({ file: this.paths.file, lockFile: this.paths.lock, logger: deps.logger })
+    this.recovery = new RecoveryStore({ paths: this.paths, logger: deps.logger })
     this.snapshot = Object.freeze({ degraded: false, sessions: Object.freeze([]) })
   }
 
@@ -299,6 +339,18 @@ export class TemporarySessions {
     this.deps.logger?.warn?.(message)
   }
 
+  /** Buffer one recovery-log line until the ownership journal is validated. */
+  logRecovery(event, details = {}) {
+    this.pendingRecoveryLog.push({ event, details })
+  }
+
+  /** Emit buffered recovery-log lines after a healthy journal replay. */
+  flushRecoveryLog() {
+    const entries = this.pendingRecoveryLog
+    this.pendingRecoveryLog = []
+    for (const entry of entries) this.recovery.log(entry.event, entry.details)
+  }
+
   /** Emit one ordered stop-path step for the logger or a probe. */
   trace(message) {
     try {
@@ -355,9 +407,26 @@ export class TemporarySessions {
     this.storedHeaders = stored
     this.bootStoredHeaders = stored
     this.storedListingComplete = stored !== undefined
+    this.listingUncertain = stored === undefined
+    this.registryDisputed = new Set()
+    this.registryAmbiguous = false
+    this.pendingRecoveryLog = []
     const registry = await this.readRegistry(stored, now)
     this.state = registry.state
     this.registryDegraded = registry.damaged
+    this.registryContext = registry.context
+    this.registryRead = registry
+    this.registryAuthority = registry.context?.bytes ?? Buffer.alloc(0)
+    this.registryUnreadable = registry.unreadable === true
+    this.registryUnsupported = registry.unsupported === true
+    this.registryAmbiguous = registry.context?.inspection?.ambiguous === true
+    this.registryUnresolved = [...(registry.unresolved ?? [])]
+    this.registrySources = [...(registry.sources ?? [])]
+    this.registryRecovered = false
+    if (this.registryContext !== undefined) {
+      this.registryContext.damaged = registry.damaged
+      this.registryContext.missing = registry.missing === true
+    }
     const marker = readJournalMarker(this.paths.marker)
     this.marker = marker.state === 'valid' ? marker.marker : undefined
     const file = await readJournalFile(this.paths.journal)
@@ -368,7 +437,7 @@ export class TemporarySessions {
     for (const fault of faults) this.warn(fault)
     // A torn tail is not evidence. Drop it from the file before the next append,
     // which would otherwise make it a complete invalid line.
-    if (this.journal.torn && !this.journal.degraded && file.exists === true) {
+    if (this.journal.torn && !this.journalDegraded && file.exists === true) {
       try {
         rewriteJournal(this.paths.journal, this.journalSource)
         // The file now holds only the valid events; fold them again so the torn
@@ -381,18 +450,45 @@ export class TemporarySessions {
         this.warn(`could not drop the torn ownership-journal line; the journal is degraded: ${String(error)}`)
       }
     }
+    // Registry diagnostics may mention untrusted bytes, and a degraded journal
+    // must write nothing. Emit them only after the journal is proven healthy.
+    if (this.journalDegraded || this.registryUnsupported || this.registryAmbiguous) {
+      this.pendingRecoveryLog = []
+    } else {
+      this.flushRecoveryLog()
+    }
+    if (this.registryUnreadable) {
+      // The journal is usable, but the registry-backed startup stages were
+      // skipped. A later readable reap must run them before readiness.
+      this.startupStagesPending = true
+      this.migrationIncomplete = this.marker === undefined && this.journal.migrationComplete === undefined
+    }
     this.publisher.setDegraded(this.journalDegraded || this.registryDegraded)
     let healed = false
-    if (!this.journalDegraded) {
+    if (!this.journalDegraded && !this.registryUnsupported && !this.registryAmbiguous && !this.registryUnreadable) {
       try {
         // The spec order is replay, reservations, heal/import, reconcile, then
         // drain announcements that arrived while the listing was being taken.
         await this.resolveReservations(stored)
         await this.migrate(registry, stored)
         this.migrationIncomplete = this.marker === undefined && this.journal.migrationComplete === undefined
-        healed = this.healFromJournal(stored)
+        // A readable boot can still leave the first migration unresolved, for
+        // example because a missing source needs a preserved slot. Retry that
+        // startup stage on the next readable reap instead of stranding it.
+        if (this.migrationIncomplete) this.startupStagesPending = true
+        const settled = this.settleRegistry(registry, stored)
+        if (registry.damaged) this.registryDegraded = true
+        healed = this.healFromJournal(stored) || settled
         const reconciled = await this.reconcileFixedPoint(stored)
         healed = this.healFromJournal(stored) || healed
+        if (registry.damaged && Object.keys(this.state.sessions).length > 0) {
+          this.registryRecovered = true
+        }
+        if (this.registryRecovered) healed = true
+        if (this.registryDegraded && this.registryRecovered) {
+          const repaired = this.repairRegistry(registry)
+          if (repaired) healed = false
+        }
         if ((healed || this.registryChanged || reconciled.adopted || reconciled.observed)
           && !this.registryDegraded
           && !this.reconciliationDegraded) await this.save()
@@ -405,7 +501,7 @@ export class TemporarySessions {
     }
     this.loaded = true
     this.refreshSnapshot()
-    if (!this.journalDegraded) await this.resumePendingStops()
+    if (!this.journalDegraded && !this.registryUnsupported && !this.registryAmbiguous && !this.registryUnreadable) await this.resumePendingStops()
     return this.state
   }
 
@@ -480,74 +576,837 @@ export class TemporarySessions {
   }
 
   /**
-   * Read and validate the registry index.
+   * Read the registry index with exact spans. The journal is not available yet,
+   * so this pass only proves that a member is complete, belongs to the
+   * top-level `sessions` map and agrees with a stored header. Journal
+   * ownership and first-migration admission are settled after replay.
    * @param {Map<string, object> | undefined} stored - stored headers, when available.
    * @param {number} now - current wall clock for records without a clock.
-   * @returns {Promise<{ state: object, damaged: boolean, missing: boolean }>} registry state and health.
+   * @returns {Promise<object>} recovered state and unresolved evidence.
    */
   async readRegistry(stored, now) {
-    let text
+    let bytes
     try {
-      text = await readFile(this.paths.file, 'utf8')
+      bytes = await readFile(this.paths.file)
     } catch (error) {
       if (error?.code !== 'ENOENT') {
         this.warn(`could not read the temporary-session registry: ${String(error)}`)
-        return { state: emptyState(), damaged: true, missing: true }
+        return {
+          state: emptyState(),
+          damaged: true,
+          missing: false,
+          unreadable: true,
+          unsupported: false,
+          context: undefined,
+        }
       }
-      return { state: emptyState(), damaged: false, missing: true }
+      return {
+        state: emptyState(),
+        damaged: false,
+        missing: true,
+        unreadable: false,
+        unsupported: false,
+        context: undefined,
+      }
     }
-    let parsed
-    try {
-      parsed = parseState(text)
-    } catch (error) {
-      this.warn(`ignoring unparsable temporary-session registry: ${String(error)}`)
+    const inspection = inspectRegistry(bytes)
+    const context = { bytes, inspection, keyOnly: new Set(), blocked: new Map() }
+    if (inspection.ambiguous) {
+      this.registryAmbiguous = true
+      this.registryUnsupported = false
+      this.warn('ignoring a temporary-session registry with ambiguous top-level framing')
+      return {
+        state: emptyState(),
+        damaged: true,
+        missing: false,
+        unsupported: false,
+        context,
+        sources: [],
+        unresolved: [],
+      }
     }
-    if (parsed === undefined) {
-      if (!this.registryDegraded) this.warn(`ignoring unsupported temporary-session registry at ${this.paths.file}`)
-      return { state: emptyState(), damaged: true, missing: false }
+    this.registryAmbiguous = false
+    if (!inspection.supported) {
+      const unsupported = inspection.versionPresent === true
+      this.registryUnsupported = unsupported
+      if (unsupported && !this.registryDegraded) {
+        this.warn(`ignoring unsupported temporary-session registry at ${this.paths.file}`)
+      } else if (!this.registryDegraded) {
+        this.warn('ignoring unparsable temporary-session registry')
+      }
+      return {
+        state: emptyState(),
+        damaged: true,
+        missing: false,
+        unsupported,
+        context,
+        sources: [],
+        unresolved: [],
+      }
     }
+    this.registryUnsupported = false
     const sessions = {}
-    for (const [key, value] of Object.entries(parsed.sessions)) {
-      const filled = this.fillFromStored(value, key, stored)
-      if (filled === null || typeof filled !== 'object') {
-        this.warn(`ignoring unusable temporary-session record "${key}"`)
+    const unresolved = [...inspection.unresolved]
+    const sources = new Set()
+    for (const member of inspection.members) {
+      if (typeof member.key === 'string' && member.key !== '') sources.add(member.key)
+      if (member.invalid !== undefined) {
+        this.warn(`quarantining a temporary-session registry member at byte ${member.offset}: ${member.invalid}`)
+        this.logRecovery('quarantined', { offset: member.offset, reason: member.invalid })
+        unresolved.push({ offset: member.offset, reason: member.invalid, bytes: member.bytes })
+        if (member.invalid === 'truncated-member') {
+          const key = member.key
+          const ids = Array.isArray(member.partialSessionIds) ? member.partialSessionIds : []
+          if (member.partialBlocked === true) {
+            if (typeof key === 'string' && key !== '') context.blocked.set(key, 'truncated-member')
+            for (const id of ids) {
+              if (typeof id === 'string' && id !== '') context.blocked.set(id, 'truncated-member')
+            }
+          } else if (member.sessionIdPresent !== true) {
+            if (typeof key === 'string' && key !== '') context.blocked.set(key, 'truncated-member')
+            for (const id of ids) {
+              if (typeof id === 'string' && id !== '') context.blocked.set(id, 'key-mismatch')
+            }
+          } else if (member.sessionId !== key) {
+            if (typeof key === 'string' && key !== '') context.blocked.set(key, 'key-mismatch')
+            if (typeof member.sessionId === 'string' && member.sessionId !== '') {
+              context.blocked.set(member.sessionId, 'key-mismatch')
+            }
+          }
+        } else if (typeof member.key === 'string' && member.key !== '') {
+          context.blocked.set(member.key, member.invalid)
+        }
+        // A key that names another Session is a detectable disagreement for
+        // both ids. Do not let the named journal-owned id be rebuilt as though
+        // the row had never existed.
+        if (member.invalid === 'key-mismatch'
+          && typeof member.sessionId === 'string'
+          && member.sessionId !== '') {
+          context.blocked.set(member.sessionId, member.invalid)
+        }
         continue
       }
-      if (filled.sessionId !== undefined && filled.sessionId !== key) {
-        this.warn(`quarantining temporary-session record "${key}": it names another Session`)
+      if (stored === undefined) {
+        const raw = readRecord(member.value, member.key, now)
+        if (raw === undefined) {
+          unresolved.push({ offset: member.offset, reason: 'unusable-record', bytes: member.bytes })
+          continue
+        }
+        sessions[member.key] = raw
+        if (member.sessionIdPresent !== true) context.keyOnly.add(member.key)
         continue
       }
-      const record = readRecord(filled, key, now)
-      if (record === undefined) {
-        this.warn(`ignoring unusable temporary-session record "${key}"`)
+      const recovered = this.registryRecordFromMember(member, stored, now)
+      if (recovered.record === undefined) {
+        this.warn(`quarantining a temporary-session registry member at byte ${member.offset}: ${recovered.reason}`)
+        this.logRecovery('quarantined', { offset: member.offset, reason: recovered.reason })
+        unresolved.push({ offset: member.offset, reason: recovered.reason, bytes: member.bytes })
+        context.blocked.set(member.key, recovered.reason)
         continue
       }
-      sessions[key] = record
+      sessions[member.key] = recovered.record
+      if (member.sessionIdPresent !== true) context.keyOnly.add(member.key)
     }
-    return { state: { version: STATE_VERSION, sessions }, damaged: false, missing: false }
+    const damaged = !inspection.complete || unresolved.length > 0
+    return {
+      state: { version: STATE_VERSION, sessions },
+      damaged,
+      missing: false,
+      unsupported: false,
+      context,
+      sources: [...sources],
+      unresolved,
+    }
   }
 
   /**
-   * Fill fields a legacy record predates from its stored header: the storage
-   * directory, the direct parent and the kind. A kind-less row is the
-   * pre-version record shape; the header is its only trustworthy source.
-   * @param {object} value - stored member value.
-   * @param {string} key - member key.
-   * @param {Map<string, object> | undefined} stored - stored headers.
-   * @returns {unknown} the value to validate.
+   * Read the current registry bytes before a destructive sweep. A file that
+   * changed after boot may be unsupported or damaged; the fresh read lets the
+   * sweep fail closed or run the healing transaction without trusting stale
+   * bytes. The state already loaded is retained; only authority and evidence
+   * change here.
+   * @param {Map<string, object> | undefined} stored - stored headers for the sweep.
+   * @returns {Promise<object>} the fresh registry read.
    */
-  fillFromStored(value, key, stored) {
-    if (value === null || typeof value !== 'object') return value
-    const sessionId = typeof value.sessionId === 'string' ? value.sessionId : key
-    const header = stored?.get(sessionId)
-    if (header === undefined) return value
-    const filled = { ...value }
-    if (filled.dir === undefined) filled.dir = this.dirOf(header)
-    if (filled.parentSessionId === undefined && typeof header.parentSession === 'string') {
-      filled.parentSessionId = header.parentSession
+  async refreshRegistryRead(stored) {
+    const current = await this.readRegistry(stored, Date.now())
+    const previous = this.registryAuthority
+    const bytes = current.context?.bytes
+    const changed = previous !== undefined
+      && (bytes === undefined || !bytes.equals(previous))
+    this.registryRead = current
+    this.registryContext = current.context
+    this.registryUnresolved = [...(current.unresolved ?? [])]
+    this.registrySources = [...(current.sources ?? [])]
+    this.registryDegraded = current.damaged
+    this.registryUnreadable = current.unreadable === true
+    this.registryUnsupported = current.unsupported === true
+    this.registryAmbiguous = current.context?.inspection?.ambiguous === true
+    this.registryAuthority = bytes ?? Buffer.alloc(0)
+    current.changed = changed
+    if (changed && current.context?.inspection?.supported === false) {
+      // A file that changed into unreadable bytes after a successful read is
+      // evidence to preserve, not a repair target for this sweep.
+      this.registryUnsupported = true
     }
-    if (filled.kind === undefined) filled.kind = kindOfHeader(header)
-    return filled
+    if (this.registryContext !== undefined) {
+      this.registryContext.damaged = current.damaged
+      this.registryContext.missing = current.missing === true
+    }
+    return current
+  }
+
+  /**
+   * Cross-check one complete member against the stored header. The source
+   * folder, parent, kind and clocks are never trusted on their own.
+   * @param {object} member - scanned member with exact key and value.
+   * @param {Map<string, object>} stored - stored headers.
+   * @param {number} now - bootstrap clock.
+   * @returns {{ record?: object, reason?: string }} the validated record or quarantine reason.
+   */
+  registryRecordFromMember(member, stored, now) {
+    const key = member.key
+    if (typeof key !== 'string' || key === '' || key.length > 200) return { reason: 'invalid-key' }
+    const value = member.value
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return { reason: 'not-object' }
+    if (member.sessionIdPresent === true && member.sessionId !== key) return { reason: 'key-mismatch' }
+    const header = stored.get(key) ?? this.deps.sessions.get(key)?.header
+    if (header === undefined) return { reason: 'no-header' }
+    const storage = this.resolveStorage(header)
+    if (storage === undefined) return { reason: 'no-locator' }
+    if (value.dir !== undefined && value.dir !== storage.dir) return { reason: 'dir-mismatch' }
+    if (value.cwd !== undefined && value.cwd !== (header.cwd ?? null)) return { reason: 'cwd-mismatch' }
+    const headerKind = kindOfHeader(header)
+    let kind = headerKind
+    if (value.kind !== undefined) {
+      if (typeof value.kind !== 'string' || !RECORD_KINDS.includes(value.kind)) return { reason: 'kind-invalid' }
+      const sideAgrees = value.kind === 'side'
+        && header.isSeeded === true
+        && typeof header.parentSession === 'string'
+      if (value.kind !== headerKind && !sideAgrees) return { reason: 'kind-mismatch' }
+      kind = value.kind
+    }
+    const directParent = header.parentSession ?? null
+    let parentSessionId = directParent
+    if (value.parentSessionId !== undefined) {
+      if (value.parentSessionId === null) {
+        // An explicit null is a surviving value, not an absent field. It only
+        // agrees when the header also has no parent.
+        if (directParent !== null) return { reason: 'parent-mismatch' }
+      } else {
+        if (typeof value.parentSessionId !== 'string') return { reason: 'parent-invalid' }
+        if (value.parentSessionId !== directParent) {
+          if (!this.legacyParentAgrees(value, header, stored)) return { reason: 'parent-mismatch' }
+          parentSessionId = directParent
+        }
+      }
+    }
+    if (value.createdAt !== undefined && value.createdAt !== header.createdAt) {
+      this.registryChanged = true
+    }
+    let pendingDelete = false
+    if (value.pendingDelete !== undefined) {
+      if (typeof value.pendingDelete !== 'boolean') return { reason: 'pending-invalid' }
+      pendingDelete = value.pendingDelete
+    } else {
+      this.logRecovery('pending-absent', { field: 'pendingDelete' })
+    }
+    try {
+      return {
+        record: recordFields({
+          sessionId: key,
+          kind,
+          parentSessionId,
+          title: typeof value.title === 'string' ? value.title : '',
+          dir: storage.dir,
+          cwd: header.cwd ?? null,
+          createdAt: header.createdAt,
+          lastActivityAt: value.lastActivityAt,
+          activitySince: value.activitySince,
+          pendingDelete,
+        }, now),
+      }
+    } catch {
+      return { reason: 'unusable-record' }
+    }
+  }
+
+  /**
+   * Filter recovered rows through the replayed journal and rebuild every
+   * journal-owned id the damaged bytes did not yield. A row whose id has no
+   * journal entry after migration, or whose fields disagree with the journal
+   * or header, is quarantined and recorded as unresolved evidence.
+   * @param {object} registry - registry read context.
+   * @param {Map<string, object> | undefined} stored - stored headers.
+   * @returns {boolean} whether the in-memory registry changed.
+   */
+  settleRegistry(registry, stored) {
+    if (registry === undefined
+      || registry.unsupported === true
+      || this.registryAmbiguous
+      || this.journalDegraded
+      || this.migrationIncomplete) return false
+    if (stored === undefined) {
+      // Without the stored listing, validate every complete row against the
+      // live header and journal, then defer publication and deletion. A row
+      // whose header is unavailable is uncertain, not a proven disagreement.
+      this.listingUncertain = true
+      const next = { ...this.state.sessions }
+      const quarantined = new Set()
+      let changed = this.settleFreshRecords(registry, stored, quarantined)
+      for (const sessionId of quarantined) delete next[sessionId]
+      for (const [sessionId, reason] of registry.context?.blocked ?? []) {
+        if (this.journal.entries[sessionId] === undefined || quarantined.has(sessionId)) continue
+        // A journal tombstone resolves the row even when its stored header is
+        // gone. Disputing it here would make the next boot permanently degraded.
+        if (this.journal.entries[sessionId]?.deleted === true) continue
+        if (next[sessionId] !== undefined) {
+          delete next[sessionId]
+          changed = true
+        }
+        this.registryDisputed.add(sessionId)
+        this.quarantineRegistryRecord(registry, sessionId, reason)
+        quarantined.add(sessionId)
+        changed = true
+      }
+      for (const [sessionId, record] of Object.entries(this.state.sessions)) {
+        if (quarantined.has(sessionId)) continue
+        const entry = this.journal.entries[sessionId]
+        if (entry === undefined || entry.deleted === true) {
+          delete next[sessionId]
+          changed = true
+          continue
+        }
+        const header = this.deps.sessions.get(sessionId)?.header
+        const storage = header === undefined ? undefined : this.resolveStorage(header)
+        if (header === undefined || storage === undefined) {
+          this.listingUncertain = true
+          continue
+        }
+        if (!this.registryEntryAgreesWithHeader(entry, header, storage)) {
+          delete next[sessionId]
+          this.registryDisputed.add(sessionId)
+          this.quarantineRegistryRecord(registry, sessionId, 'journal-header-mismatch')
+          changed = true
+          continue
+        }
+        const headerKind = kindOfHeader(header)
+        const sideUpgrade = record.kind !== entry.kind
+          && entry.kind === 'side'
+          && record.kind === headerKind
+          && header.isSeeded === true
+          && typeof header.parentSession === 'string'
+        // A pre-journal subagent row may name a recorded ancestor instead of the
+        // direct parent. Without the stored ancestry this cannot be proven, so
+        // defer it rather than turn an old collapsed link into a dispute.
+        const collapsedParent = record.kind === entry.kind
+          && record.kind === 'subagent'
+          && record.parentSessionId !== entry.parentSessionId
+          && record.dir === entry.dir
+          && record.cwd === entry.cwd
+          && !(record.pendingDelete === true && entry.pending !== true)
+        const disagrees = record.kind !== entry.kind
+          || record.parentSessionId !== entry.parentSessionId
+          || record.dir !== entry.dir
+          || record.cwd !== entry.cwd
+          || (record.pendingDelete === true && entry.pending !== true)
+        if (disagrees && !sideUpgrade) {
+          if (collapsedParent) {
+            this.listingUncertain = true
+            continue
+          }
+          delete next[sessionId]
+          this.registryDisputed.add(sessionId)
+          this.quarantineRegistryRecord(registry, sessionId, 'journal-record-mismatch')
+          changed = true
+          continue
+        }
+        if (sideUpgrade && record.kind !== 'side') {
+          record.kind = 'side'
+          changed = true
+        }
+        if (entry.pending === true && record.pendingDelete !== true) {
+          record.pendingDelete = true
+          changed = true
+        }
+      }
+      for (const entry of Object.values(this.journal.entries)) {
+        if (entry.deleted === true || quarantined.has(entry.sessionId)) continue
+        const partial = registry.context?.inspection?.members?.find(candidate => (
+          candidate.key === entry.sessionId && candidate.invalid === 'truncated-member'
+        ))
+        if (partial === undefined) continue
+        const header = this.deps.sessions.get(entry.sessionId)?.header
+        const storage = header === undefined ? undefined : this.resolveStorage(header)
+        if (header === undefined || storage === undefined) {
+          this.listingUncertain = true
+          continue
+        }
+        const disagreement = this.registryEntryAgreesWithHeader(entry, header, storage)
+          ? this.partialMemberDisagreement(partial, entry, header, storage)
+          : 'journal-header-mismatch'
+        if (disagreement === undefined) continue
+        delete next[entry.sessionId]
+        this.registryDisputed.add(entry.sessionId)
+        this.quarantineRegistryRecord(registry, entry.sessionId, disagreement)
+        changed = true
+      }
+      if (changed) {
+        this.state = { version: STATE_VERSION, sessions: next }
+        if (registry.damaged === true) this.registryRecovered = true
+      }
+      return changed
+    }
+    const next = {}
+    const quarantined = new Set()
+    let changed = this.settleFreshRecords(registry, stored, quarantined)
+    for (const [sessionId, reason] of registry.context?.blocked ?? []) {
+      if (this.journal.entries[sessionId] === undefined || quarantined.has(sessionId)) continue
+      // A journal tombstone resolves the row even when its stored header is
+      // gone. Disputing it here would make the next boot permanently degraded.
+      if (this.journal.entries[sessionId]?.deleted === true) continue
+      this.registryDisputed.add(sessionId)
+      this.quarantineRegistryRecord(registry, sessionId, reason)
+      quarantined.add(sessionId)
+      changed = true
+    }
+    // A fresh scan can contain a conflicting partial row for an id that is
+    // already in memory. Validate that current evidence before accepting the
+    // older in-memory record; otherwise a changed file is silently ignored.
+    for (const entry of Object.values(this.journal.entries)) {
+      if (entry.deleted === true || quarantined.has(entry.sessionId)) continue
+      const partial = registry.context?.inspection?.members?.find(candidate => (
+        candidate.key === entry.sessionId && candidate.invalid === 'truncated-member'
+      ))
+      if (partial === undefined) continue
+      const header = stored.get(entry.sessionId) ?? this.deps.sessions.get(entry.sessionId)?.header
+      const storage = header === undefined ? undefined : this.resolveStorage(header)
+      if (header === undefined || storage === undefined) continue
+      const disagreement = this.registryEntryAgreesWithHeader(entry, header, storage)
+        ? this.partialMemberDisagreement(partial, entry, header, storage)
+        : 'journal-header-mismatch'
+      if (disagreement === undefined) continue
+      this.registryDisputed.add(entry.sessionId)
+      this.quarantineRegistryRecord(registry, entry.sessionId, disagreement)
+      quarantined.add(entry.sessionId)
+      changed = true
+    }
+    for (const [sessionId, record] of Object.entries(this.state.sessions)) {
+      if (quarantined.has(sessionId)) continue
+      const entry = this.journal.entries[sessionId]
+      if (entry === undefined) {
+        this.quarantineRegistryRecord(registry, sessionId, 'no-journal-entry')
+        quarantined.add(sessionId)
+        changed = true
+        continue
+      }
+      if (entry.deleted === true) {
+        this.quarantineRegistryRecord(registry, sessionId, 'journal-deleted')
+        quarantined.add(sessionId)
+        changed = true
+        continue
+      }
+      const header = stored.get(sessionId) ?? this.deps.sessions.get(sessionId)?.header
+      if (header === undefined) {
+        this.quarantineRegistryRecord(registry, sessionId, 'no-header')
+        quarantined.add(sessionId)
+        changed = true
+        continue
+      }
+      const storage = this.resolveStorage(header)
+      if (!this.registryEntryAgreesWithHeader(entry, header, storage)) {
+        this.registryDisputed.add(sessionId)
+        this.quarantineRegistryRecord(registry, sessionId, 'journal-header-mismatch')
+        quarantined.add(sessionId)
+        changed = true
+        continue
+      }
+      const keyOnly = registry.context?.keyOnly?.has(sessionId) === true
+      const headerKind = kindOfHeader(header)
+      const sideUpgrade = record.kind !== entry.kind
+        && entry.kind === 'side'
+        && record.kind === headerKind
+        && header.isSeeded === true
+        && typeof header.parentSession === 'string'
+      if (sideUpgrade) {
+        // The side upgrade journals first and publishes the index second. A
+        // crash in that interval is repaired from the journal, keeping title.
+        record.kind = 'side'
+        changed = true
+      }
+      const disagrees = record.kind !== entry.kind
+        || record.parentSessionId !== entry.parentSessionId
+        || record.dir !== entry.dir
+        || record.cwd !== entry.cwd
+        || (record.pendingDelete === true && entry.pending !== true)
+      // The old recorder collapsed a subagent onto its nearest recorded
+      // ancestor. With the stored ancestry available, keep that provable link
+      // so healFromJournal can migrate it to the direct parent below.
+      const collapsedParent = record.kind === entry.kind
+        && record.kind === 'subagent'
+        && record.parentSessionId !== entry.parentSessionId
+        && record.dir === entry.dir
+        && record.cwd === entry.cwd
+        && !(record.pendingDelete === true && entry.pending !== true)
+        && this.legacyParentAgrees(record, header, stored)
+      if ((disagrees && !collapsedParent) || keyOnly) {
+        if (disagrees && !collapsedParent) {
+          this.registryDisputed.add(sessionId)
+          this.quarantineRegistryRecord(registry, sessionId, 'journal-record-mismatch')
+          quarantined.add(sessionId)
+          changed = true
+          continue
+        }
+        const rebuilt = this.journalRecord(entry, header, storage, record.title)
+        if (rebuilt === undefined) {
+          this.quarantineRegistryRecord(registry, sessionId, 'unusable-journal-record')
+          quarantined.add(sessionId)
+        } else {
+          next[sessionId] = rebuilt
+        }
+        changed = true
+        continue
+      }
+      if (entry.pending === true && record.pendingDelete !== true) {
+        record.pendingDelete = true
+        changed = true
+      }
+      next[sessionId] = record
+    }
+    for (const entry of Object.values(this.journal.entries)) {
+      if (entry.deleted === true || next[entry.sessionId] !== undefined || quarantined.has(entry.sessionId)) continue
+      const header = stored.get(entry.sessionId) ?? this.deps.sessions.get(entry.sessionId)?.header
+      if (header === undefined) continue
+      const storage = this.resolveStorage(header)
+      if (!this.registryEntryAgreesWithHeader(entry, header, storage)) {
+        this.quarantineRegistryRecord(registry, entry.sessionId, 'journal-header-mismatch')
+        quarantined.add(entry.sessionId)
+        changed = true
+        continue
+      }
+      const partial = registry.context?.inspection?.members?.find(candidate => (
+        candidate.key === entry.sessionId && candidate.invalid === 'truncated-member'
+      ))
+      const partialDisagreement = partial === undefined
+        ? undefined
+        : this.partialMemberDisagreement(partial, entry, header, storage)
+      if (partialDisagreement !== undefined) {
+        this.registryDisputed.add(entry.sessionId)
+        this.quarantineRegistryRecord(registry, entry.sessionId, partialDisagreement)
+        quarantined.add(entry.sessionId)
+        changed = true
+        continue
+      }
+      const rebuilt = this.journalRecord(entry, header, storage)
+      if (rebuilt === undefined) continue
+      next[entry.sessionId] = rebuilt
+      this.recovery.log('adopted', { id: entry.sessionId, reason: 'journal-only' })
+      this.warn(`rebuilt the temporary-session record for "${entry.sessionId}" from the ownership journal`)
+      changed = true
+    }
+    if (changed) {
+      this.state = { version: STATE_VERSION, sessions: next }
+      if (registry.damaged === true) this.registryRecovered = true
+    }
+    return changed
+  }
+
+  /**
+   * Whether one journal identity agrees with the stored header it claims.
+   * @param {object} entry - replayed journal entry.
+   * @param {object} header - stored or live header.
+   * @param {{ dir: string } | undefined} storage - locator result.
+   * @returns {boolean} whether the identity, target and parent agree.
+   */
+  registryEntryAgreesWithHeader(entry, header, storage) {
+    if (header?.id !== entry.sessionId) return false
+    if ((header.cwd ?? null) !== entry.cwd) return false
+    if ((header.parentSession ?? null) !== entry.parentSessionId) return false
+    if (storage === undefined || entry.dir !== storage.dir) return false
+    const headerKind = kindOfHeader(header)
+    return entry.kind === headerKind
+      || (entry.kind === 'side' && header.isSeeded === true && typeof header.parentSession === 'string')
+  }
+
+  /**
+   * Compare every complete authority field in a truncated member with the
+   * journal and stored header. A field that cannot be compared safely blocks
+   * the id instead of allowing a journal-only rebuild.
+   * @param {object} member - scanned truncated member.
+   * @param {object} entry - replayed journal identity.
+   * @param {object} header - stored or live header.
+   * @param {{ dir: string }} storage - locator result.
+   * @returns {string | undefined} fixed disagreement reason, or undefined.
+   */
+  partialMemberDisagreement(member, entry, header, storage) {
+    if (member.partialBlocked === true) return 'truncated-member'
+    const fields = member.partialFields
+    if (fields === null || typeof fields !== 'object') return 'truncated-member'
+    const has = name => Object.prototype.hasOwnProperty.call(fields, name)
+    if (has('dir') && (typeof fields.dir !== 'string' || fields.dir !== storage.dir)) {
+      return 'dir-mismatch'
+    }
+    if (has('cwd') && (fields.cwd ?? null) !== (header.cwd ?? null)) return 'cwd-mismatch'
+    if (has('kind')) {
+      const headerKind = kindOfHeader(header)
+      const journalKind = entry.kind
+      const journalFirstSideUpgrade = journalKind === 'side'
+        && headerKind === 'fork'
+        && header.isSeeded === true
+        && typeof header.parentSession === 'string'
+        && fields.kind === headerKind
+      if (typeof fields.kind !== 'string'
+        || !RECORD_KINDS.includes(fields.kind)
+        || (fields.kind !== journalKind && !journalFirstSideUpgrade)) return 'kind-mismatch'
+    }
+    if (has('parentSessionId')) {
+      const directParent = header.parentSession ?? null
+      if (fields.parentSessionId === null) {
+        if (directParent !== null) return 'parent-mismatch'
+      } else if (typeof fields.parentSessionId !== 'string' || fields.parentSessionId !== directParent) {
+        return 'parent-mismatch'
+      }
+    }
+    if (has('pendingDelete')) {
+      if (typeof fields.pendingDelete !== 'boolean'
+        || (fields.pendingDelete === true && entry.pending !== true)) return 'pending-mismatch'
+    }
+    return undefined
+  }
+
+  /**
+   * Compare a complete fresh member's authority fields with the journal and
+   * header. The older in-memory row is not allowed to hide a changed complete
+   * row, especially a pending flag the journal never recorded.
+   * @param {object} entry - replayed journal identity.
+   * @param {object} record - record recovered from current registry bytes.
+   * @param {object} header - stored or live header.
+   * @param {Map<string, object> | undefined} stored - stored headers, when available.
+   * @returns {string | undefined} fixed disagreement reason, or undefined.
+   */
+  freshRecordDisagreement(entry, record, header, stored) {
+    if (record === null || typeof record !== 'object') return 'fresh-record-unusable'
+    const headerKind = kindOfHeader(header)
+    const sideUpgrade = entry.kind === 'side'
+      && record.kind === headerKind
+      && header.isSeeded === true
+      && typeof header.parentSession === 'string'
+    const disagrees = record.kind !== entry.kind
+      || record.parentSessionId !== entry.parentSessionId
+      || record.dir !== entry.dir
+      || record.cwd !== entry.cwd
+      || (record.pendingDelete === true && entry.pending !== true)
+    if (!disagrees) return undefined
+    const collapsedParent = record.kind === entry.kind
+      && record.kind === 'subagent'
+      && record.parentSessionId !== entry.parentSessionId
+      && record.dir === entry.dir
+      && record.cwd === entry.cwd
+      && !(record.pendingDelete === true && entry.pending !== true)
+      && (stored === undefined || this.legacyParentAgrees(record, header, stored))
+    if (collapsedParent) return undefined
+    if (sideUpgrade
+      && record.parentSessionId === entry.parentSessionId
+      && record.dir === entry.dir
+      && record.cwd === entry.cwd
+      && !(record.pendingDelete === true && entry.pending !== true)) return undefined
+    return 'journal-record-mismatch'
+  }
+
+  /**
+   * Quarantine fresh complete rows that disagree with the ownership journal or
+   * header before an older in-memory state can be accepted. A matching current
+   * row is left alone; the existing state loop handles journal-first upgrades.
+   * @param {object} registry - registry read context.
+   * @param {Map<string, object> | undefined} stored - stored headers.
+   * @param {Set<string>} quarantined - ids already rejected in this pass.
+   * @returns {boolean} whether a fresh row was quarantined.
+   */
+  settleFreshRecords(registry, stored, quarantined) {
+    const sessions = registry?.state?.sessions
+    if (sessions === null || typeof sessions !== 'object') return false
+    let changed = false
+    for (const entry of Object.values(this.journal.entries)) {
+      if (entry.deleted === true) continue
+      const record = sessions[entry.sessionId]
+      if (record === undefined) continue
+      const header = stored?.get(entry.sessionId) ?? this.deps.sessions.get(entry.sessionId)?.header
+      const storage = header === undefined ? undefined : this.resolveStorage(header)
+      if (header === undefined || storage === undefined) continue
+      const disagreement = this.registryEntryAgreesWithHeader(entry, header, storage)
+        ? this.freshRecordDisagreement(entry, record, header, stored)
+        : 'journal-header-mismatch'
+      if (disagreement === undefined) continue
+      this.registryDisputed.add(entry.sessionId)
+      this.quarantineRegistryRecord(registry, entry.sessionId, disagreement)
+      quarantined.add(entry.sessionId)
+      changed = true
+    }
+    return changed
+  }
+
+  /**
+   * Build one validated record from a journal identity and its stored header.
+   * @param {object} entry - replayed journal entry.
+   * @param {object} header - stored or live header.
+   * @param {{ dir: string }} storage - locator result.
+   * @param {string} [title] - a title already recovered from the registry.
+   * @returns {object | undefined} the record.
+   */
+  journalRecord(entry, header, storage, title = '') {
+    const now = Date.now()
+    try {
+      return recordFields({
+        sessionId: entry.sessionId,
+        kind: entry.kind,
+        parentSessionId: entry.parentSessionId,
+        title,
+        dir: storage.dir,
+        cwd: entry.cwd,
+        createdAt: header.createdAt,
+        lastActivityAt: now,
+        activitySince: now,
+        pendingDelete: entry.pending === true,
+      }, now)
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Record one quarantined row as unresolved evidence and mark the registry
+   * damaged. The raw member bytes stay in the backlog when a member exists.
+   * @param {object} registry - registry read context.
+   * @param {string} sessionId - quarantined id.
+   * @param {string} reason - fixed decision code.
+   * @returns {void}
+   */
+  quarantineRegistryRecord(registry, sessionId, reason) {
+    const member = registry.context?.inspection?.members?.find(candidate => candidate.key === sessionId)
+    if (member !== undefined) {
+      this.registryUnresolved.push({ offset: member.offset, reason, bytes: member.bytes })
+    }
+    registry.damaged = true
+    if (registry.context !== undefined) registry.context.damaged = true
+    this.registryRecovered = true
+    this.recovery.log('quarantined', { offset: member?.offset, reason })
+    this.warn(`quarantining a temporary-session registry member at byte ${member?.offset ?? 'unknown'}: ${reason}`)
+  }
+
+  /**
+   * Publish a recovered registry through the shared publisher after preserving
+   * the original and writing unresolved fragments. Order is the contract:
+   * preserve, backlog, publish, then retire only when no fragment remains.
+   * @param {object} registry - registry read context.
+   * @returns {boolean} whether a recovered registry was published.
+   */
+  repairRegistry(registry) {
+    const context = registry?.context ?? registry
+    if (context === undefined
+      || registry.unsupported === true
+      || this.registryAmbiguous
+      || this.registryUnreadable
+      || registry.missing === true
+      || (registry.damaged !== true && context.damaged !== true)
+      || this.journalDegraded
+      || this.reconciliationDegraded
+      || this.migrationIncomplete
+      || this.listingUncertain) return false
+    const original = context.bytes
+    if (!Buffer.isBuffer(original)) return false
+    let preserved
+    try {
+      preserved = this.recovery.preserve(original)
+    } catch {
+      this.warn('temporary-session registry healing deferred: the damaged original could not be preserved')
+      return false
+    }
+    if (preserved.status === 'full' || preserved.status === 'failed') {
+      this.warn('temporary-session registry healing deferred: the preserved-original budget is full')
+      return false
+    }
+    let backlog
+    try {
+      backlog = this.recovery.appendUnresolved(preserved.hash, this.registryUnresolved)
+    } catch {
+      this.warn('temporary-session registry healing deferred: the unresolved backlog could not be written')
+      return false
+    }
+    if (backlog.error !== undefined) {
+      this.warn('temporary-session registry healing deferred: the unresolved backlog could not be written')
+      return false
+    }
+    if (this.registryDisputed.size > 0) {
+      // The original stays in place so the same disagreement is re-evaluated on
+      // the next boot. Publishing a registry without the disputed id would make
+      // the next boot see a journal-only row and authorize deletion.
+      this.registryDegraded = true
+      this.publisher.setDegraded(true)
+      this.recovery.log('publish-deferred', { reason: 'disputed', count: this.registryDisputed.size })
+      this.warn('temporary-session registry healing deferred: a registry row disagrees with the journal or header')
+      return false
+    }
+    const hadUnresolved = this.registryUnresolved.length > 0
+    this.publisher.setDegraded(false)
+    this.publisher.mutate()
+    let published = false
+    try {
+      published = this.publisher.publish(encodeState(this.state))
+    } catch (error) {
+      this.warn(`could not publish the recovered temporary-session registry: ${String(error)}`)
+    }
+    if (!published) {
+      this.publisher.setDegraded(true)
+      this.recovery.log('publish-deferred', { reason: 'publisher-unavailable' })
+      return false
+    }
+    this.registryDegraded = false
+    this.registryRecovered = false
+    this.registryUnresolved = []
+    this.registryDisputed.clear()
+    // The published bytes are now the authority. Do not let a later sweep
+    // repair from this boot's stale scan or overwrite a newer registry file.
+    this.registryRead = undefined
+    this.registryContext = undefined
+    this.registryAuthority = Buffer.from(encodeState(this.state))
+    this.publisher.setDegraded(this.journalDegraded || this.reconciliationDegraded)
+    this.refreshSnapshot()
+    this.recovery.log('published', { count: Object.keys(this.state.sessions).length })
+    if (!hadUnresolved) {
+      try {
+        this.recovery.retire(preserved.file)
+      } catch {
+        // The publish is already durable; a preserved leftover is extra evidence.
+      }
+    } else {
+      this.recovery.log('preserved-kept', { reason: 'unresolved' })
+    }
+    return true
+  }
+
+  /**
+   * Retry registry healing at a sweep boundary. A failed publish or a full
+   * evidence budget leaves the original bytes and the degraded gate in place.
+   * @returns {boolean} whether healing completed.
+   */
+  retryRegistryHealing() {
+    if (!this.registryDegraded
+      || this.registryUnsupported
+      || this.registryAmbiguous
+      || this.registryUnreadable
+      || this.journalDegraded
+      || this.migrationIncomplete
+      || !this.storedListingComplete
+      || this.listingUncertain
+      || this.registryContext === undefined
+      || this.registryRead === undefined) return false
+    if (this.registryContext.damaged !== true) return false
+    this.settleRegistry(this.registryRead, this.storedHeaders)
+    this.healFromJournal(this.storedHeaders)
+    const healed = this.repairRegistry(this.registryContext)
+    if (!healed) return false
+    this.warn('recovered the temporary-session registry from its preserved evidence')
+    return true
   }
 
   /**
@@ -560,6 +1419,7 @@ export class TemporarySessions {
    * @returns {Promise<void>}
    */
   async migrate(registry, stored) {
+    if (registry.unsupported === true) return
     if (this.marker !== undefined) return
     if (this.journal.migrationComplete !== undefined) {
       // A crash before the marker leaves the journal complete: the marker is
@@ -570,7 +1430,7 @@ export class TemporarySessions {
       return
     }
     if (this.journal.migration === undefined) {
-      if (registry.damaged) {
+      if (registry.damaged && (registry.sources?.length ?? 0) === 0) {
         this.warn('first ownership migration deferred: the registry cannot list its sources')
         return
       }
@@ -578,9 +1438,13 @@ export class TemporarySessions {
         this.warn('first ownership migration deferred: the stored session list is unavailable')
         return
       }
+      if (registry.damaged) {
+        const preserved = this.preserveMigrationOriginal(registry)
+        if (!preserved) return
+      }
       await this.appendEvent({
         type: 'migration',
-        ids: Object.keys(registry.state.sessions),
+        ids: registry.sources ?? Object.keys(registry.state.sessions),
         preexisting: [...stored.keys()],
         at: Date.now(),
       })
@@ -591,13 +1455,57 @@ export class TemporarySessions {
       this.warn('first ownership migration deferred: the stored session list is unavailable')
       return
     }
+    if (registry.damaged && registry.preserved === undefined) {
+      if (!this.preserveMigrationOriginal(registry)) return
+    }
     for (const sessionId of migration.ids) {
-      await this.importMigrationSource(sessionId, stored, registry)
+      const outcome = await this.importMigrationSource(sessionId, stored, registry)
+      if (outcome === 'unresolved' && !this.recordMigrationUnresolved(registry, sessionId)) return
     }
     await this.appendEvent({ type: 'migrationComplete', at: Date.now() })
     const completedAt = this.journal.migrationComplete
     if (completedAt === undefined) return
     this.writeMarker(this.journal.migration?.at ?? completedAt, completedAt)
+  }
+
+  /**
+   * Preserve a damaged registry before the migration starts writing journal
+   * events. The preserved file is reused by the repair transaction later.
+   * @param {object} registry - registry read context.
+   * @returns {boolean} whether a preserved original exists.
+   */
+  preserveMigrationOriginal(registry) {
+    const bytes = registry.context?.bytes
+    if (!Buffer.isBuffer(bytes)) return false
+    const preserved = this.recovery.preserve(bytes)
+    if (preserved.status === 'full' || preserved.status === 'failed') {
+      this.warn('first ownership migration deferred: the damaged registry cannot be preserved')
+      return false
+    }
+    registry.preserved = preserved
+    return true
+  }
+
+  /**
+   * Record one migration source that cannot be imported. It is appended before
+   * `migrationComplete`, so the cutoff is never claimed over an unrecorded id.
+   * @param {object} registry - registry read context.
+   * @param {string} sessionId - unresolved source id.
+   * @returns {boolean} whether the evidence was appended or already present.
+   */
+  recordMigrationUnresolved(registry, sessionId) {
+    if (!this.preserveMigrationOriginal(registry)) return false
+    const member = registry.context?.inspection?.members?.find(candidate => candidate.key === sessionId)
+    const fragments = member === undefined
+      ? [{ offset: 0, reason: 'unusable-source', bytes: Buffer.alloc(0) }]
+      : [{ offset: member.offset, reason: 'unusable-source', bytes: member.bytes }]
+    const appended = this.recovery.appendUnresolved(registry.preserved.hash, fragments)
+    if (appended.error !== undefined || appended.full === true) {
+      this.warn(`first ownership migration deferred: the unresolved source "${sessionId}" could not be recorded`)
+      return false
+    }
+    this.registryRecovered = true
+    return true
   }
 
   /**
@@ -675,7 +1583,7 @@ export class TemporarySessions {
    * @param {string} sessionId - source id from the migration event.
    * @param {Map<string, object>} stored - stored headers.
    * @param {{ state: object }} registry - the registry read at this boot.
-   * @returns {Promise<void>}
+   * @returns {Promise<'owned' | 'unresolved'>} the import outcome.
    */
   async importMigrationSource(sessionId, stored, registry) {
     if (this.journal.entries[sessionId] === undefined) {
@@ -683,18 +1591,25 @@ export class TemporarySessions {
       const storage = header === undefined ? undefined : this.resolveStorage(header)
       if (header === undefined || storage === undefined) {
         this.warn(`first ownership migration could not import "${sessionId}": no usable stored header`)
-        return
+        return 'unresolved'
       }
       const legacy = registry.state.sessions[sessionId]
       if (!this.legacyRecordAgrees(legacy, header, storage, stored)) {
         this.warn(`first ownership migration quarantined "${sessionId}": its record disagrees with its stored header`)
-        return
+        return 'unresolved'
       }
       const kind = this.legacyJournalKind(legacy, header)
       const parentSessionId = header.parentSession ?? null
+      const member = registry.context?.inspection?.members?.find(candidate => candidate.key === sessionId)
+      const source = member?.value
+      const sourceNeedsRepair = source !== null
+        && typeof source === 'object'
+        && (source.kind === undefined
+          || source.parentSessionId !== parentSessionId
+          || source.dir === undefined)
       // The old recorder collapsed a subagent to an ancestor; the header's
       // direct parent is authoritative, so persist the corrected link.
-      if (legacy.parentSessionId !== parentSessionId) {
+      if (legacy.parentSessionId !== parentSessionId || sourceNeedsRepair) {
         legacy.parentSessionId = parentSessionId
         this.registryChanged = true
       }
@@ -713,6 +1628,7 @@ export class TemporarySessions {
     if (wasPending && entry?.pending !== true) {
       await this.appendEvent({ type: 'pending', sessionIds: [sessionId], reason: 'discard', at: Date.now() })
     }
+    return 'owned'
   }
 
   /**
@@ -798,6 +1714,9 @@ export class TemporarySessions {
    */
   async reconcileStoredChild(sessionId, header) {
     if (header === null || typeof header !== 'object' || typeof sessionId !== 'string') return false
+    // A disputed row means the registry is not trustworthy evidence for any
+    // adoption or orphan deletion until healing succeeds on a later pass.
+    if (this.registryDisputed.size > 0) return false
     if (typeof header.parentSession !== 'string' || header.parentSession === '') return false
     const parentId = header.parentSession
     const parent = this.journal.entries[parentId]
@@ -842,6 +1761,7 @@ export class TemporarySessions {
         return false
       }
       await this.appendOwnedChild({ sessionId, kind: childKind, parentId, header, storage, parent })
+      this.recovery.log('adopted', { id: sessionId, reason: 'stored-child' })
       this.warn(`adopted stored ${childKind} "${sessionId}" under its journal-deleted parent`)
       return true
     }
@@ -865,6 +1785,7 @@ export class TemporarySessions {
       return false
     }
     await this.appendOwnedChild({ sessionId, kind: kindOfHeader(header), parentId, header, storage, parent })
+    this.recovery.log('adopted', { id: sessionId, reason: 'stored-child' })
     this.warn(`adopted stored descendant "${sessionId}" under its journal-owned parent`)
     return true
   }
@@ -902,10 +1823,13 @@ export class TemporarySessions {
    * @returns {void}
    */
   logCutoff(sessionId, cutoff) {
+    const reason = cutoff === 'migration-incomplete' ? 'migration-incomplete' : 'pre-migration'
     if (cutoff === 'migration-incomplete') {
-      this.logOnce(`migration-incomplete:${sessionId}`, `not adopting "${sessionId}": the first ownership migration is incomplete`)
-    } else {
-      this.logOnce(`quarantine:${sessionId}`, `quarantined "${sessionId}": ${cutoff}`)
+      if (this.logOnce(`migration-incomplete:${sessionId}`, `not adopting "${sessionId}": the first ownership migration is incomplete`)) {
+        this.recovery.log('cutoff', { id: sessionId, reason })
+      }
+    } else if (this.logOnce(`quarantine:${sessionId}`, `quarantined "${sessionId}": ${cutoff}`)) {
+      this.recovery.log('cutoff', { id: sessionId, reason })
     }
   }
 
@@ -941,9 +1865,10 @@ export class TemporarySessions {
    * @returns {void}
    */
   logOnce(key, message) {
-    if (this.logged.has(key)) return
+    if (this.logged.has(key)) return false
     this.logged.add(key)
     this.warn(message)
+    return true
   }
 
   /**
@@ -958,6 +1883,7 @@ export class TemporarySessions {
    * @returns {Promise<boolean>} whether this pass recorded or removed the child.
    */
   async deleteOrphanedChild(sessionId, parentId, header, storage, existing) {
+    if (this.registryDisputed.size > 0) return false
     if (kindOfHeader(header) !== 'subagent') {
       this.warn(`not deleting "${sessionId}": its stored header is not a subagent`)
       return false
@@ -1055,30 +1981,42 @@ export class TemporarySessions {
    * @returns {boolean} whether the registry changed.
    */
   healFromJournal(stored) {
+    if (this.listingUncertain) {
+      this.warn('deferring journal-only recovery: the stored-session listing is unavailable')
+      return false
+    }
     let healed = false
     const now = Date.now()
     for (const entry of Object.values(this.journal.entries)) {
       if (entry.deleted === true) continue
+      // A registry row that disagrees with the journal or header stays
+      // quarantined. Rebuilding it would turn a detectable disagreement into a
+      // journal-only deletion target on this or the next boot.
+      if (this.registryDisputed.has(entry.sessionId)) continue
       const live = this.deps.sessions.get(entry.sessionId)
       const header = stored?.get(entry.sessionId) ?? live?.header
+      const storage = header === undefined ? undefined : this.resolveStorage(header)
+      if (header !== undefined && !this.registryEntryAgreesWithHeader(entry, header, storage)) {
+        this.warn(`not rebuilding "${entry.sessionId}" from the ownership journal: its identity disagrees with its stored header`)
+        continue
+      }
       const existing = this.state.sessions[entry.sessionId]
       if (existing === undefined) {
-        if (header === undefined) continue
-        const storage = this.resolveStorage(header)
-        if (storage === undefined) continue
+        if (header === undefined || storage === undefined) continue
         try {
           this.state.sessions[entry.sessionId] = recordFields({
             sessionId: entry.sessionId,
             kind: entry.kind,
-            parentSessionId: entry.parentSessionId ?? header.parentSession ?? null,
+            parentSessionId: entry.parentSessionId,
             dir: storage.dir,
-            cwd: header.cwd ?? null,
+            cwd: entry.cwd,
             createdAt: header.createdAt,
             lastActivityAt: now,
             activitySince: now,
             pendingDelete: entry.pending === true,
           }, now)
           healed = true
+          this.recovery.log('adopted', { id: entry.sessionId, reason: 'journal-only' })
           this.warn(`rebuilt the temporary-session record for "${entry.sessionId}" from the ownership journal`)
         } catch (error) {
           this.warn(`could not rebuild the temporary-session record for "${entry.sessionId}": ${String(error)}`)
@@ -1269,7 +2207,7 @@ export class TemporarySessions {
    * @throws the filesystem failure itself.
    */
   async save() {
-    if (this.loadFailed || this.journalDegraded || this.registryDegraded || this.reconciliationDegraded) return false
+    if (this.loadFailed || this.journalDegraded || this.registryDegraded || this.registryAmbiguous || this.registryUnreadable || this.reconciliationDegraded || this.listingUncertain) return false
     const ticket = this.publisher.begin()
     if (ticket === undefined) return false
     const text = encodeState(this.state)
@@ -1285,7 +2223,10 @@ export class TemporarySessions {
       throw error
     }
     const published = this.publisher.commit(ticket)
-    if (published) this.registryDegraded = false
+    if (published) {
+      this.registryDegraded = false
+      this.registryAuthority = Buffer.from(text)
+    }
     return published
   }
 
@@ -1303,8 +2244,10 @@ export class TemporarySessions {
       || this.loadFailed
       || this.migrationIncomplete
       || this.registryDegraded
+      || this.registryAmbiguous
       || this.journalDegraded
-      || this.reconciliationDegraded) return false
+      || this.reconciliationDegraded
+      || this.listingUncertain) return false
     for (const session of this.pending) {
       const sessionId = session?.header?.id
       const entry = typeof sessionId === 'string' ? this.journal.entries[sessionId] : undefined
@@ -1356,6 +2299,29 @@ export class TemporarySessions {
   }
 
   /**
+   * Every queued observation, disputed row and resolvable ancestor. A dispute
+   * can keep an observation unjournaled until a later boot, so exit cleanup
+   * must not remove the parent it still names.
+   * @returns {Set<string>} ids protected from the exit snapshot.
+   */
+  protectedSnapshotIds() {
+    const headers = new Map(this.storedHeaders ?? [])
+    for (const observation of this.pending) {
+      const header = observation?.header
+      if (typeof header?.id === 'string' && header.id !== '') headers.set(header.id, header)
+    }
+    const kept = new Set()
+    for (const observation of this.pending) {
+      const sessionId = observation?.header?.id
+      if (typeof sessionId === 'string') this.addAncestorChain(kept, sessionId, headers, this.storedHeaders)
+    }
+    for (const sessionId of this.registryDisputed) {
+      this.addAncestorChain(kept, sessionId, headers, this.storedHeaders)
+    }
+    return kept
+  }
+
+  /**
    * Rebuild the immutable in-memory snapshot. Only a record the ownership
    * journal owns is deletion evidence; a journal-degraded instance deletes
    * nothing.
@@ -1364,11 +2330,22 @@ export class TemporarySessions {
     // The injected degraded seam keeps the last validated snapshot. Journal
     // observations may still be written; the next healthy pass heals them.
     if (this.reconciliationDegraded) return
+    if (this.migrationIncomplete
+      || this.settlementPending
+      || this.listingUncertain
+      || this.registryUnreadable) {
+      this.snapshot = Object.freeze({ degraded: true, sessions: Object.freeze([]) })
+      return
+    }
     const sessions = []
-    if (!this.journalDegraded) {
+    if (!this.journalDegraded && !this.registryAmbiguous) {
+      const protectedIds = this.protectedSnapshotIds()
       for (const record of Object.values(this.state.sessions)) {
         const entry = this.journal.entries[record.sessionId]
         if (entry === undefined || entry.deleted === true) continue
+        // A disputed child or queued observation may become resolvable on the
+        // next boot. Keep every record on its parent chain out of this snapshot.
+        if (protectedIds.has(record.sessionId)) continue
         // The journal owns the identity and the target. A registry row that
         // disagrees with it is quarantined, never deleted.
         const agrees = record.kind === entry.kind
@@ -1392,7 +2369,7 @@ export class TemporarySessions {
         sessions.push(Object.freeze({ ...record }))
       }
     }
-    this.snapshot = Object.freeze({ degraded: this.journalDegraded, sessions: Object.freeze(sessions) })
+    this.snapshot = Object.freeze({ degraded: this.journalDegraded || this.registryAmbiguous, sessions: Object.freeze(sessions) })
   }
 
   /**
@@ -1420,6 +2397,9 @@ export class TemporarySessions {
     }
     if (this.journalDegraded) {
       throw new Error(`the temporary-session ownership journal is degraded; refusing to ${action}`)
+    }
+    if (this.registryAmbiguous) {
+      throw new Error(`the temporary-session registry framing is ambiguous; refusing to ${action}`)
     }
     if (this.registryDegraded) {
       throw new Error(`the temporary-session registry is damaged; refusing to ${action}`)
@@ -1780,7 +2760,11 @@ export class TemporarySessions {
    */
   async drainObserved(options = {}) {
     const persist = options.persist !== false
-    if (this.loadFailed || this.journalDegraded) return false
+    if (this.loadFailed
+      || this.journalDegraded
+      || this.registryUnsupported
+      || this.registryAmbiguous
+      || this.registryDisputed.size > 0) return false
     let changed = false
     let grew = true
     while (grew) {
@@ -1805,6 +2789,8 @@ export class TemporarySessions {
    * because a stored parent may become journal-owned only in the next
    * alternating pass; dropping its observed child earlier loses the tree.
    * The protected retry queue and an incomplete migration are never dropped.
+   * A disputed registry or unsupported version keeps them too: the next healthy
+   * pass can still prove the observation, while dropping it here loses the tree.
    * A failed or unavailable listing also keeps them: a stored parent may be
    * present but invisible to this pass. When a successful listing omits the
    * parent, a direct stat must confirm absence before its child is dropped.
@@ -1812,7 +2798,13 @@ export class TemporarySessions {
    * @returns {Promise<void>}
    */
   async dropUnprovenObservations(stored) {
-    if (stored === undefined || this.journalDegraded || this.migrationIncomplete || this.reconciliationDegraded) return
+    if (stored === undefined
+      || this.journalDegraded
+      || this.registryUnsupported
+      || this.registryAmbiguous
+      || this.registryDisputed.size > 0
+      || this.migrationIncomplete
+      || this.reconciliationDegraded) return
     for (const session of [...this.pending]) {
       const sessionId = session?.header?.id
       if (typeof sessionId !== 'string' || this.retryQueue.has(sessionId)) continue
@@ -2145,7 +3137,11 @@ export class TemporarySessions {
     return this.enqueue(async () => {
       if (this.admissionClosed) return false
       await this.load()
-      if (this.loadFailed || this.journalDegraded) return false
+      if (this.loadFailed
+        || this.journalDegraded
+        || this.registryUnsupported
+        || this.registryAmbiguous
+        || this.registryDisputed.size > 0) return false
       try {
         const stored = this.storedListingComplete
           ? new Map(this.bootStoredHeaders ?? [])
@@ -2236,6 +3232,7 @@ export class TemporarySessions {
       this.warn(`could not record descendant "${header.id}": ${String(error)}`)
       return false
     }
+    this.recovery.log('adopted', { id: header.id, reason: 'observed-child' })
     this.refreshSnapshot()
     return true
   }
@@ -2867,6 +3864,7 @@ export class TemporarySessions {
    * @returns {Promise<number>} folders removed.
    */
   async finishJournalDeletes(storedHeaders) {
+    if (this.registryDisputed.size > 0) return 0
     let removed = 0
     for (const [sessionId, entry] of Object.entries(this.journal.entries)) {
       if (entry.deleted !== true) continue
@@ -2972,19 +3970,37 @@ export class TemporarySessions {
       this.warn('skipping boot cleanup: the ownership journal is degraded')
       return
     }
+    if (this.registryUnsupported) {
+      this.warn('skipping boot cleanup: the temporary-session registry version is unsupported')
+      this.snapshot = Object.freeze({ degraded: true, sessions: Object.freeze([]) })
+      return
+    }
+    if (this.registryAmbiguous) {
+      this.warn('skipping boot cleanup: the temporary-session registry framing is ambiguous')
+      this.snapshot = Object.freeze({ degraded: true, sessions: Object.freeze([]) })
+      return
+    }
+    if (this.registryDisputed.size > 0) {
+      this.warn('skipping boot cleanup: a temporary-session registry row disagrees with the journal or header')
+      this.refreshSnapshot()
+      return
+    }
     // Keep the boot listing separate: the fresh listing can omit an id that
     // the boot listing saw, and omission is not absence.
     const bootHeaders = this.storedHeaders
     const storedHeaders = new Map()
+    const settlementDeferred = this.listingUncertain
     let listingComplete = false
     try {
       const snapshots = await this.deps.sessionPersistence.list()
       for (const snapshot of snapshots) storedHeaders.set(snapshot.header.id, snapshot.header)
       this.storedHeaders = storedHeaders
       this.storedListingComplete = true
+      this.listingUncertain = false
       listingComplete = true
     } catch (error) {
       this.storedListingComplete = false
+      this.listingUncertain = true
       this.warn(`could not list stored sessions during temporary-session cleanup: ${String(error)}`)
     }
     // A Session announced while the listing was being taken is in the observed
@@ -2996,14 +4012,75 @@ export class TemporarySessions {
     if (reconcileHeaders !== undefined) {
       for (const [sessionId, header] of storedHeaders) reconcileHeaders.set(sessionId, header)
     }
+    // The registry may have changed after boot. Read its current bytes before
+    // any adoption or deletion: an unsupported or ambiguous replacement must
+    // fail closed, and fresh damage must heal without trusting stale evidence.
+    const current = await this.refreshRegistryRead(reconcileHeaders)
+    if (this.registryUnsupported
+      || this.registryUnreadable
+      || this.registryAmbiguous
+      || (current.changed === true && current.context?.inspection?.supported === false)) {
+      this.refreshSnapshot()
+      this.warn('skipping boot cleanup: the current temporary-session registry is no longer usable')
+      return
+    }
+    // A boot whose registry was unreadable skipped reservation resolution and
+    // migration. Resume those durable stages on the first readable sweep,
+    // before settlement or reconciliation can act on half-started state.
+    if (this.startupStagesPending && listingComplete && this.registryRead !== undefined) {
+      await this.resolveReservations(reconcileHeaders)
+      await this.migrate(this.registryRead, reconcileHeaders)
+      this.migrationIncomplete = this.marker === undefined && this.journal.migrationComplete === undefined
+      if (!this.migrationIncomplete) this.startupStagesPending = false
+    }
+    // A boot whose stored listing failed could not validate its complete rows.
+    // Settle the retained evidence before reconciliation can adopt or delete a
+    // child, so a disagreement is quarantined before destructive work starts.
+    // A newly damaged or changed current file needs the same settlement. A
+    // healthy boot already settled at load, and settling again would treat an
+    // in-memory observation that was never persisted as a damaged row.
+    const changedNeedsSettlement = current.changed === true
+      && current.missing !== true
+      && current.context !== undefined
+    const settlementRequired = settlementDeferred || current.damaged === true || changedNeedsSettlement
+    const settlementNeeded = settlementRequired || this.settlementPending
+    const canSettle = listingComplete && this.registryRead !== undefined
+    const unsettledEvidence = changedNeedsSettlement
+      || current.damaged === true
+      || this.settlementPending
+    if (unsettledEvidence && !canSettle) {
+      this.settlementPending = true
+      this.registryDegraded = true
+      this.refreshSnapshot()
+      this.warn('skipping boot cleanup: changed registry evidence could not be settled safely')
+      return
+    }
+    if (this.migrationIncomplete) {
+      // Migration can still change which stored ids are authoritative. Never
+      // reconcile, heal or remove while that startup stage is unfinished, and
+      // retain the settlement gate for the first pass that completes it.
+      this.settlementPending = true
+      this.registryDegraded = true
+      this.refreshSnapshot()
+      this.warn('skipping boot cleanup: the first ownership migration is incomplete')
+      return
+    }
+    const settled = canSettle && settlementNeeded
+      ? this.settleRegistry(this.registryRead, reconcileHeaders)
+      : false
+    if (canSettle && settlementNeeded) this.settlementPending = false
+    if (this.registryRead?.damaged === true) this.registryDegraded = true
     const reconciled = await this.reconcileFixedPoint(reconcileHeaders)
     const healed = this.healFromJournal(reconcileHeaders)
-    let changed = reconciled.adopted || reconciled.observed || healed
+    let changed = reconciled.adopted || reconciled.observed || settled || healed
     // Degraded reconciliation is a write-free, delete-free pass. The journal may
     // already hold observed descendants; the next healthy pass adopts them.
     if (this.reconciliationDegraded) {
       this.warn('degraded reconciliation: keeping the snapshot, writing no registry and deleting nothing')
       return
+    }
+    if (this.registryDegraded && this.retryRegistryHealing()) {
+      changed = true
     }
     if (this.registryDegraded) {
       this.refreshSnapshot()
@@ -3311,7 +4388,7 @@ export class TemporarySessions {
     this.flushRegistrySync()
     return this.enqueue(async () => {
       await this.load()
-      if (this.loadFailed || this.journalDegraded || this.registryDegraded || this.reconciliationDegraded || this.migrationIncomplete) {
+      if (this.loadFailed || this.journalDegraded || this.registryDegraded || this.registryAmbiguous || this.reconciliationDegraded || this.migrationIncomplete) {
         this.warn('skipping unload cleanup: the ownership evidence is degraded')
         return
       }

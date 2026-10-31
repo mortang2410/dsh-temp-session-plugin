@@ -110,6 +110,7 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 - 删除目标必须是绝对路径、至少三层深，且最后一段包含会话 id。
 - Host 在已记录的临时会话下创建的 subagent 会自动记录（`kind: "subagent"`），并随该会话一起在退出、丢弃和卸载清理时处理。丢弃会逐个归档聊天并停止其活动、取消存活 Agent、终止所属任务；记录保持可见的停止状态直到确认结算。插件卸载只删除已确认空闲且无所属任务的成员；进程退出会删除退出快照中所有已校验的目录；下次启动会继续待删除的停止流程，并删除已确认的成员。只有祖先链经由存活的普通 fork 或 subagent 会话追溯到已记录临时 id 时才记录；追溯不到已记录祖先的链不记录。
 - 注册表位于 `$DSH_HOME` 下，原子写入。
+- 注册表损坏时，插件从所有权日志和 DSH 已存会话头重建。损坏原件复制到 `temp-session/preserved/`，无法解析的片段带字节偏移追加到 `temp-session/records.unresolved.jsonl`；两者权限均为 `0600`，达到上限时停止追加而不截断已有证据。`temp-session/recovery.log` 权限为 `0600`，按 1 MB 轮转并保留 5 个历史文件，只记录 id、偏移、固定字段名和判定码，不记录标题、路径或模型文本。注册表行与日志或会话头不一致时，该行被隔离，原文件保持不动且修复延后，避免该 id 在下次启动变成仅凭日志的删除目标。版本不是 1 的注册表保持字节不变，并拒绝新建临时会话直到修复完成，且不删除任何内容。日志降级时不写、不删；仅注册表降级时继续记录可信观察并重试修复事务。
 - 插件不会碰附件，也不会碰其他会话的数据。
 
 ## 隐私说明
@@ -130,11 +131,12 @@ dsh plugin --profile web remove dsh-temp-session-plugin
 - 临时侧聊由客户端过滤出侧栏；刷新页面会从 Host 注册表恢复隐藏集合。删除后它仍会留在工作区的成员 id 列表里（浏览器会按会话列表过滤掉，属无害残留）。
 - 远程/移动端没有 `tempSession` Remote 的授权，远程连接创建临时会话会被拒绝。
 - 仅支持默认 JSONL 后端。
+- 已接受的恢复限制：若损坏的注册表与仅出现在日志里的 `owned` 行同时指向一个真实永久会话，且会话头与目录都匹配，插件无法区分「本意是临时会话」和「两处来源被一致改写」，可能把该目录当作临时会话。另一来源有该 id 的记录时，不一致会被隔离；恢复日志是审计记录。
 - UI 依赖 `0.2.x` 的稳定槽位（`conversation.hero.options`、`conversation.session.header.actions`、`conversation.input.dock`、`sidebar.session.row.leading`、`sidebar.right.pane.tab`、`shell.overlay`），以及工作区行末尾的「+」按钮（通过 `data-row-key` 捕获）；未来 DSH 可能调整。
 
 ## 验证
 
-- `npm run check`：207 个 Host/Client 测试，无需安装依赖。
+- `npm run check`：267 个 Host/Client 测试，无需安装依赖。
 - 在一次性 `0.2.1-rc.1` Web profile 上用 Playwright 验证：工作区「+」菜单二选一、侧栏底部无临时入口、选区浮层（hover 不透底）、fork、右侧栏原生会话、引用预填、侧栏隐藏、关闭标签丢弃、`SIGTERM` 删除日志、重启清理。
 - 未验证：侧聊里真实的模型回复（测试环境没有凭据；fork 来自一个已完成但失败的回合），以及通过真实浏览器或 Gateway 发起的旧提升调用拒绝。Desktop 使用相同的 Host/Client 部件，但没有单独复跑。
 

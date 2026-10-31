@@ -12,6 +12,25 @@ All notable changes to this project are documented here. The format follows
   fork of a fork and a fork of a recorded subagent. Its true direct parent is
   recorded, and a late descendant of a pending tree inherits pending/stopping
   and is enqueued for a stop.
+- A damaged registry is rebuilt deterministically from the ownership journal
+  and stored DSH headers. The byte-span scan validates the member key,
+  `sessionId`, `sessions` membership, folder, kind, direct parent, `createdAt`
+  and pending state before a record can reach deletion. Healing preserves the
+  original, appends unresolved fragments with offsets, publishes atomically and
+  retires the original only after the commit; `preserved/`,
+  `records.unresolved.jsonl` and `recovery.log` are private and bounded. A
+  registry row that disagrees with the journal or header stays quarantined and
+  healing defers with the original in place, so the id cannot become a
+  journal-only deletion target. Ambiguous top-level framing and a conflicting
+  workspace or explicit parent disagreement in a surviving row are the same
+  kind of evidence and are left untouched. While a dispute exists, queued observations and their parent chain
+  survive, stored-child adoption and orphan deletion wait, and exit cleanup
+  keeps the chain intact. The private recovery log records journal-only
+  adoptions and migration cutoffs by id and decision code. A registry version
+  other than 1 is refused without interpretation, rewrite or deletion, including
+  after reap. Journal degradation refuses every write and deletion; registry
+  degradation keeps journaled observations and retries healing. The path is
+  exercised by `test/probes/healing.mjs`.
 - The browser follows the Host publisher epoch and per-response sequence,
   ignores delayed replies, keeps pending state terminal until the record is
   dropped, and shows a per-chat stopping entry independent of closed chat views.

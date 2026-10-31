@@ -113,6 +113,69 @@ async function writeRegistry(sessions) {
   await writeFile(stateFile, JSON.stringify({ version: 1, sessions }, null, 2))
 }
 
+/** Write registry bytes exactly, without a serializer or newline. */
+async function writeRawRegistry(text) {
+  await mkdir(stateDir, { recursive: true })
+  await writeFile(stateFile, text)
+}
+
+/** Serialize a `sessions` object with optional trailing bytes and no close. */
+function rawSessionsText(records, suffix = '') {
+  const members = Object.entries(records)
+    .map(([key, value]) => `${JSON.stringify(key)}:${JSON.stringify(value)}`)
+    .join(',')
+  return `{"version":1,"sessions":{${members}}${suffix}`
+}
+
+/**
+ * Seed one complete migration. `owned` entries carry the session, its journal
+ * kind and its direct parent; pending ids get one pending event after the owns.
+ */
+async function seedOwnedSessions(owned, {
+  at = 100,
+  preexisting = owned.map(item => item.session.id),
+  complete = true,
+  pendingIds = [],
+} = {}) {
+  await appendJournalEvent(journalFile, {
+    type: 'migration',
+    ids: owned.map(item => item.session.id),
+    preexisting,
+    at,
+  })
+  let tick = at + 1
+  for (const item of owned) {
+    const parentSessionId = item.parent?.id ?? null
+    await appendJournalEvent(journalFile, {
+      type: 'owned',
+      sessionId: item.session.id,
+      kind: item.kind ?? 'main',
+      parentSessionId,
+      dir: sessionDirOf(item.session.id),
+      cwd: item.session.header.cwd ?? null,
+      at: tick,
+    })
+    tick += 1
+  }
+  if (pendingIds.length > 0) {
+    await appendJournalEvent(journalFile, {
+      type: 'pending', sessionIds: pendingIds, reason: 'discard', at: tick,
+    })
+    tick += 1
+  }
+  if (complete) await appendJournalEvent(journalFile, { type: 'migrationComplete', at: tick })
+}
+
+/** A record shaped like the pre-healing registry row for one session. */
+function recordOf(session, overrides = {}) {
+  return { ...legacyRecord(session), ...overrides }
+}
+
+/** The permission bits a private artifact must carry. */
+function modeOf(path) {
+  return fs.statSync(path).mode & 0o777
+}
+
 function harness({ sessions = new Map(), stored = [], registry, persistence = {} } = {}) {
   const live = new Map(sessions)
   const removed = []
@@ -2006,7 +2069,9 @@ test('a corrupt registry does not resurrect a discarded tree', async () => {
     get: id => (id === parent.id ? parentAgent : id === child.id ? childAgent : undefined),
   }
   await h.temp.load()
-  assert.equal(h.temp.registryDegraded, true)
+  assert.equal(h.temp.registryDegraded, false)
+  const recovered = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.equal(recovered.sessions[parent.id].pendingDelete, true)
   assert.equal(h.temp.state.sessions[parent.id].pendingDelete, true)
   assert.equal(h.temp.state.sessions[child.id].pendingDelete, true)
   assert.deepEqual((await h.temp.list()).stopping, [])
@@ -2563,10 +2628,13 @@ test('an ambiguous create retains the reservation', async () => {
   // A Session that already has the reserved id is refused and never touched.
   const existing = fakeSession('session-existing', { createdAt: 90 })
   const beforeCount = (await journalLines()).length
-  const liveHarness = harness({ sessions: new Map([[existing.id, existing]]), stored: [existing.header] })
+  const liveHarness = harness({
+    sessions: new Map([[existing.id, existing]]),
+    stored: [existing.header, ...stored],
+  })
   await liveHarness.temp.load()
   await assert.rejects(liveHarness.temp.reserve({ sessionId: existing.id, cwd: '/tmp/project' }), /already live/)
-  const storedHarness = harness({ stored: [existing.header] })
+  const storedHarness = harness({ stored: [existing.header, ...stored] })
   await storedHarness.temp.load()
   await assert.rejects(storedHarness.temp.reserve({ sessionId: existing.id, cwd: '/tmp/project' }), /already has the reserved id/)
   assert.equal((await journalLines()).length, beforeCount)
@@ -4136,12 +4204,14 @@ test('a degraded manual fork is journaled', async () => {
   await seedOwnedParent(parent, { at: 100, preexisting: [parent.id] })
   await writeRegistry({})
   await writeFile(stateFile, '{damaged')
+  await writeFile(join(stateDir, 'records.lock'), `${process.ppid}\n`)
   const h = harness({ stored: [parent.header] })
   await h.temp.load()
   assert.equal(h.temp.registryDegraded, true)
   await h.temp.recordDescendant(fork)
   assert.ok((await journalLines()).some(event => event.type === 'owned' && event.sessionId === fork.id))
   assert.equal(h.temp.state.sessions[fork.id].kind, 'fork')
+  await rm(join(stateDir, 'records.lock'), { force: true })
   await writeRegistry({})
   h.deps.sessionPersistence.list = async () => [{ header: parent.header }, { header: fork.header }]
   const recovered = new TemporarySessions(h.deps)
@@ -4219,7 +4289,9 @@ test('a failed inherited-pending append repairs without a restart', async () => 
   assert.ok(h.temp.pending.includes(fork))
   h.temp.appendEvent = append
   await waitFor(
-    () => h.temp.journal.entries[fork.id]?.pending === true && !h.temp.pending.includes(fork),
+    () => h.temp.journal.entries[fork.id]?.pending === true
+      && !h.temp.pending.includes(fork)
+      && h.cancelled.includes(fork.id),
     'the inherited-pending observation did not repair without another event',
   )
   assert.equal(h.temp.state.sessions[fork.id].pendingDelete, true)
@@ -4325,8 +4397,12 @@ test('an owned id survives a corrupt registry', async () => {
     createdAt: 50,
     pendingDelete: false,
   })
-  // The damaged bytes are preserved, and exit removes the rebuilt folder.
-  assert.equal(await readFile(stateFile, 'utf8'), '{"version":1,"sessions":{')
+  // The recovered index is published, the damaged bytes are preserved, and
+  // exit removes the rebuilt folder.
+  assert.deepEqual(Object.keys(JSON.parse(await readFile(stateFile, 'utf8')).sessions), [chat.id])
+  const preserved = fs.readdirSync(h.temp.paths.preserved)
+  assert.ok(preserved.length > 0)
+  assert.equal(await readFile(join(h.temp.paths.preserved, preserved[0]), 'utf8'), '{"version":1,"sessions":{')
   assert.equal(cleanupSnapshotSync(snapshot), 1)
   await assert.rejects(readFile(join(dir, 'session.v4.jsonl.zstd')), /ENOENT/)
 })
@@ -4588,6 +4664,7 @@ test('the degraded flags fail closed', async () => {
   const chatBDir = await materializeSession(chatB.id)
   const childBDir = await materializeSession(childB.id)
   await writeFile(stateFile, '{damaged')
+  await writeFile(join(stateDir, 'records.lock'), `${process.ppid}\n`)
   const boot = new TemporarySessions(first.deps)
   await boot.load()
   assert.equal(boot.registryDegraded, true)
@@ -4637,7 +4714,7 @@ test('boot reap refuses a registry row with no journal ownership', async () => {
   await h.temp.load()
   await h.temp.reap()
   assert.equal(existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
-  assert.notEqual(h.temp.state.sessions[session.id], undefined)
+  assert.equal(h.temp.state.sessions[session.id], undefined)
   assert.deepEqual(h.temp.exitSnapshot().sessions, [])
 })
 
@@ -4813,4 +4890,37 @@ test('registration is refused while the first migration is deferred', async () =
   await restored.temp.load()
   await restored.temp.register({ sessionId: session.id })
   assert.deepEqual(restored.temp.exitSnapshot().sessions.map(item => item.sessionId), [session.id])
+})
+
+test('three complete records survive truncation', async () => {
+  const sessions = [
+    fakeSession('session-truncated-one', { createdAt: 10 }),
+    fakeSession('session-truncated-two', { createdAt: 20 }),
+    fakeSession('session-truncated-three', { createdAt: 30 }),
+  ]
+  for (const session of sessions) await materializeSession(session.id)
+  await seedOwnedSessions(sessions.map(session => ({ session })))
+  const titles = new Map(sessions.map((session, index) => [session.id, `truncated title ${index + 1}`]))
+  const records = Object.fromEntries(sessions.map(session => [
+    session.id,
+    recordOf(session, { title: titles.get(session.id) }),
+  ]))
+  await writeRawRegistry(rawSessionsText(records))
+  const h = harness({ stored: sessions.map(session => session.header) })
+  await h.temp.load()
+  assert.equal(h.temp.registryDegraded, false)
+  assert.deepEqual(Object.keys(h.temp.state.sessions).sort(), sessions.map(session => session.id).sort())
+  const published = JSON.parse(await readFile(stateFile, 'utf8'))
+  assert.deepEqual(Object.keys(published.sessions).sort(), sessions.map(session => session.id).sort())
+  for (const session of sessions) {
+    assert.equal(h.temp.state.sessions[session.id].title, titles.get(session.id))
+    assert.equal(published.sessions[session.id].title, titles.get(session.id))
+  }
+  assert.deepEqual(
+    h.temp.exitSnapshot().sessions.map(record => record.sessionId).sort(),
+    sessions.map(session => session.id).sort(),
+  )
+  assert.ok(fs.existsSync(h.temp.paths.preserved))
+  assert.ok(fs.readdirSync(h.temp.paths.preserved).length > 0)
+  assert.ok(fs.existsSync(h.temp.paths.unresolved))
 })

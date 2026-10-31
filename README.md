@@ -178,6 +178,20 @@ Safety boundaries:
 - Deletion only targets a directory whose final path segment contains the
   session id, is absolute, and is nested at least three levels deep.
 - Records are stored under `$DSH_HOME`, and the registry is written atomically.
+- A damaged registry is rebuilt from the ownership journal and DSH's stored
+  headers. The damaged original is copied to `temp-session/preserved/` and
+  unreadable fragments are appended with byte offsets to
+  `temp-session/records.unresolved.jsonl`; both are mode `0600`, bounded without
+  truncating existing evidence. `temp-session/recovery.log` is `0600`, rotates
+  at 1 MB and keeps five previous files, and carries only ids, offsets, fixed field names and
+  decision codes, never titles, paths or model text. A registry row that
+  disagrees with the journal or header is quarantined; the original stays in
+  place and healing defers, so the id never becomes a journal-only deletion
+  target. A registry version other than 1 is left byte-identical and new
+  temporary chats are refused until it is repaired. While the journal is
+  degraded the plugin writes and deletes nothing; while only the registry is
+  degraded it keeps journaling trusted observations and retries the healing
+  transaction.
 - The plugin never deletes attachments or other sessions' data.
 
 ## Privacy
@@ -218,6 +232,11 @@ written:
   namespace; creating a temporary session from a remote connection is refused.
 - Only the default JSONL backend is supported. The plugin refuses to register on
   a backend that cannot locate a session directory.
+- Accepted recovery limit: if a damaged registry and a journal-only `owned`
+  line both name a real permanent Session with a matching header and folder,
+  the plugin cannot tell an intended temporary chat from a consistent rewrite
+  and may treat that folder as temporary. A disagreement is quarantined when
+  the other source has an entry; the recovery log is the audit record.
 - UI integration relies on stable `0.2.x` slots (`conversation.hero.options`,
   `conversation.session.header.actions`, `conversation.input.dock`,
   `sidebar.session.row.leading`, `sidebar.right.pane.tab`, `shell.overlay`,
@@ -226,7 +245,7 @@ written:
 
 ## Verification
 
-- `npm run check`: 207 Host/client tests with no dependencies.
+- `npm run check`: 267 Host/client tests with no dependencies.
 - Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
   (both choices), no sidebar-foot temporary entry, selection action, fork,
   native right-sidebar conversation, quoted draft prefill, hidden sidebar row,
