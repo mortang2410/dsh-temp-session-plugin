@@ -52,6 +52,14 @@ export async function apply(ctx) {
     })
   })
 
+  // Real Session events are the only clock for idle expiry. A listener that
+  // throws would starve the Host's own event dispatch, so contain every error.
+  ctx.on('session/event', (session, event) => {
+    temp.noteActivity(session, event).catch((error) => {
+      log.warn(`temporary-session activity tracking failed: ${String(error)}`)
+    })
+  })
+
   // Complete boot reconciliation and reap before the browser can list Sessions.
   // The ready promise also covers announcements queued while the stored listing
   // was being taken.

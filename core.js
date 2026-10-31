@@ -14,7 +14,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
@@ -51,6 +51,29 @@ const STOP_WAIT_MS = 100
 
 /** Job lifecycles that still count as owned work. */
 const LIVE_JOB_STATUSES = new Set(['running', 'stopping'])
+
+/** A temporary tree expires after this much inactivity. */
+const EXPIRY_WINDOW_MS = 3 * 24 * 60 * 60 * 1000
+
+/** How often a live instance checks for expired trees. */
+const EXPIRY_SWEEP_MS = 60 * 60 * 1000
+
+/** Activity persistence is coalesced to at most one write per minute. */
+const ACTIVITY_SAVE_MS = 60 * 1000
+
+/** Session events that count as real activity for expiry. */
+const ACTIVITY_EVENT_TYPES = new Set([
+  'turn/start', 'turn/end', 'step/start', 'step/end', 'user/message', 'assistant/message',
+  'tool/call', 'tool/result', 'session/title', 'goal/change',
+])
+
+/** Whether one Session event is real activity rather than teardown noise. */
+function isActivityEvent(event) {
+  if (!ACTIVITY_EVENT_TYPES.has(event?.type)) return false
+  // A cancellation closes the live turn with an aborted reason. That closer is
+  // teardown, not work; every event without an aborted reason records work.
+  return event.data?.reason?.kind !== 'aborted'
+}
 
 /** Boundary note added to a forked, temporary side conversation. */
 const SIDE_INSTRUCTIONS = `This is a temporary side conversation forked from the main conversation.
@@ -240,6 +263,24 @@ export class TemporarySessions {
     this.sideTitled = new Map()
     this.retryTimer = undefined
     this.retryDelayMs = RETRY_DELAY_MS
+    this.expiryTimer = undefined
+    this.activityTimer = undefined
+    this.activitySaveAt = 0
+    this.expiryInFlight = false
+    this.expiryQueued = false
+    // Real events observed before the serialized activity task runs. The expiry
+    // pre-commit recheck reads this map, so an event delivered while the sweep
+    // is awaiting a busy probe still aborts the mark.
+    this.observedActivity = new Map()
+    // The stored snapshots behind the last successful list, keyed by Session id.
+    // A snapshot with a numeric sizeBytes is a materialized artifact; a snapshot
+    // without one is a backend pending creation.
+    this.storedSnapshots = new Map()
+    // Ids observed with a real artifact during this instance. A later pending
+    // snapshot for one of these means the artifact disappeared unexpectedly.
+    this.materializedIds = new Set()
+    this.expiryWarned = new Set()
+    this.now = typeof deps.now === 'function' ? deps.now : () => Date.now()
     // Injected seam for a degraded reconciliation pass. Real detection is
     // owned by the degraded-mode ticket; this flag only suppresses registry
     // writes and deletion while journal observations still proceed.
@@ -365,7 +406,336 @@ export class TemporarySessions {
   closeAdmission() {
     this.admissionClosed = true
     this.clearRetryTimer()
+    this.clearExpiryTimers()
   }
+
+  /** Stop the expiry and activity timers when the plugin instance unloads. */
+  clearExpiryTimers() {
+    if (this.expiryTimer !== undefined) {
+      clearInterval(this.expiryTimer)
+      this.expiryTimer = undefined
+    }
+    if (this.activityTimer !== undefined) {
+      clearTimeout(this.activityTimer)
+      this.activityTimer = undefined
+    }
+  }
+
+  /** Start the hourly expiry sweep once per loaded instance. */
+  startExpiryTimer() {
+    if (this.expiryTimer !== undefined || this.admissionClosed) return
+    this.expiryTimer = setInterval(() => {
+      this.sweepExpiry().catch(error => {
+        this.warn(`temporary-session expiry sweep failed: ${String(error)}`)
+      })
+    }, EXPIRY_SWEEP_MS)
+    this.expiryTimer.unref?.()
+  }
+
+  /**
+   * Record real activity from a Session event. Activity is only a hint for the
+   * expiry clock; it never authorises a deletion. A missing record is ignored.
+   * @param {object} session - Session carrying the event.
+   * @param {object} event - canonical Session event.
+   * @returns {Promise<void>} settles after the coalesced save decision.
+   */
+  noteActivity(session, event) {
+    const sessionId = session?.header?.id ?? session?.id
+    if (typeof sessionId !== 'string' || sessionId === '') return Promise.resolve()
+    if (!isActivityEvent(event)) return Promise.resolve()
+    const at = Number.isSafeInteger(event?.time) ? event.time : this.now()
+    // Publish the observation synchronously so a sweep already waiting on a
+    // busy probe sees it in its pre-commit recheck, even though the serialized
+    // registry update below runs after that sweep.
+    const observed = this.observedActivity.get(sessionId) ?? 0
+    if (at > observed) this.observedActivity.set(sessionId, at)
+    return this.enqueue(async () => {
+      await this.load()
+      if (this.loadFailed
+        || this.journalDegraded
+        || this.registryUnsupported
+        || this.registryAmbiguous
+        || this.reconciliationDegraded) return
+      const record = this.state.sessions[sessionId]
+      if (record === undefined) {
+        this.observedActivity.delete(sessionId)
+        return
+      }
+      const latest = Math.max(at, this.observedActivity.get(sessionId) ?? 0)
+      const previous = Math.max(record.lastActivityAt ?? 0, record.activitySince ?? 0)
+      if (latest <= previous) {
+        this.observedActivity.delete(sessionId)
+        return
+      }
+      record.lastActivityAt = latest
+      this.observedActivity.delete(sessionId)
+      this.refreshSnapshot()
+      await this.persistActivity()
+    })
+  }
+
+  /** Save activity at most once per minute; retain the in-memory clock meanwhile. */
+  async persistActivity() {
+    const now = this.now()
+    const due = this.activitySaveAt + ACTIVITY_SAVE_MS
+    if (this.activitySaveAt !== 0 && now < due) {
+      if (this.activityTimer === undefined) {
+        this.activityTimer = setTimeout(() => {
+          this.activityTimer = undefined
+          this.enqueue(async () => {
+            await this.load()
+            await this.persistActivity()
+          }).catch(error => this.warn(`could not save temporary-session activity: ${String(error)}`))
+        }, Math.max(1, due - now))
+        this.activityTimer.unref?.()
+      }
+      return
+    }
+    this.activitySaveAt = now
+    try {
+      await this.save()
+    } catch (error) {
+      this.warn(`could not save temporary-session activity: ${String(error)}`)
+    }
+  }
+
+  /** Log one expiry skip once per Session instead of on every hourly sweep. */
+  warnExpiryOnce(key, message) {
+    if (this.expiryWarned.has(key)) return
+    this.expiryWarned.add(key)
+    this.warn(message)
+  }
+
+  /**
+   * Classify one record's stored artifact for the expiry clock.
+   *
+   * The real JSONL listing includes a numeric `sizeBytes` for every materialized
+   * artifact, including a selected historical generation, and omits it for a
+   * created-but-unmaterialized Session. A pending Session that was materialized
+   * before and is now missing is not trustworthy deletion evidence, so the tree
+   * is skipped. A direct filesystem check covers a listing that predates a live
+   * registration or a fake backend that omits `sizeBytes`.
+   * @param {object} record - one validated registry record.
+   * @returns {{ materialized: boolean, skip?: boolean }} artifact class.
+   */
+  expiryArtifact(record) {
+    const sessionId = record.sessionId
+    const snapshot = this.storedSnapshots.get(sessionId)
+    if (snapshot !== undefined && typeof snapshot.sizeBytes === 'number') {
+      this.materializedIds.add(sessionId)
+      return { materialized: true }
+    }
+    const header = this.headerFor(record)
+    const storage = header === undefined ? undefined : this.resolveStorage(header)
+    if (storage !== undefined) {
+      try {
+        statSync(storage.artifact)
+        this.materializedIds.add(sessionId)
+        return { materialized: true }
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          this.warnExpiryOnce(`io:${sessionId}`, `skipping expired temporary session "${sessionId}": its artifact could not be read (${String(error)})`)
+          return { materialized: false, skip: true }
+        }
+      }
+      try {
+        const historical = readdirSync(storage.dir).some(name => name.startsWith('session.') && name !== basename(storage.artifact))
+        if (historical) {
+          this.materializedIds.add(sessionId)
+          return { materialized: true }
+        }
+      } catch (error) {
+        if (error?.code !== 'ENOENT') {
+          this.warnExpiryOnce(`dir:${sessionId}`, `skipping expired temporary session "${sessionId}": its artifact directory could not be read (${String(error)})`)
+          return { materialized: false, skip: true }
+        }
+      }
+    }
+    if (this.materializedIds.has(sessionId)
+      || (snapshot === undefined && (record.lastActivityAt ?? 0) > (record.createdAt ?? 0))) {
+      this.warnExpiryOnce(`missing:${sessionId}`, `skipping expired temporary session "${sessionId}": its previously materialized artifact is missing`)
+      return { materialized: false, skip: true }
+    }
+    // A snapshot without `sizeBytes` is an affirmative listing of a backend
+    // pending creation. A pending creation that was materialized before is
+    // caught by `materializedIds`; an activity clock here is not an artifact.
+    // A snapshot that is absent entirely and has no artifact on disk is only
+    // trusted as unmaterialized when the record never moved past creation.
+    return { materialized: false }
+  }
+
+  /**
+   * The newest activity clock in one tree. A materialized record without a
+   * clock is stamped now and saved, so it receives one full expiry window. An
+   * unmaterialized backend creation uses its creation time instead; file mtimes
+   * never participate.
+   * @param {object[]} members - tree records.
+   * @param {number} now - sweep clock.
+   * @returns {{ clock: number, changed: boolean, skip: boolean }} tree clock.
+   */
+  treeActivity(members, now) {
+    let clock = 0
+    let changed = false
+    for (const record of members) {
+      const artifact = this.expiryArtifact(record)
+      if (artifact.skip) return { clock, changed, skip: true }
+      let value = artifact.materialized
+        ? Math.max(record.lastActivityAt ?? 0, record.activitySince ?? 0, this.observedActivity.get(record.sessionId) ?? 0)
+        : Math.max(record.createdAt ?? 0, this.observedActivity.get(record.sessionId) ?? 0)
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        record.lastActivityAt = now
+        record.activitySince = now
+        value = now
+        changed = true
+      }
+      if (value > clock) clock = value
+    }
+    return { clock, changed, skip: false }
+  }
+
+  /**
+   * Group non-pending records into trees by their direct parent. A record whose
+   * parent is not recorded is a root; a pending tree is terminal and skipped.
+   * @returns {object[][]} tree member lists.
+   */
+  expiryTrees() {
+    const records = Object.values(this.state.sessions).filter(record => record !== null && typeof record === 'object')
+    const byId = new Map(records.map(record => [record.sessionId, record]))
+    const children = new Map()
+    for (const record of records) {
+      const parent = typeof record.parentSessionId === 'string' && byId.has(record.parentSessionId)
+        ? record.parentSessionId
+        : undefined
+      if (parent === undefined) continue
+      if (!children.has(parent)) children.set(parent, [])
+      children.get(parent).push(record)
+    }
+    const trees = []
+    const seen = new Set()
+    const visit = (record, members) => {
+      if (record === undefined || seen.has(record.sessionId)) return
+      seen.add(record.sessionId)
+      members.push(record)
+      for (const child of children.get(record.sessionId) ?? []) visit(child, members)
+    }
+    for (const record of records) {
+      if (typeof record.parentSessionId === 'string' && byId.has(record.parentSessionId)) continue
+      const members = []
+      visit(record, members)
+      if (members.some(member => member.pendingDelete === true)) continue
+      trees.push(members)
+    }
+    return trees
+  }
+
+  /** Whether any member of a tree has live work that forbids expiry. */
+  async expiryBusy(members) {
+    for (const record of members) {
+      const sessionId = record.sessionId
+      const agent = this.deps.agents?.get?.(sessionId)
+      if (agent !== undefined && agent !== null) {
+        if (agent.status === 'running') return true
+        if (agent.activeStream === true || agent.streaming === true || agent.activeTool !== undefined) return true
+        if (await this.confirmIdle(agent, sessionId) === false) return true
+      }
+      const session = this.deps.sessions.get(sessionId)
+      if (session !== undefined && (session.activeStream === true || session.streaming === true || session.activeTool !== undefined)) return true
+      try {
+        if (this.ownedJobs(sessionId).length > 0) return true
+      } catch {
+        return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * Run one serialized expiry transaction. The whole tree is rechecked just
+   * before the durable pending append; an event observed in that window aborts
+   * the mark.
+   * @param {number} [now] - injected clock for tests and the sweep timer.
+   * @returns {Promise<boolean>} whether a tree was marked.
+   */
+  sweepExpiry(now = this.now()) {
+    if (this.expiryInFlight) {
+      this.expiryQueued = true
+      return Promise.resolve(false)
+    }
+    this.expiryInFlight = true
+    const run = this.enqueue(async () => {
+      await this.load()
+      if (this.loadFailed
+        || this.journalDegraded
+        || this.registryUnsupported
+        || this.registryAmbiguous
+        || this.registryDegraded
+        || this.listingUncertain
+        || this.migrationIncomplete
+        || this.reconciliationDegraded
+        || this.admissionClosed) return false
+      // Re-read the stored-session listing at the start of every sweep. A
+      // backend pending creation is only visible here while it is unmaterialized;
+      // a listing failure is an I/O skip, not evidence that the tree is idle.
+      if (await this.listStored() === undefined) return false
+      let marked = false
+      for (const members of this.expiryTrees()) {
+        const activity = this.treeActivity(members, now)
+        if (activity.skip) continue
+        if (activity.changed) {
+          this.activitySaveAt = now
+          await this.save()
+        }
+        if (now - activity.clock < EXPIRY_WINDOW_MS) continue
+        if (await this.expiryBusy(members)) continue
+        // Yield once so an event delivered by the Host can be observed before
+        // the durable pending append. The same tree must still be unchanged.
+        await Promise.resolve()
+        const ids = members.map(record => record.sessionId)
+        const current = ids.map(id => this.state.sessions[id])
+        if (current.some((record, index) => record === undefined || record !== members[index])) continue
+        // Recompute the same tree clock after the yield. For a materialized
+        // artifact a new record clock wins; for a backend pending creation only
+        // a synchronously observed event can move the clock.
+        const recheck = this.treeActivity(current, now)
+        if (recheck.skip || recheck.clock > activity.clock) continue
+        // Work can start while the busy probe above is awaiting whenIdle() or
+        // while the microtask yield runs. Recheck work as well as the clock
+        // immediately before the durable pending append.
+        if (await this.expiryBusy(current)) continue
+        const finalActivity = this.treeActivity(current, now)
+        if (finalActivity.skip || finalActivity.clock > activity.clock) continue
+        try {
+          await this.appendEvent({
+            type: 'pending',
+            sessionIds: ids,
+            reason: 'expiry',
+            at: now,
+          })
+        } catch (error) {
+          this.warn(`could not mark expired temporary sessions: ${String(error)}`)
+          continue
+        }
+        this.markMembers(members)
+        try {
+          await this.save()
+        } catch (error) {
+          this.warn(`could not save expired temporary sessions: ${String(error)}`)
+        }
+        this.refreshSnapshot()
+        await this.stopMembers(members)
+        marked = true
+      }
+      return marked
+    })
+    return run.finally(() => {
+      this.expiryInFlight = false
+      if (this.expiryQueued) {
+        this.expiryQueued = false
+        this.sweepExpiry(this.now()).catch(error => this.warn(`temporary-session expiry sweep failed: ${String(error)}`))
+      }
+    })
+  }
+
 
   /**
    * Read the registry once and reconcile it with the ownership journal.
@@ -517,6 +887,10 @@ export class TemporarySessions {
     if (this.startPromise !== undefined) return this.startPromise
     this.startPromise = this.reap().then(() => {
       this.ready = true
+      this.startExpiryTimer()
+      this.sweepExpiry().catch(error => {
+        this.warn(`temporary-session startup expiry sweep failed: ${String(error)}`)
+      })
       return this.state
     }, (error) => {
       this.startPromise = undefined
@@ -552,7 +926,14 @@ export class TemporarySessions {
     try {
       const snapshots = await this.deps.sessionPersistence.list()
       const headers = new Map()
-      for (const snapshot of snapshots) headers.set(snapshot.header.id, snapshot.header)
+      const byId = new Map()
+      for (const snapshot of snapshots) {
+        const id = snapshot?.header?.id
+        if (typeof id !== 'string') continue
+        headers.set(id, snapshot.header)
+        byId.set(id, snapshot)
+      }
+      this.storedSnapshots = byId
       return headers
     } catch (error) {
       this.warn(`could not list stored sessions: ${String(error)}`)
@@ -3993,7 +4374,14 @@ export class TemporarySessions {
     let listingComplete = false
     try {
       const snapshots = await this.deps.sessionPersistence.list()
-      for (const snapshot of snapshots) storedHeaders.set(snapshot.header.id, snapshot.header)
+      const byId = new Map()
+      for (const snapshot of snapshots) {
+        const id = snapshot?.header?.id
+        if (typeof id !== 'string') continue
+        storedHeaders.set(id, snapshot.header)
+        byId.set(id, snapshot)
+      }
+      this.storedSnapshots = byId
       this.storedHeaders = storedHeaders
       this.storedListingComplete = true
       this.listingUncertain = false

@@ -8,6 +8,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- A temporary tree that has no real activity for three days is marked pending,
+  stopped and hidden by an hourly sweep. Activity comes from recorded Session
+  event times, not file mtimes; a running Agent, an active stream or tool,
+  unsettled maintenance, or an owned job postpones the mark. The tree's pending
+  event is fsynced before the registry mark, a pre-mark recheck aborts on a
+  newly observed event, and a live held member keeps its folder until the next
+  start or exit boundary. A backend pending creation uses its creation time;
+  a historically materialized artifact counts as materialized; a missing
+  previously materialized artifact or a non-ENOENT read error is skipped and
+  logged. The path is exercised by `test/probes/expiry-clock.mjs`.
 - A fork made from a temporary chat is temporary at every depth, including a
   fork of a fork and a fork of a recorded subagent. Its true direct parent is
   recorded, and a late descendant of a pending tree inherits pending/stopping

@@ -41,6 +41,11 @@ plain JavaScript with no build step, so it installs directly from GitHub.
   composer. It is archived (hidden from the list) immediately. Closing a side-chat tab discards it.
 - **Deleted on quit** - the Host removes every temporary session's log
   directory on exit (normal exit, `SIGTERM`, or `SIGINT`).
+- **Idle expiry** - a temporary tree with no real activity for three days is
+  marked stopping and hidden, then removed at the next start or exit. Messages,
+  turns, steps, tool calls, results, titles and goal changes count as activity;
+  a running Agent, an active stream or tool, maintenance that has not settled,
+  or an owned background job keeps the tree alive.
 - **Crash recovery** — if the process was killed hard, the next boot deletes the
   leftover logs before the browser can list them.
 - **Bilingual UI** — Chinese and English, following the DSH language setting.
@@ -156,6 +161,7 @@ Deletion points:
 | Moment | What happens |
 |---|---|
 | App exit / `SIGTERM` / `SIGINT` | Every directory in the validated exit snapshot is deleted synchronously; exit never parses the registry file. |
+| Three idle days | The tree's pending event is appended and fsynced, every member is marked stopping and hidden, and its folder waits for the next start or exit boundary. A live Agent or owned job postpones the mark. |
 | Plugin unload / live profile reload | Pending sessions are stopped again, and only members whose stop is confirmed idle with no owned job are deleted; live or unconfirmed work stays. |
 | Next boot | Journal-pending sessions resume their stop before the browser connects; confirmed members are deleted and their archive entries are cleared. |
 
@@ -245,7 +251,7 @@ written:
 
 ## Verification
 
-- `npm run check`: 267 Host/client tests with no dependencies.
+- `npm run check`: 284 Host/client tests with no dependencies.
 - Playwright against a disposable `0.2.1-rc.1` Web profile: workspace `+` menu
   (both choices), no sidebar-foot temporary entry, selection action, fork,
   native right-sidebar conversation, quoted draft prefill, hidden sidebar row,

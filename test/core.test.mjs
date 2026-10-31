@@ -4924,3 +4924,331 @@ test('three complete records survive truncation', async () => {
   assert.ok(fs.readdirSync(h.temp.paths.preserved).length > 0)
   assert.ok(fs.existsSync(h.temp.paths.unresolved))
 })
+
+test('a four-day-idle tree dies at the restart boundary', async () => {
+  const chat = fakeSession('session-expiry-idle')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  h.temp.state.sessions[chat.id].lastActivityAt = NOW - 4 * 24 * 60 * 60 * 1000
+  h.temp.state.sessions[chat.id].activitySince = NOW - 4 * 24 * 60 * 60 * 1000
+  await h.temp.save()
+  assert.equal(await h.temp.sweepExpiry(NOW), true)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, true)
+  assert.equal(fs.existsSync(sessionDirOf(chat.id)), true)
+  h.live.clear()
+  const restarted = new TemporarySessions(h.temp.deps)
+  await restarted.start()
+  assert.equal(fs.existsSync(sessionDirOf(chat.id)), false)
+})
+
+test('a busy descendant keeps its chat alive', async () => {
+  const chat = fakeSession('session-expiry-parent')
+  const child = fakeSession('session-expiry-child', {
+    origin: 'subagent', parentSession: chat.id, createdAt: NOW + 1,
+  })
+  await materializeSession(chat.id)
+  await materializeSession(child.id)
+  const h = harness({ sessions: new Map([[chat.id, chat], [child.id, child]]), stored: [chat.header, child.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await h.temp.recordDescendant(child)
+  for (const id of [chat.id, child.id]) {
+    h.temp.state.sessions[id].lastActivityAt = NOW - 4 * 24 * 60 * 60 * 1000
+    h.temp.state.sessions[id].activitySince = NOW - 4 * 24 * 60 * 60 * 1000
+  }
+  h.temp.state.sessions[child.id].lastActivityAt = NOW - 1000
+  await h.temp.save()
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+  // The child's live work is also a busy exclusion, not only its activity stamp.
+  for (const id of [chat.id, child.id]) {
+    h.temp.state.sessions[id].lastActivityAt = NOW - 4 * 24 * 60 * 60 * 1000
+    h.temp.state.sessions[id].activitySince = NOW - 4 * 24 * 60 * 60 * 1000
+  }
+  await h.temp.save()
+  h.deps.agents.get = id => (id === child.id ? { status: 'running' } : undefined)
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+})
+
+async function ageRecord(h, sessionId, age = 4 * 24 * 60 * 60 * 1000) {
+  h.temp.state.sessions[sessionId].lastActivityAt = NOW - age
+  h.temp.state.sessions[sessionId].activitySince = NOW - age
+  await h.temp.save()
+}
+
+test('a running agent is never expired', async () => {
+  const chat = fakeSession('session-expiry-running')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  h.deps.agents.get = () => ({ status: 'running' })
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+})
+
+test('an idle held agent is marked but not removed live', async () => {
+  const chat = fakeSession('session-expiry-held')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  const held = { status: 'idle', whenIdle: async () => {} }
+  h.deps.agents.get = () => held
+  assert.equal(await h.temp.sweepExpiry(NOW), true)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, true)
+  assert.equal(fs.existsSync(sessionDirOf(chat.id)), true)
+})
+
+test('an active stream or tool excludes the tree', async () => {
+  const chat = fakeSession('session-expiry-stream')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  h.deps.agents.get = () => ({ status: 'idle', activeStream: true })
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  h.deps.agents.get = () => ({ status: 'idle', activeTool: 'tool-1' })
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+})
+
+test('an owned job keeps the tree alive', async () => {
+  const chat = fakeSession('session-expiry-job')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  h.deps.jobs.list = () => [jobView('job-expiry', chat.id)]
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  // Work can begin while the pre-mark busy probe is awaiting. The second
+  // check immediately before the commit must see it and abort.
+  h.deps.jobs.list = () => []
+  const busyProbe = h.temp.expiryBusy.bind(h.temp)
+  let probes = 0
+  h.temp.expiryBusy = async (members) => {
+    probes += 1
+    if (probes === 1) return false
+    h.deps.jobs.list = () => [jobView('job-late', chat.id)]
+    return busyProbe(members)
+  }
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  h.temp.expiryBusy = busyProbe
+  h.deps.jobs.list = () => []
+  assert.equal(await h.temp.sweepExpiry(NOW), true)
+})
+
+test('maintenance postpones the mark', async () => {
+  const chat = fakeSession('session-expiry-maintenance')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  h.deps.agents.get = () => ({ status: 'idle', whenIdle: () => new Promise(() => {}) })
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+})
+
+test('a failed pending append aborts', async () => {
+  const chat = fakeSession('session-expiry-append')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  h.temp.appendEvent = async () => { throw new Error('journal unavailable') }
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+})
+
+test('teardown events are not activity', async () => {
+  const chat = fakeSession('session-expiry-teardown')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  const before = h.temp.state.sessions[chat.id].lastActivityAt
+  await h.temp.noteActivity(chat, { type: 'agent/inbox/spliced', time: NOW })
+  await h.temp.noteActivity(chat, { type: 'turn/end', time: NOW, data: { reason: { kind: 'completed' } } })
+  assert.equal(h.temp.state.sessions[chat.id].lastActivityAt, NOW)
+  const completed = h.temp.state.sessions[chat.id].lastActivityAt
+  await h.temp.noteActivity(chat, { type: 'turn/end', time: NOW + 1000, data: { reason: { kind: 'aborted' } } })
+  assert.equal(h.temp.state.sessions[chat.id].lastActivityAt, completed)
+  await h.temp.noteActivity(chat, { type: 'step/end', time: NOW + 2000, data: { turn: 1, step: 1 } })
+  assert.equal(h.temp.state.sessions[chat.id].lastActivityAt, NOW + 2000)
+})
+
+test('a cold record starts and keeps its window', async () => {
+  const chat = fakeSession('session-expiry-cold')
+  await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  h.temp.state.sessions[chat.id].lastActivityAt = 0
+  h.temp.state.sessions[chat.id].activitySince = 0
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  assert.equal(h.temp.state.sessions[chat.id].lastActivityAt, NOW)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+})
+
+test('a maintenance rewrite is not activity', async () => {
+  const chat = fakeSession('session-expiry-mtime')
+  const dir = await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  fs.utimesSync(join(dir, 'session.v4.jsonl.zstd'), new Date(), new Date())
+  assert.equal(await h.temp.sweepExpiry(NOW), true)
+})
+
+test('the pending, historical and missing artifacts differ', async () => {
+  const pending = fakeSession('session-expiry-pending-artifact', { createdAt: NOW - 4 * 24 * 60 * 60 * 1000 })
+  const pendingHarness = harness({ sessions: new Map([[pending.id, pending]]), stored: [pending.header] })
+  await pendingHarness.temp.register({ sessionId: pending.id })
+  assert.equal(await pendingHarness.temp.sweepExpiry(NOW), true)
+  assert.equal(pendingHarness.temp.state.sessions[pending.id].pendingDelete, true)
+
+  await rm(join(root, 'temp-session'), { recursive: true, force: true })
+  await rm(join(root, 'sessions'), { recursive: true, force: true })
+  const historical = fakeSession('session-expiry-historical-artifact', { createdAt: NOW - 10 * 24 * 60 * 60 * 1000 })
+  const historicalHarness = harness({ sessions: new Map([[historical.id, historical]]), stored: [historical.header] })
+  await historicalHarness.temp.register({ sessionId: historical.id })
+  const historicalDir = sessionDirOf(historical.id)
+  await mkdir(historicalDir, { recursive: true })
+  await writeFile(join(historicalDir, 'session.v3.jsonl'), 'old log')
+  historicalHarness.temp.state.sessions[historical.id].lastActivityAt = NOW - 60 * 1000
+  historicalHarness.temp.state.sessions[historical.id].activitySince = NOW - 60 * 1000
+  assert.equal(await historicalHarness.temp.sweepExpiry(NOW), false)
+  assert.equal(historicalHarness.temp.state.sessions[historical.id].pendingDelete, false)
+
+  await rm(join(root, 'temp-session'), { recursive: true, force: true })
+  await rm(join(root, 'sessions'), { recursive: true, force: true })
+  const missing = fakeSession('session-expiry-missing-artifact', { createdAt: NOW - 10 * 24 * 60 * 60 * 1000 })
+  const missingHarness = harness({ sessions: new Map([[missing.id, missing]]), stored: [missing.header] })
+  await missingHarness.temp.register({ sessionId: missing.id })
+  missingHarness.temp.state.sessions[missing.id].lastActivityAt = NOW - 60 * 1000
+  missingHarness.deps.sessionPersistence.list = async () => []
+  await missingHarness.temp.listStored()
+  assert.equal(await missingHarness.temp.sweepExpiry(NOW), false)
+  assert.equal(missingHarness.temp.state.sessions[missing.id].pendingDelete, false)
+  assert.ok(warnings.some(message => message.includes('previously materialized artifact is missing')))
+
+  await rm(join(root, 'temp-session'), { recursive: true, force: true })
+  await rm(join(root, 'sessions'), { recursive: true, force: true })
+  const snapshot = fakeSession('session-expiry-size-snapshot', { createdAt: NOW - 10 * 24 * 60 * 60 * 1000 })
+  const snapshotHarness = harness({
+    sessions: new Map([[snapshot.id, snapshot]]),
+    stored: [snapshot.header],
+    persistence: { list: async () => [{ header: snapshot.header, revision: 'r', sizeBytes: 1 }] },
+  })
+  await snapshotHarness.temp.register({ sessionId: snapshot.id })
+  snapshotHarness.temp.state.sessions[snapshot.id].lastActivityAt = 0
+  snapshotHarness.temp.state.sessions[snapshot.id].activitySince = 0
+  assert.equal(await snapshotHarness.temp.sweepExpiry(NOW), false)
+  assert.equal(snapshotHarness.temp.state.sessions[snapshot.id].lastActivityAt, NOW)
+})
+
+test('an I/O error never expires', async () => {
+  const chat = fakeSession('session-expiry-io')
+  const dir = await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  const list = h.deps.sessionPersistence.list
+  h.deps.sessionPersistence.list = async () => {
+    throw Object.assign(new Error('EACCES: listing denied'), { code: 'EACCES' })
+  }
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+  h.deps.sessionPersistence.list = list
+  fs.chmodSync(dir, 0o000)
+  try {
+    assert.equal(await h.temp.sweepExpiry(NOW), false)
+  } finally {
+    fs.chmodSync(dir, 0o755)
+  }
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+  assert.ok(warnings.some(message => message.includes('could not be read')))
+})
+
+test('an event before the commit aborts the expiry', async () => {
+  const chat = fakeSession('session-expiry-race')
+  const dir = await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  const busyProbe = h.temp.expiryBusy.bind(h.temp)
+  h.temp.expiryBusy = async () => {
+    h.temp.noteActivity(chat, { type: 'user/message', time: NOW })
+    return false
+  }
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  await h.temp.queue
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+  assert.equal(fs.existsSync(join(dir, 'session.v4.jsonl.zstd')), true)
+  // A second, later check runs after the busy probe. An event delivered during
+  // that probe must still abort the mark.
+  await ageRecord(h, chat.id)
+  let probes = 0
+  h.temp.expiryBusy = async (members) => {
+    probes += 1
+    if (probes === 2) h.temp.noteActivity(chat, { type: 'user/message', time: NOW })
+    return busyProbe(members)
+  }
+  assert.equal(await h.temp.sweepExpiry(NOW), false)
+  await h.temp.queue
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, false)
+})
+
+test('a held session delays the restart-boundary deletion', async () => {
+  const chat = fakeSession('session-expiry-held-restart')
+  const dir = await materializeSession(chat.id)
+  const h = harness({ sessions: new Map([[chat.id, chat]]), stored: [chat.header] })
+  await h.temp.register({ sessionId: chat.id })
+  await ageRecord(h, chat.id)
+  assert.equal(await h.temp.sweepExpiry(NOW), true)
+  assert.equal(h.temp.state.sessions[chat.id].pendingDelete, true)
+  assert.equal(fs.existsSync(dir), true)
+  h.live.clear()
+  const restarted = new TemporarySessions(h.deps)
+  await restarted.start()
+  assert.equal(fs.existsSync(dir), false)
+})
+
+test('a sweep marks every expired tree', async () => {
+  const first = fakeSession('session-expiry-multi-first')
+  const second = fakeSession('session-expiry-multi-second')
+  await materializeSession(first.id)
+  await materializeSession(second.id)
+  const h = harness({
+    sessions: new Map([[first.id, first], [second.id, second]]),
+    stored: [first.header, second.header],
+  })
+  await h.temp.register({ sessionId: first.id })
+  await h.temp.register({ sessionId: second.id })
+  await ageRecord(h, first.id)
+  await ageRecord(h, second.id)
+  assert.equal(await h.temp.sweepExpiry(NOW), true)
+  assert.equal(h.temp.state.sessions[first.id].pendingDelete, true)
+  assert.equal(h.temp.state.sessions[second.id].pendingDelete, true)
+})
+
+test('unload clears the expiry timer', async () => {
+  const chat = fakeSession('session-expiry-timer')
+  const h = harness({ sessions: new Map([[chat.id, chat]]) })
+  await h.temp.start()
+  assert.notEqual(h.temp.expiryTimer, undefined)
+  h.temp.closeAdmission()
+  assert.equal(h.temp.expiryTimer, undefined)
+  assert.equal(h.temp.activityTimer, undefined)
+
+  // Arm the coalesced activity timer too; asserting an undefined timer without
+  // ever creating one would not pin the cleanup branch.
+  const activityChat = fakeSession('session-expiry-activity-timer')
+  await materializeSession(activityChat.id)
+  const ah = harness({ sessions: new Map([[activityChat.id, activityChat]]), stored: [activityChat.header] })
+  await ah.temp.register({ sessionId: activityChat.id })
+  await ageRecord(ah, activityChat.id)
+  await ah.temp.noteActivity(activityChat, { type: 'user/message', time: NOW })
+  await ah.temp.noteActivity(activityChat, { type: 'user/message', time: NOW + 1000 })
+  assert.notEqual(ah.temp.activityTimer, undefined)
+  ah.temp.closeAdmission()
+  assert.equal(ah.temp.activityTimer, undefined)
+})
